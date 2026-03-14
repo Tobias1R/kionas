@@ -1,0 +1,1 @@
+docker run -it -d --network=warehouse_network --hostname=worker1.local --name=worker1 -p 6667:6667 -v c:\code\kionas:/workspace -e KIONAS_HOME=/workspace docker-devcontainer 

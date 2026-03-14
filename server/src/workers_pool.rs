@@ -1,0 +1,50 @@
+use deadpool::managed::{Manager, Pool, Metrics, RecycleResult};
+use tonic::transport::{Channel, Endpoint};
+use std::time::Duration;
+
+#[derive(Debug, Default)]
+pub struct WorkerConnectionManager {
+    endpoint: String,
+    worker_id: String,
+    ca_cert: Option<Vec<u8>>,
+}
+
+impl WorkerConnectionManager {
+    pub fn new(endpoint: String, worker_id: String, ca_cert: Option<Vec<u8>>) -> Self {
+        Self { endpoint, worker_id, ca_cert }
+    }
+}
+
+impl Manager for WorkerConnectionManager {
+    type Type = Channel;
+    type Error = tonic::transport::Error;
+
+    async fn create(&self) -> Result<Channel, tonic::transport::Error> {
+        let mut ep = Endpoint::from_shared(self.endpoint.clone())?;
+        if let Some(ca) = &self.ca_cert {
+            let ca_cert = tonic::transport::Certificate::from_pem(ca.clone());
+            let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+            ep = ep.tls_config(tls)?;
+        }
+        ep = ep.connect_timeout(Duration::from_secs(5));
+        ep.connect().await
+    }
+
+    async fn recycle(&self, conn: &mut Channel, _: &Metrics) -> RecycleResult<tonic::transport::Error> {
+        let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
+        let request = tonic::Request::new(crate::services::worker_service_client::worker_service::HeartbeatRequest {worker_id: self.worker_id.clone()});
+        let _ = client.heartbeat(request).await;
+        Ok(())
+    }
+}
+
+pub fn get_new_pool(endpoint: String, worker_id: String, ca_cert: Option<Vec<u8>>) -> Pool<WorkerConnectionManager> {
+    let manager = WorkerConnectionManager::new(endpoint, worker_id, ca_cert);
+    Pool::builder(manager)
+        .max_size(10)
+        .build()
+        .unwrap()
+}
+
+
+pub type WorkerPool = Pool<WorkerConnectionManager>;

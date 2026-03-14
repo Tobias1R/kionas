@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package interops_service;
+
+service InteropsService {
+    // Register new warehouse worker
+    rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
+    // Worker heartbeat
+    rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+    
+}
+
+message RegisterWorkerRequest {
+    string name = 1;
+    string host = 2;
+    uint32 port = 3;
+    string warehouse_type = 4;
+}
+
+message RegisterWorkerResponse {
+    string status = 1;
+    string uuid = 2;   
+}
+
+
+message HeartbeatRequest {
+    string uuid = 1;
+}
+
+message HeartbeatResponse {
+    string status = 1;
+}

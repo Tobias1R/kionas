@@ -1,0 +1,31 @@
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+tokio.workspace = true
+tonic.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tonic-reflection = "0.12.3"
+prost = "0.13.5"
+prost-types = "0.13.5"
+rdkafka = { version = "0.37.0", features = ["cmake-build"] }
+redis = { version = "0.25", features = ["tokio-comp"] }
+kionas = { path = "../kionas" }
+base64 = "0.22"
+toml = "0.8"
+deadpool = "0.12.1"
+arrow = "57.2.0"
+parquet = "57.2.0"
+uuid = "1.22.0"
+
+[build-dependencies]
+tonic-build = "0.12.3"
+prost-build = "0.13"

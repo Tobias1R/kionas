@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package worker_service;
+
+// Worker registration
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string host = 2;
+  int32 port = 3;
+}
+
+message RegisterWorkerResponse {
+  string status = 1;
+  string uuid = 2;
+}
+
+// Heartbeat
+message HeartbeatRequest {
+  string worker_id = 1;
+}
+
+message HeartbeatResponse {
+  string status = 1;
+}
+
+// Task-based execution
+message TaskRequest {
+  string session_id = 1;
+  repeated Task tasks = 2;
+}
+
+message TaskResponse {
+  string status = 1;
+  string error = 2;
+  string result_location = 3; // Arrow Flight endpoint or file path
+}
+
+message Task {
+  string task_id = 1;
+  string operation = 2; // e.g., "scan", "filter", "aggregate", "write"
+  string input = 3; // input path or ticket
+  string output = 4; // output path or ticket
+  map<string, string> params = 5; // operation-specific parameters
+}
+
+// Arrow Flight integration
+message FlightInfoRequest {
+  string session_id = 1;
+  string task_id = 2;
+}
+
+message FlightInfoResponse {
+  string endpoint = 1;
+  string schema = 2;
+  string ticket = 3;
+}
+
+service WorkerService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ExecuteTask(TaskRequest) returns (TaskResponse);
+  rpc GetFlightInfo(FlightInfoRequest) returns (FlightInfoResponse);
+}

@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package warehouse_service;
+/*
+WarehouseService
+
+Describes the protocol between client and the data-warehouse service
+*/
+
+service WarehouseService {
+    // Query the database
+    rpc Query (QueryRequest) returns (QueryResponse);        
+    // Query Status
+    rpc QueryStatus (QueryStatusRequest) returns (QueryStatusResponse);
+
+}
+
+// Request message to get the status of a query
+message QueryStatusRequest {
+    string query_id = 1; // The query id
+}
+
+// Response message containing the status of the query
+message QueryStatusResponse {
+    string query_id = 1; // The query id
+    string status = 2; // The status of the query
+    string error_code = 3; // The error code
+    string execution_time = 4; // The execution time
+    string data = 5; // The data
+
+}
+
+// Request Message to delivery SQL query
+message QueryRequest {
+    string query = 1; // The SQL query
+}
+
+// Response message containing the result of the SQL query
+message QueryResponse {
+    string message = 1; // The result of the SQL query
+    string status = 2; // The session id
+    string error_code = 3; // The error code
+    string execution_time = 4; // The execution time
+    bytes data = 5; // The data
+}

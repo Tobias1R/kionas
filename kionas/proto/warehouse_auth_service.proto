@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package warehouse_auth_service;
+/*
+WarehouseAuthService
+
+Describes the protocol for authentication between client and the data-warehouse service
+*/
+
+service WarehouseAuthService {
+    // Authenticate user
+    rpc JwtAuth (JwtAuthRequest) returns (AuthResponse);
+    // User Pass Auth
+    rpc UserPassAuth (UserPassAuthRequest) returns (AuthResponse);    
+    // refresh token
+    rpc RefreshToken (RefreshTokenRequest) returns (RefreshTokenResponse);
+    // logout
+    rpc Logout (LogoutRequest) returns (LogoutResponse);
+}
+
+// Request message to authenticate user
+message JwtAuthRequest {
+    string token = 1; // The token
+}
+
+// Request message to authenticate user
+message UserPassAuthRequest {
+    string username = 1; // The username
+    string password = 2; // The password
+}
+
+// Request message to refresh token
+message RefreshTokenRequest {
+    string token = 1; // The token
+}
+
+// Response message containing the result of the refresh token
+message RefreshTokenResponse {
+    string message = 1; // The result of the refresh token
+    string status = 2; // The status of the refresh token
+    string error_code = 3; // The error code
+    string execution_time = 4; // The execution time
+    string token = 5; // The token
+}
+
+// Request message to logout
+message LogoutRequest {
+    string token = 1; // The token
+}
+
+// Response message containing the result of the logout
+message LogoutResponse {
+    string message = 1; // The result of the logout
+    string status = 2; // The status of the logout
+    string error_code = 3; // The error code
+    string execution_time = 4; // The execution time
+}
+
+// Response message containing the result of the authentication
+message AuthResponse {
+    string message = 1; // The result of the authentication
+    string status = 2; // The status of the authentication
+    string error_code = 3; // The error code
+    string execution_time = 4; // The execution time
+    string token = 5; // The token
+    string session_id = 6; // The session id
+}
+
+
+

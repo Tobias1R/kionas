@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package metastore_service;
+/*
+metastoreService
+
+Describes the protocol between client and the data-metastore service
+*/
+
+service MetastoreService {
+    rpc Execute(MetastoreRequest) returns (MetastoreResponse);
+    rpc UpdateTableStatistics(UpdateTableStatisticsRequest) returns (UpdateTableStatisticsResponse);
+    rpc GetTableStatistics(GetTableStatisticsRequest) returns (GetTableStatisticsResponse);
+}
+
+message MetastoreRequest {
+  oneof action {
+    CreateTableRequest create_table = 1;
+    DropTableRequest drop_table = 2;
+    GetTableRequest get_table = 3;
+    // Schema/Catalogue related requests
+    CreateSchemaRequest create_schema = 4;
+    DropSchemaRequest drop_schema = 5;
+    GetSchemaRequest get_schema = 6;
+    // Additional requests can be added here
+  }
+}
+
+message MetastoreResponse {
+  oneof result {
+    CreateTableResponse create_table_response = 1;
+    DropTableResponse drop_table_response = 2;
+    GetTableResponse get_table_response = 3;
+    // Schema/Catalogue related responses
+    CreateSchemaResponse create_schema_response = 4;
+    DropSchemaResponse drop_schema_response = 5;
+    GetSchemaResponse get_schema_response = 6;
+    // Additional responses can be added here
+  }
+}
+
+// Table related messages
+message CreateTableRequest {
+  string schema_name = 1;
+  string table_name = 2;
+  string engine = 3; // e.g., "parquet", "csv"
+    repeated ColumnSchema columns = 4;
+
+}
+
+message DropTableRequest {
+  string schema_name = 1;
+  string table_name = 2;
+}
+
+message GetTableRequest {
+  string schema_name = 1;
+  string table_name = 2;
+  string location = 3; // Optional: location of the table data
+}
+
+message CreateTableResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DropTableResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetTableResponse {
+  bool success = 1;
+  string message = 2;
+  TableMetadata metadata = 3;
+}
+
+// Schema/Catalogue related messages
+message CreateSchemaRequest {
+  string schema_name = 1;
+}
+
+message DropSchemaRequest {
+  string schema_name = 1;
+}
+
+message GetSchemaRequest {
+  string schema_name = 1;
+}
+
+message CreateSchemaResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DropSchemaResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetSchemaResponse {
+  bool success = 1;
+  string message = 2;
+  SchemaMetadata metadata = 3;
+}
+
+// Common messages
+message ColumnSchema {
+  string name = 1;
+  string data_type = 2; // e.g., "string", "int", "float"
+  bool nullable = 3;
+}
+
+message TableMetadata {
+  string uuid = 1;
+  string schema_name = 2;
+  string table_name = 3;
+  string table_type = 4; // e.g., "delta", "external"
+  string location = 5;
+  string container = 6;
+  repeated ColumnSchema columns = 7;
+}
+
+message PartitionMetadata {
+  string uuid = 1;
+  string table_uuid = 2;
+  string location = 3;
+  string owner = 4;
+  string values_json = 5;
+  string created_at = 6;
+}
+
+message SchemaMetadata {
+  string uuid = 1;
+  string schema_name = 2;
+  string location = 3;
+  string container = 4;
+}
+
+message CatalogMetadata {
+  string uuid = 1;
+  string name = 2;
+  string description = 3;
+  string owner = 4;
+  string location = 5;
+  string created_at = 6;
+}
+
+// Statistics messages
+message TableStatistics {
+  string uuid = 1;
+  string table_uuid = 2;
+  int64 row_count = 3;
+  int64 data_size_bytes = 4;
+  string last_updated = 5;
+}
+
+message UpdateTableStatisticsRequest {
+  string table_uuid = 1;
+  TableStatistics statistics = 2;
+}
+
+message UpdateTableStatisticsResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetTableStatisticsRequest {
+  string table_uuid = 1;
+}
+
+message GetTableStatisticsResponse {
+  bool success = 1;
+  string message = 2;
+  TableStatistics statistics = 3;
+}
+

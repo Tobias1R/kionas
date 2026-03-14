@@ -1,0 +1,67 @@
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+
+use crate::constants::CONSUL_CLUSTER_KEY;
+
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct ClusterInfo {
+    pub nodes: Vec<String>,
+    pub server: serde_json::Value,
+    pub logging: serde_json::Value,
+    pub security: serde_json::Value,
+    pub storage: serde_json::Value,
+    pub warehouse: serde_json::Value,
+    pub interops: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct WorkerInfo {
+    pub worker_id: String,
+    pub server_url: String,
+    pub consul_url: String,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub ca_cert_path: String,
+    pub interops_port: u16,
+    pub interops_host: String,
+}
+
+pub async fn download_cluster_info(consul_url: &str) -> Result<ClusterInfo, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let url = format!("{}/v1/kv/{}?raw", consul_url, CONSUL_CLUSTER_KEY);
+    println!("[DEBUG] Requesting cluster info from: {}", url);
+    let resp = client.get(&url).send().await?.text().await?;
+    println!("[DEBUG] Raw response: {}", resp);
+    let info: ClusterInfo = match serde_json::from_str(&resp) {
+        Ok(i) => {
+            println!("[DEBUG] Parsed ClusterInfo: {:?}", i);
+            i
+        },
+        Err(e) => {
+            println!("[ERROR] Failed to parse ClusterInfo: {}", e);
+            return Err(Box::new(e));
+        }
+    };
+    Ok(info)
+}
+
+// Download worker information. Worker configs are populate inside the key configs/<worker_id>
+pub async fn download_worker_info(consul_url: &str, worker_id: &str) -> Result<WorkerInfo, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let url = format!("{}/v1/kv/kionas/configs/{}?raw", consul_url, worker_id);
+    println!("[DEBUG] Requesting worker info from: {}", url);
+    let resp = client.get(&url).send().await?.text().await?;
+    println!("[DEBUG] Raw response: {}", resp);
+    let info: WorkerInfo = match serde_json::from_str(&resp) {
+        Ok(i) => {
+            println!("[DEBUG] Parsed Worker WorkerInfo: {:?}", i);
+            i
+        },
+        Err(e) => {
+            println!("[ERROR] Failed to parse Worker WorkerInfo: {}", e);
+            return Err(Box::new(e));
+        }
+    };
+    Ok(info)
+}
