@@ -5,6 +5,7 @@ use kionas::parser::datafusion_sql::sqlparser::ast::{ObjectName, Statement};
 use crate::services::metastore_client::metastore_service as ms;
 use crate::services::metastore_client::MetastoreClient;
 use crate::warehouse::state::SharedData;
+use crate::core::DomainService;
 use crate::session::Session;
 use crate::warehouse::Warehouse;
 
@@ -61,49 +62,75 @@ pub async fn get_worker_addr_for_session(shared_data: &SharedData, session_id: &
 pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &SharedData) -> String {
     match stmt {
         Statement::CreateSchema { schema_name, .. } => {
-            match helpers::run_task_for_input(shared_data, session_id, "create_schema", schema_name.to_string(), 30).await {
-                Ok(loc) => {
-                    // After successful task dispatch/completion, inform metastore
-                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: schema_name.to_string() })) };
-                    match MetastoreClient::connect_with_shared(shared_data).await {
-                        Ok(mut client) => {
-                            match client.execute(mreq).await {
-                                Ok(resp) => log::info!("Metastore Execute response for CreateSchema: {:?}", resp),
-                                Err(e) => log::error!("Metastore Execute failed for CreateSchema: {}", e),
-                            }
-                        }
-                        Err(e) => log::error!("Failed to connect to metastore for CreateSchema: {}", e),
-                    }
-                    format!("Schema created successfully: {}", loc)
+            // Build domain object from AST and validate
+            let owner = {
+                let state = shared_data.lock().await;
+                match state.session_manager.get_session(session_id.to_string()).await {
+                    Some(s) => s.get_role(),
+                    None => "unknown".to_string(),
                 }
-                Err(e) => e.to_string(),
+            };
+            match DomainService::from_create_schema(schema_name, &owner) {
+                Ok(_catalog) => {
+                    match helpers::run_task_for_input(shared_data, session_id, "create_schema", schema_name.to_string(), 30).await {
+                        Ok(loc) => {
+                            // Persist to metastore (use domain-derived request in future)
+                            let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: schema_name.to_string() })) };
+                            match MetastoreClient::connect_with_shared(shared_data).await {
+                                Ok(mut client) => {
+                                    match client.execute(mreq).await {
+                                        Ok(resp) => log::info!("Metastore Execute response for CreateSchema: {:?}", resp),
+                                        Err(e) => log::error!("Metastore Execute failed for CreateSchema: {}", e),
+                                    }
+                                }
+                                Err(e) => log::error!("Failed to connect to metastore for CreateSchema: {}", e),
+                            }
+                            format!("Schema created successfully: {}", loc)
+                        }
+                        Err(e) => e.to_string(),
+                    }
+                }
+                Err(e) => format!("Domain validation failed: {}", e),
             }
         }
         Statement::CreateTable(create_table) => {
             // `CreateTable` is a tuple variant carrying a `CreateTable` struct; extract its `name`.
             let name = &create_table.name;
-            match helpers::run_task_for_input(shared_data, session_id, "create_table", name.to_string(), 30).await {
-                Ok(loc) => {
-                    let table_name = name.to_string();
-                    let creq = ms::CreateTableRequest {
-                        schema_name: String::new(),
-                        table_name: table_name.clone(),
-                        engine: String::new(),
-                        columns: Vec::new(),
-                    };
-                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
-                    match MetastoreClient::connect_with_shared(shared_data).await {
-                        Ok(mut client) => {
-                            match client.execute(mreq).await {
-                                Ok(resp) => log::info!("Metastore Execute response for CreateTable {}: {:?}", table_name, resp),
-                                Err(e) => log::error!("Metastore Execute failed for CreateTable {}: {}", table_name, e),
-                            }
-                        }
-                        Err(e) => log::error!("Failed to connect to metastore for CreateTable {}: {}", table_name, e),
-                    }
-                    format!("Table created successfully: {}", loc)
+            // Build domain object from AST
+            let default_schema = {
+                let state = shared_data.lock().await;
+                match state.session_manager.get_session(session_id.to_string()).await {
+                    Some(s) => s.get_use_database(),
+                    None => "default".to_string(),
                 }
-                Err(e) => e.to_string(),
+            };
+            match DomainService::from_create_table(create_table, &default_schema) {
+                Ok(_table) => {
+                    match helpers::run_task_for_input(shared_data, session_id, "create_table", name.to_string(), 30).await {
+                        Ok(loc) => {
+                            let table_name = name.to_string();
+                            let creq = ms::CreateTableRequest {
+                                schema_name: String::new(),
+                                table_name: table_name.clone(),
+                                engine: String::new(),
+                                columns: Vec::new(),
+                            };
+                            let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
+                            match MetastoreClient::connect_with_shared(shared_data).await {
+                                Ok(mut client) => {
+                                    match client.execute(mreq).await {
+                                        Ok(resp) => log::info!("Metastore Execute response for CreateTable {}: {:?}", table_name, resp),
+                                        Err(e) => log::error!("Metastore Execute failed for CreateTable {}: {}", table_name, e),
+                                    }
+                                }
+                                Err(e) => log::error!("Failed to connect to metastore for CreateTable {}: {}", table_name, e),
+                            }
+                            format!("Table created successfully: {}", loc)
+                        }
+                        Err(e) => e.to_string(),
+                    }
+                }
+                Err(e) => format!("Domain validation failed: {}", e),
             }
         }
         // Add more statement handlers here

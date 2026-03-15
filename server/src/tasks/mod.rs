@@ -107,24 +107,10 @@ impl TaskManager {
         };
 
         if notifier_opt.is_none() {
-            // fallback to previous polling behavior if no notifier
-            let mut elapsed = std::time::Duration::from_secs(0);
-            let poll_interval = std::time::Duration::from_millis(200);
-            while elapsed < deadline {
-                if let Some(task_arc) = self.get_task(id).await {
-                    let t = task_arc.lock().await;
-                    match t.state {
-                        TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
-                        _ => {}
-                    }
-                } else { return None; }
-                tokio::time::sleep(poll_interval).await;
-                elapsed = Utc::now().signed_duration_since(start).to_std().unwrap_or_default();
-            }
-            if let Some(task_arc) = self.get_task(id).await {
-                let t = task_arc.lock().await;
-                return Some(t.clone());
-            }
+            // No notifier exists for this task — this should not happen because
+            // notifiers are created when tasks are created. Return None to
+            // indicate we cannot wait for completion.
+            log::warn!("No notifier found for task {} in wait_for_completion", id);
             return None;
         }
 

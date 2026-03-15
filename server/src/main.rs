@@ -18,6 +18,7 @@ mod auth_setup;
 mod statement_handler;
 mod tasks;
 mod workers;
+mod core;
 
 use crate::config::AppConfig;
 
