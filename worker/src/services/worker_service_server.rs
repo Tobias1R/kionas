@@ -42,6 +42,8 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
     ) -> Result<tonic::Response<worker_service::TaskResponse>, tonic::Status> {
         let req = request.into_inner();
         // TODO: Task execution logic
+        // print something
+        log::info!("Received task: {}", req.session_id);
         let resp = worker_service::TaskResponse {
             status: "ok".to_string(),
             error: String::new(),

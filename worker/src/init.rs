@@ -17,6 +17,15 @@ pub async fn init_worker(worker_id: &str) -> Result<(kionas::consul::WorkerInfo,
     let consul_url = std::env::var("CONSUL_URL").unwrap_or_else(|_| "http://kionas-consul:8500".to_string());
     let cluster_info = download_cluster_info(&consul_url).await?;
     println!("Cluster info: {:?}", cluster_info);
+    let log_level = cluster_info.logging["level"].clone().to_string();
+    let log_output = cluster_info.logging["output"].clone().to_string();
+    let log_format = cluster_info.logging["format"].clone().to_string();
+    // Initialize logging
+    if let Err(e) = kionas::logging::init_logging(&log_level, &log_output, &log_format) {
+        eprintln!("Failed to initialize logging: {}", e);
+    } else {
+        println!("Logging initialized with level: {}, output: {}, format: {}", log_level, log_output, log_format);
+    }
 
     let worker_config = download_worker_info(&consul_url, worker_id).await?;
     println!("Worker config: {:?}", worker_config.clone());

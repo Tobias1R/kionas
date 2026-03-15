@@ -20,14 +20,18 @@ impl Manager for WorkerConnectionManager {
     type Error = tonic::transport::Error;
 
     async fn create(&self) -> Result<Channel, tonic::transport::Error> {
+        log::info!("WorkerConnectionManager creating channel to {} (worker_id={}) ca_cert_present={}", self.endpoint, self.worker_id, self.ca_cert.is_some());
         let mut ep = Endpoint::from_shared(self.endpoint.clone())?;
         if let Some(ca) = &self.ca_cert {
             let ca_cert = tonic::transport::Certificate::from_pem(ca.clone());
-            let tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
+            let tls = tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(ca_cert)
+                .domain_name(self.worker_id.clone());
             ep = ep.tls_config(tls)?;
         }
         ep = ep.connect_timeout(Duration::from_secs(5));
-        ep.connect().await
+        // Use lazy connect so the pool can be created before the worker is actually accepting connections.
+        Ok(ep.connect_lazy())
     }
 
     async fn recycle(&self, conn: &mut Channel, _: &Metrics) -> RecycleResult<tonic::transport::Error> {

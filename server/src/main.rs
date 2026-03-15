@@ -12,10 +12,12 @@ mod auth;
 mod handlers;
 mod services;
 mod workers_pool;
+mod workers;
 mod warehouse;
 mod session;
 mod auth_setup;
 mod statement_handler;
+mod tasks;
 
 use crate::config::AppConfig;
 

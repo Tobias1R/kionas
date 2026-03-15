@@ -96,9 +96,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     println!("Unsupported query type.");
     // }
 
+    let query_use_warehouse = "use warehouse worker1;";
+    let request = warehouse_service::QueryRequest {
+        query: query_use_warehouse.to_string()
+    };
+    let mut grpc_request = Request::new(request);
+    grpc_request.metadata_mut().insert("session_id", MetadataValue::from_str(&session_id).unwrap());
+    grpc_request.metadata_mut().insert("authorization", MetadataValue::from_str(&format!("Bearer {}", token)).unwrap());
+    let mut warehouse_client = warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response: {:?}", response);
+
     let query = "create schema test_schema;";
 
     let schema_name = query.strip_prefix("create schema ").unwrap().trim_end_matches(';').trim();
+    let request = warehouse_service::QueryRequest {
+        query: query.to_string()
+    };
+    let mut grpc_request = Request::new(request);
+    grpc_request.metadata_mut().insert("session_id", MetadataValue::from_str(&session_id).unwrap());
+    grpc_request.metadata_mut().insert("authorization", MetadataValue::from_str(&format!("Bearer {}", token)).unwrap());
+    let mut warehouse_client = warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response: {:?}", response);
+
+    // create table
+    let query = "create table test_table (id int, name string);";
+
+    let table_name = query.strip_prefix("create table ").unwrap().trim_end_matches(';').trim();
     let request = warehouse_service::QueryRequest {
         query: query.to_string()
     };

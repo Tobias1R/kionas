@@ -3,7 +3,7 @@
 use tonic::{Request, Response, Status};
 use kionas::{get_digest, parse_env_vars};
 use std::sync::Arc;
-use crate::warehouse::state::{SharedData};
+use crate::warehouse::state::{SharedData, WorkerEntry};
 use crate::warehouse::Warehouse;
 use crate::workers_pool::get_new_pool;
 // Second gRPC service
@@ -39,12 +39,13 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             ),
         );
 
-        // create a connection pool to the worker (include scheme)
+        // create a connection pool address to the worker (include scheme)
         let pool_addr = if worker.port == 443 {
             format!("https://{}:{}", worker.host, worker.port)
         } else {
             format!("http://{}:{}", worker.host, worker.port)
         };
+        log::info!("Registering worker {} at {} (pool_addr={})", worker.name, worker.host, pool_addr);
 
         // attempt to read CA cert from config (if available) to trust worker TLS
         let cnf = shared_data.config.clone();
@@ -64,8 +65,18 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             None
         };
 
-        let pool = get_new_pool(pool_addr, worker.name.clone(), ca_bytes);
-        shared_data.worker_pools.lock().await.insert(digested.clone(), pool);
+        // Create a WorkerEntry and insert into SharedState.workers for lazy pool creation later
+        let warehouses = Arc::clone(&shared_data.warehouses);
+        let warehouse = Warehouse::new(
+            worker.name.clone(),
+            digested.clone(),
+            worker.host.clone(),
+            worker.port.clone() as u32,
+            worker.warehouse_type.clone(),
+        );
+        let entry = WorkerEntry::new(digested.clone(), warehouse.clone(), ca_bytes.clone());
+        shared_data.workers.lock().await.insert(digested.clone(), entry);
+        log::info!("Inserted worker entry for {} (key={})", worker.name, digested.clone());
         
 
         let response = interops_service::RegisterWorkerResponse {

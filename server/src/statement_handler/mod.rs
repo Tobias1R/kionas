@@ -1,3 +1,5 @@
+pub(crate) mod helpers;
+
 use crate::warehouse::state::SharedData;
 use crate::session::Session;
 use crate::warehouse::Warehouse;
@@ -51,6 +53,8 @@ pub async fn get_worker_addr_for_session(shared_data: &SharedData, session_id: &
     None
 }
 pub mod create_schema;
+pub mod use_warehouse;
+pub mod create_table;
 
 use kionas::parser::datafusion_sql::sqlparser::ast::{ObjectName, Statement};
 
@@ -62,7 +66,31 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
                 Err(e) => e.to_string(),
             }
         }
+        Statement::CreateTable(create_table) => {
+            // `CreateTable` is a tuple variant carrying a `CreateTable` struct; extract its `name`.
+            let name = &create_table.name;
+            match create_table::handle(name, session_id, shared_data).await {
+                Ok(s) => s,
+                Err(e) => e.to_string(),
+            }
+        }
         // Add more statement handlers here
         _ => "Unsupported statement".to_string(),
     }
+}
+
+/// Check for simple, service-level commands that don't parse into the
+/// standard SQL AST (for example `USE WAREHOUSE <name>`). If handled,
+/// return Some(message) to short-circuit normal parsing; otherwise
+/// return None to continue normal processing.
+pub async fn maybe_handle_direct_command(query: &str, session_id: &str, shared_data: &SharedData) -> Option<String> {
+    let q_trim = query.trim();
+    let q_lower = q_trim.to_lowercase();
+    if q_lower.starts_with("use warehouse") {
+        match use_warehouse::handle_use_warehouse(q_trim, session_id, shared_data).await {
+            Ok(msg) => return Some(msg),
+            Err(e) => return Some(format!("ERROR: {}", e)),
+        }
+    }
+    None
 }

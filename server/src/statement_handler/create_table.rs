@@ -1,25 +1,21 @@
-use kionas::parse_env_vars;
-use kionas::parser::datafusion_sql::sqlparser::ast::SchemaName;
-
+use kionas::parser::datafusion_sql::sqlparser::ast::ObjectName;
 use crate::services::worker_service_client::worker_service::{TaskRequest, Task};
-
 use crate::workers::{acquire_channel_with_heartbeat, send_task_to_worker};
 use crate::tasks::task_to_request;
 use std::collections::HashMap;
 use crate::warehouse::state::SharedData;
-
 use std::error::Error;
 
 use crate::statement_handler::helpers;
 
-pub async fn handle(schema_name: &SchemaName, session_id: &str, shared_data: &SharedData) -> Result<String, Box<dyn Error>> {
-    log::info!("create_schema::handle invoked for session {} schema={:?}", session_id, schema_name);
+pub async fn handle(table_name: &ObjectName, session_id: &str, shared_data: &SharedData) -> Result<String, Box<dyn Error>> {
+    log::info!("create_table::handle invoked for session {} table={:?}", session_id, table_name);
 
     // Resolve session and worker key
     let (session, key) = helpers::resolve_session_and_key(shared_data, session_id).await?;
 
     // Schedule task
-    let task_id = helpers::build_task_and_schedule(shared_data, "".to_string(), session_id, "create_schema", schema_name.to_string()).await?;
+    let task_id = helpers::build_task_and_schedule(shared_data, "".to_string(), session_id, "create_table", table_name.to_string()).await?;
 
     // Acquire pooled connection
     let conn = helpers::acquire_pooled_conn(shared_data, &key, &session.get_warehouse(), 10).await?;
@@ -39,7 +35,7 @@ pub async fn handle(schema_name: &SchemaName, session_id: &str, shared_data: &Sh
     log::info!("Received response from worker for session {} (task_id={})", session_id, task_id);
 
     if resp.status == "ok" {
-        Ok(format!("Schema created successfully: {}", resp.result_location))
+        Ok(format!("Table created successfully: {}", resp.result_location))
     } else {
         Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, resp.error)))
     }

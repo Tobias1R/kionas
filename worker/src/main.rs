@@ -51,10 +51,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = resolve_hostname(&worker_config.interops_host, worker_config.interops_port).await?;
     let svc = services::worker_service_server::WorkerService { shared_data };
     println!("Starting interops_server on {}", addr);
-    tonic::transport::Server::builder()
+    if worker_config.interops_port == 443 {
+        println!("Interops server will use TLS on port 443");
+        tonic::transport::Server::builder()
         .tls_config(tls_config)?
         .add_service(services::worker_service_server::worker_service::worker_service_server::WorkerServiceServer::new(svc))
         .serve(addr)
         .await?;
+    } else {
+        println!("Interops server will use port {}", worker_config.interops_port);
+        tonic::transport::Server::builder()
+        .add_service(services::worker_service_server::worker_service::worker_service_server::WorkerServiceServer::new(svc))
+        .serve(addr)
+        .await?;
+    }
+    
     Ok(())
 }

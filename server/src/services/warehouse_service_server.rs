@@ -17,6 +17,8 @@ use warehouse_service::{
 };
 
 use crate::services::request_context::RequestContext;
+use crate::tasks::{TaskManager, TaskState};
+use chrono::Utc;
 
 #[derive(Clone)]
 pub struct WarehouseService {
@@ -74,15 +76,45 @@ impl WarehouseServiceTrait for WarehouseService {
 
         let shared_data = self.shared_data.clone();
 
-        async fn handle_query(query: String, session_id: String, shared_data: SharedData) {
+        // Centralized handler for simple commands (e.g. `USE WAREHOUSE`) that
+        // do not produce a normal SQL AST. The logic lives in the
+        // `statement_handler` package so command handling is centralized.
+        if let Some(msg) = crate::statement_handler::maybe_handle_direct_command(&query_text, &session_id, &shared_data).await {
+            resp.message = msg;
+            return Ok(Response::new(resp));
+        }
+
+        async fn handle_query(query: String, session_id: String, shared_data: SharedData, query_id: String) {
             match parse_query(&query) {
                 Ok(statements) => {
                     println!("Parsed statements: {:?}", statements);
+
+                    // Acquire TaskManager reference without holding shared_data lock across awaits
+                    let task_manager = {
+                        let state = shared_data.lock().await;
+                        state.task_manager.clone()
+                    };
+
                     for stmt in &statements {
+                        // Create a task representing this statement
+                        let payload = format!("{:?}", stmt);
+                        let task_id = task_manager.create_task(query_id.clone(), session_id.clone(), "sql_statement".to_string(), payload).await;
+                        // Mark scheduled then running
+                        task_manager.set_state(&task_id, TaskState::Scheduled).await;
+                        task_manager.set_state(&task_id, TaskState::Running).await;
+
+                        // Execute handler synchronously (existing logic performs dispatch to worker)
                         let result = handle_statement(stmt, &session_id, &shared_data).await;
                         println!("Execution result: {}", result);
-                        // TODO: Populate response with result
-                        // Arrow-flight
+
+                        // Record the textual result as the result_location for now
+                        if let Some(task_arc) = task_manager.get_task(&task_id).await {
+                            let mut t = task_arc.lock().await;
+                            t.result_location = Some(result.clone());
+                            t.error = None;
+                            t.state = TaskState::Succeeded;
+                            t.finished_at = Some(Utc::now());
+                        }
                     }
                 }
                 Err(e) => {
@@ -91,7 +123,7 @@ impl WarehouseServiceTrait for WarehouseService {
             }
         }
 
-        handle_query(query_text.clone(), session_id.clone(), shared_data).await;
+        handle_query(query_text.clone(), session_id.clone(), shared_data, query_id.clone()).await;
 
         Ok(Response::new(resp))
     }

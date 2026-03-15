@@ -18,6 +18,9 @@ use hostname;
 use regex::Regex;
 use std::env;
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 #[derive(Debug, Clone)]
 pub enum RedisDatabases {
     Session = 0,
