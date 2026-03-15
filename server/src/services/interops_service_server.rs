@@ -112,6 +112,54 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
         Ok(Response::new(response))
     }
+    
+    async fn task_update(
+        &self,
+        request: Request<interops_service::TaskUpdateRequest>,
+    ) -> Result<Response<interops_service::TaskUpdateResponse>, Status> {
+        let upd = request.into_inner();
+        log::info!("Task update received: {} status={}", upd.task_id, upd.status);
+
+        let shared = self.shared_data.lock().await;
+        let tm = shared.task_manager.clone();
+
+        if let Some(task_arc) = tm.get_task(&upd.task_id).await {
+            let mut t = task_arc.lock().await;
+            let s = upd.status.to_lowercase();
+            match s.as_str() {
+                "running" => {
+                    t.state = crate::tasks::TaskState::Running;
+                }
+                "succeeded" | "success" | "ok" => {
+                    t.state = crate::tasks::TaskState::Succeeded;
+                    if !upd.result_location.is_empty() {
+                        t.result_location = Some(upd.result_location.clone());
+                    }
+                }
+                "failed" | "error" => {
+                    t.state = crate::tasks::TaskState::Failed;
+                    if !upd.error.is_empty() {
+                        t.error = Some(upd.error.clone());
+                    }
+                }
+                "cancelled" | "canceled" => {
+                    t.state = crate::tasks::TaskState::Cancelled;
+                }
+                _ => {
+                    // Unknown status, store it as error text
+                    t.error = Some(format!("unknown status from worker: {}", upd.status));
+                }
+            }
+        } else {
+            log::warn!("Task update for unknown task id: {}", upd.task_id);
+            // Proceed, but indicate not-found; still return ok to avoid worker retries
+            let resp = interops_service::TaskUpdateResponse { status: "not_found".into() };
+            return Ok(Response::new(resp));
+        }
+
+        let resp = interops_service::TaskUpdateResponse { status: "ok".into() };
+        Ok(Response::new(resp))
+    }
 }
 
 impl InteropsService {

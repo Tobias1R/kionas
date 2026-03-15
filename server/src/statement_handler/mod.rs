@@ -1,5 +1,9 @@
 pub(crate) mod helpers;
+pub mod use_warehouse;
 
+use kionas::parser::datafusion_sql::sqlparser::ast::{ObjectName, Statement};
+use crate::services::metastore_client::metastore_service as ms;
+use crate::services::metastore_client::MetastoreClient;
 use crate::warehouse::state::SharedData;
 use crate::session::Session;
 use crate::warehouse::Warehouse;
@@ -52,25 +56,53 @@ pub async fn get_worker_addr_for_session(shared_data: &SharedData, session_id: &
     log::warn!("Warehouse not found for session {} (uuid={})", session_id, worker_uuid);
     None
 }
-pub mod create_schema;
-pub mod use_warehouse;
-pub mod create_table;
 
-use kionas::parser::datafusion_sql::sqlparser::ast::{ObjectName, Statement};
 
 pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &SharedData) -> String {
     match stmt {
         Statement::CreateSchema { schema_name, .. } => {
-            match create_schema::handle(schema_name, session_id, shared_data).await {
-                Ok(s) => s,
+            match helpers::run_task_for_input(shared_data, session_id, "create_schema", schema_name.to_string(), 30).await {
+                Ok(loc) => {
+                    // After successful task dispatch/completion, inform metastore
+                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: schema_name.to_string() })) };
+                    match MetastoreClient::connect_with_shared(shared_data).await {
+                        Ok(mut client) => {
+                            match client.execute(mreq).await {
+                                Ok(resp) => log::info!("Metastore Execute response for CreateSchema: {:?}", resp),
+                                Err(e) => log::error!("Metastore Execute failed for CreateSchema: {}", e),
+                            }
+                        }
+                        Err(e) => log::error!("Failed to connect to metastore for CreateSchema: {}", e),
+                    }
+                    format!("Schema created successfully: {}", loc)
+                }
                 Err(e) => e.to_string(),
             }
         }
         Statement::CreateTable(create_table) => {
             // `CreateTable` is a tuple variant carrying a `CreateTable` struct; extract its `name`.
             let name = &create_table.name;
-            match create_table::handle(name, session_id, shared_data).await {
-                Ok(s) => s,
+            match helpers::run_task_for_input(shared_data, session_id, "create_table", name.to_string(), 30).await {
+                Ok(loc) => {
+                    let table_name = name.to_string();
+                    let creq = ms::CreateTableRequest {
+                        schema_name: String::new(),
+                        table_name: table_name.clone(),
+                        engine: String::new(),
+                        columns: Vec::new(),
+                    };
+                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
+                    match MetastoreClient::connect_with_shared(shared_data).await {
+                        Ok(mut client) => {
+                            match client.execute(mreq).await {
+                                Ok(resp) => log::info!("Metastore Execute response for CreateTable {}: {:?}", table_name, resp),
+                                Err(e) => log::error!("Metastore Execute failed for CreateTable {}: {}", table_name, e),
+                            }
+                        }
+                        Err(e) => log::error!("Failed to connect to metastore for CreateTable {}: {}", table_name, e),
+                    }
+                    format!("Table created successfully: {}", loc)
+                }
                 Err(e) => e.to_string(),
             }
         }

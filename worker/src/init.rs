@@ -13,7 +13,7 @@ use std::env;
 use kionas::consul::{download_cluster_info, download_worker_info};
 
 
-pub async fn init_worker(worker_id: &str) -> Result<(kionas::consul::WorkerInfo, kionas::consul::ClusterInfo), Box<dyn Error>> {
+pub async fn init_worker(worker_id: &str) -> Result<(kionas::consul::WorkerInfo, kionas::consul::ClusterInfo), Box<dyn Error + Send + Sync>> {
     let consul_url = std::env::var("CONSUL_URL").unwrap_or_else(|_| "http://kionas-consul:8500".to_string());
     let cluster_info = download_cluster_info(&consul_url).await?;
     println!("Cluster info: {:?}", cluster_info);
@@ -36,9 +36,9 @@ pub async fn init_worker(worker_id: &str) -> Result<(kionas::consul::WorkerInfo,
     let worker_port = worker_config.interops_port.clone();
     let master_addr = worker_config.server_url.clone();
 
-    let cert = std::fs::read(tls_cert_path)?;
-    let key = std::fs::read(tls_key_path)?;
-    let ca_cert = std::fs::read(ca_cert_path)?;
+    let cert = std::fs::read(tls_cert_path.clone())?;
+    let key = std::fs::read(tls_key_path.clone())?;
+    let ca_cert = std::fs::read(ca_cert_path.clone())?;
     let identity = Identity::from_pem(cert, key);
     let ca = tonic::transport::Certificate::from_pem(ca_cert);
     let master_tls_config = ClientTlsConfig::new().identity(identity).ca_certificate(ca);
@@ -52,6 +52,10 @@ pub async fn init_worker(worker_id: &str) -> Result<(kionas::consul::WorkerInfo,
         worker_id: worker_id_hash.clone(),
         host: local_hostname.clone(),
         port: worker_port as u32,
+        server_url: master_addr.clone().to_string(),
+        tls_cert_path: tls_cert_path,
+        tls_key_path: tls_key_path,
+        ca_cert_path: ca_cert_path
     };
     let shared_data = state::SharedData::new(worker_info.clone(), cluster_info.clone());
 

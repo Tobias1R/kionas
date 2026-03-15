@@ -6,6 +6,7 @@ use crate::warehouse::Warehouse;
 use crate::workers_pool::WorkerPool;
 use crate::session;
 use chrono::{DateTime, Utc};
+use tonic::transport::Channel;
 use std::collections::hash_map::Entry as HashEntry;
 use crate::tasks::TaskManager;
 use kionas::parse_env_vars;
@@ -23,6 +24,7 @@ pub struct SharedState {
     pub worker_pools: Arc<AsyncMutex<HashMap<String,WorkerPool>>>,
     pub task_manager: Arc<TaskManager>,
     pub workers: Arc<AsyncMutex<HashMap<String, WorkerEntry>>>,
+    pub metastore_channel: Arc<AsyncMutex<Option<Channel>>>,
     pub config: Option<AppConfig>,
 }
 
@@ -36,6 +38,7 @@ impl SharedState {
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
             task_manager: Arc::new(TaskManager::new()),
             workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            metastore_channel: Arc::new(AsyncMutex::new(None)),
             config: Some(config),
         }
     }
@@ -51,6 +54,7 @@ impl Default for SharedState {
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
             task_manager: Arc::new(TaskManager::new()),
             workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            metastore_channel: Arc::new(AsyncMutex::new(None)),
             config: None,
         }
     }

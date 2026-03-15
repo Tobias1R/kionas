@@ -12,6 +12,10 @@ pub struct WorkerInformation {
     pub worker_id: String,
     pub host: String,
     pub port: u32,
+    pub server_url: String,
+    pub tls_cert_path: String,
+    pub tls_key_path: String,
+    pub ca_cert_path: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]

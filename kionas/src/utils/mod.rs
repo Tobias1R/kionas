@@ -4,10 +4,14 @@ use sysinfo::{ProcessExt, System, SystemExt};
 pub async fn resolve_hostname(
     hostname: &str,
     port: u16,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>> {
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let addr = format!("{}:{}", hostname, port);
-    let mut addrs = tokio::net::lookup_host(addr).await?;
-    addrs.next().ok_or_else(|| "No address found".into())
+    let mut addrs = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    addrs
+        .next()
+        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No address found")) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 pub async fn check_tcp_addr(host: &str, port: u16, name: &str) -> bool {

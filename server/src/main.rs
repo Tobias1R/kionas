@@ -12,17 +12,17 @@ mod auth;
 mod handlers;
 mod services;
 mod workers_pool;
-mod workers;
 mod warehouse;
 mod session;
 mod auth_setup;
 mod statement_handler;
 mod tasks;
+mod workers;
 
 use crate::config::AppConfig;
 
  #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = AppConfig::from_args().await;
     server::run(config).await
 }

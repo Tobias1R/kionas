@@ -7,6 +7,8 @@ service InteropsService {
     rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
     // Worker heartbeat
     rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
+    // Worker reports updates about tasks previously scheduled by the server
+    rpc TaskUpdate (TaskUpdateRequest) returns (TaskUpdateResponse);
     
 }
 
@@ -28,5 +30,16 @@ message HeartbeatRequest {
 }
 
 message HeartbeatResponse {
+    string status = 1;
+}
+
+message TaskUpdateRequest {
+    string task_id = 1;
+    string status = 2; // e.g., running, succeeded, failed
+    string result_location = 3;
+    string error = 4;
+}
+
+message TaskUpdateResponse {
     string status = 1;
 }

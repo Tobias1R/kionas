@@ -18,6 +18,8 @@ use warehouse_service::{
 
 use crate::services::request_context::RequestContext;
 use crate::tasks::{TaskManager, TaskState};
+use kionas::parser::datafusion_sql::sqlparser::ast::{Statement, ObjectName};
+use crate::services::metastore_client::metastore_service as ms;
 use chrono::Utc;
 
 #[derive(Clone)]
@@ -75,7 +77,17 @@ impl WarehouseServiceTrait for WarehouseService {
 
 
         let shared_data = self.shared_data.clone();
-
+        
+        // Attempt to fetch and log the full session (if available) for better observability
+        if !ctx.session_id.is_empty() {
+            let session_manager = {
+                let sd = shared_data.lock().await;
+                sd.session_manager.clone()
+            };
+            if let Some(sess) = session_manager.get_session(ctx.session_id.clone()).await {
+                log::info!("Session: {:?}", sess);
+            }
+        }
         // Centralized handler for simple commands (e.g. `USE WAREHOUSE`) that
         // do not produce a normal SQL AST. The logic lives in the
         // `statement_handler` package so command handling is centralized.
@@ -84,46 +96,28 @@ impl WarehouseServiceTrait for WarehouseService {
             return Ok(Response::new(resp));
         }
 
-        async fn handle_query(query: String, session_id: String, shared_data: SharedData, query_id: String) {
-            match parse_query(&query) {
-                Ok(statements) => {
-                    println!("Parsed statements: {:?}", statements);
+        match parse_query(&query_text) {
+            Ok(statements) => {
+                println!("Parsed statements: {:?}", statements);
 
-                    // Acquire TaskManager reference without holding shared_data lock across awaits
-                    let task_manager = {
-                        let state = shared_data.lock().await;
-                        state.task_manager.clone()
-                    };
+                // Acquire TaskManager reference without holding shared_data lock across awaits
+                let task_manager = {
+                    let state = shared_data.lock().await;
+                    state.task_manager.clone()
+                };
 
-                    for stmt in &statements {
-                        // Create a task representing this statement
-                        let payload = format!("{:?}", stmt);
-                        let task_id = task_manager.create_task(query_id.clone(), session_id.clone(), "sql_statement".to_string(), payload).await;
-                        // Mark scheduled then running
-                        task_manager.set_state(&task_id, TaskState::Scheduled).await;
-                        task_manager.set_state(&task_id, TaskState::Running).await;
-
+                for stmt in &statements {
                         // Execute handler synchronously (existing logic performs dispatch to worker)
                         let result = handle_statement(stmt, &session_id, &shared_data).await;
                         println!("Execution result: {}", result);
 
-                        // Record the textual result as the result_location for now
-                        if let Some(task_arc) = task_manager.get_task(&task_id).await {
-                            let mut t = task_arc.lock().await;
-                            t.result_location = Some(result.clone());
-                            t.error = None;
-                            t.state = TaskState::Succeeded;
-                            t.finished_at = Some(Utc::now());
-                        }
-                    }
-                }
-                Err(e) => {
-                    println!("Failed to parse query: {}", e);
+                        // statement_handler now performs any metastore actions after dispatch.
                 }
             }
+            Err(e) => {
+                println!("Failed to parse query: {}", e);
+            }
         }
-
-        handle_query(query_text.clone(), session_id.clone(), shared_data, query_id.clone()).await;
 
         Ok(Response::new(resp))
     }

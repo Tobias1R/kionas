@@ -4,7 +4,7 @@ use tokio::fs;
 use kionas::parse_env_vars;
 use crate::{config::AppConfig, tls};
 
-pub async fn build_server_tls(cfg: &AppConfig) -> Result<ServerTlsConfig, Box<dyn Error>> {
+pub async fn build_server_tls(cfg: &AppConfig) -> Result<ServerTlsConfig, Box<dyn Error + Send + Sync>> {
     let default_tls_cert = parse_env_vars("${KIONAS_HOME}/certs/kionas/kionas.crt");
     let default_tls_key = parse_env_vars("${KIONAS_HOME}/certs/kionas/kionas.key");
     let wh_info = cfg.warehouse.clone();
@@ -31,7 +31,7 @@ pub async fn build_server_tls(cfg: &AppConfig) -> Result<ServerTlsConfig, Box<dy
 }
 
 
-pub async fn build_interops_tls(cfg: &AppConfig) -> Result<(ServerTlsConfig, Certificate), Box<dyn Error>> {
+pub async fn build_interops_tls(cfg: &AppConfig) -> Result<(ServerTlsConfig, Certificate), Box<dyn Error + Send + Sync>> {
     let default_tls_cert = "${KIONAS_HOME}/certs/interopsserver.crt";
     let default_tls_key = "${KIONAS_HOME}/certs/interopsserver.key";
     let iops_info = cfg.interops.clone();

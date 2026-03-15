@@ -6,7 +6,7 @@ use tonic::transport::Server;
 use tonic::transport::ServerTlsConfig;
 use tonic_reflection::server::Builder as ReflectionBuilder;
 
-type ServerFuture = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
+type ServerFuture = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send>>;
 
 pub fn build_servers<A, W, I>(
     wh_tls_config: ServerTlsConfig,
@@ -50,7 +50,7 @@ where
             )
             .serve(warehouse_addr)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn Error>);
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
 
         srv
     });
@@ -68,7 +68,7 @@ where
             )
             .serve(interops_addr)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn Error>);
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
 
         srv
     });

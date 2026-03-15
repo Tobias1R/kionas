@@ -6,7 +6,7 @@ use crate::workers_pool::{WorkerPool, WorkerConnectionManager};
 
 pub type PooledConn = Object<WorkerConnectionManager>;
 
-pub async fn acquire_channel_with_heartbeat(pool: &WorkerPool, worker_id: &str, timeout_secs: u64) -> Result<PooledConn, Box<dyn Error>> {
+pub async fn acquire_channel_with_heartbeat(pool: &WorkerPool, worker_id: &str, timeout_secs: u64) -> Result<PooledConn, Box<dyn Error + Send + Sync>> {
     match timeout(Duration::from_secs(timeout_secs), pool.get()).await {
         Ok(Ok(conn)) => {
             // perform heartbeat
@@ -23,7 +23,7 @@ pub async fn acquire_channel_with_heartbeat(pool: &WorkerPool, worker_id: &str, 
     }
 }
 
-pub async fn send_task_to_worker(conn: PooledConn, req: crate::services::worker_service_client::worker_service::TaskRequest, timeout_secs: u64) -> Result<crate::services::worker_service_client::worker_service::TaskResponse, Box<dyn Error>> {
+pub async fn send_task_to_worker(conn: PooledConn, req: crate::services::worker_service_client::worker_service::TaskRequest, timeout_secs: u64) -> Result<crate::services::worker_service_client::worker_service::TaskResponse, Box<dyn Error + Send + Sync>> {
     let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
     match timeout(Duration::from_secs(timeout_secs), client.execute_task(tonic::Request::new(req))).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),

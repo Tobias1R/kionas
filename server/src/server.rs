@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 
 
-pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error>> {
+pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
    
     // Initialize logging
     if let Err(e) = kionas::logging::init_logging(&config.logging.level, &config.logging.output, &config.logging.format) {

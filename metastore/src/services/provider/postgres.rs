@@ -31,7 +31,7 @@ pub struct PostgresProvider {
 }
 
 impl PostgresProvider {
-    pub fn new(config: &MetastoreConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(config: &MetastoreConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut pg_cfg = tokio_postgres::Config::new();
         pg_cfg.host(&config.postgres_host);
         pg_cfg.port(config.postgres_port);
@@ -63,6 +63,8 @@ impl MetastoreProvider for PostgresProvider {
         };
         let stmt = "INSERT INTO catalogs (name, owner) VALUES ($1, $2) RETURNING id";
         let owner = "kionas";
+        // print
+        println!("Creating schema '{}' with owner '{}'", req.schema_name, owner);
         match client.query_one(stmt, &[&req.schema_name, &owner]).await {
             Ok(_row) => CreateSchemaResponse {
                 success: true,

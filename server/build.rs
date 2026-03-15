@@ -1,4 +1,3 @@
-use std::env;
 use std::path::PathBuf;
 
 fn main() {
@@ -8,6 +7,7 @@ fn main() {
         "../kionas/proto/worker_service.proto",
         "../kionas/proto/warehouse_auth_service.proto",
         "../kionas/proto/interops_service.proto",
+        "../kionas/proto/metastore_service.proto"
         ];
     let descriptor_path = PathBuf::from("../kionas/generated/").join("grpc.reflection.v1alpha");
     tonic_build::configure()
