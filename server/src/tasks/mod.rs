@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{RwLock, Mutex, Notify};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
@@ -52,15 +52,17 @@ impl Task {
 }
 
 pub type TaskMap = Arc<RwLock<HashMap<String, Arc<Mutex<Task>>>>>;
+pub type TaskNotifiers = Arc<RwLock<HashMap<String, Arc<Notify>>>>;
 
 #[derive(Clone, Debug)]
 pub struct TaskManager {
     tasks: TaskMap,
+    notifiers: TaskNotifiers,
 }
 
 impl TaskManager {
     pub fn new() -> Self {
-        TaskManager { tasks: Arc::new(RwLock::new(HashMap::new())) }
+        TaskManager { tasks: Arc::new(RwLock::new(HashMap::new())), notifiers: Arc::new(RwLock::new(HashMap::new())) }
     }
 
     pub async fn create_task(&self, query_id: String, session_id: String, operation: String, payload: String) -> String {
@@ -69,6 +71,10 @@ impl TaskManager {
         let at = Arc::new(Mutex::new(t));
         let mut map = self.tasks.write().await;
         map.insert(id.clone(), at);
+        // create and register a notifier for this task so waiters can be notified
+        let notifier = Arc::new(Notify::new());
+        let mut not_map = self.notifiers.write().await;
+        not_map.insert(id.clone(), notifier);
         id
     }
 
@@ -79,25 +85,71 @@ impl TaskManager {
 
     /// Wait for task to reach a terminal state or timeout.
     pub async fn wait_for_completion(&self, id: &str, timeout_secs: u64) -> Option<Task> {
-        use tokio::time::{timeout, Duration, sleep};
+        use tokio::time::{timeout, Duration};
         let start = Utc::now();
         let deadline = Duration::from_secs(timeout_secs);
-        let mut elapsed = Duration::from_secs(0);
-        loop {
-            if elapsed >= deadline { break; }
+
+        // Fast-path: if task already terminal, return immediately
+        if let Some(task_arc) = self.get_task(id).await {
+            let t = task_arc.lock().await;
+            match t.state {
+                TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
+                _ => {}
+            }
+        } else {
+            return None;
+        }
+
+        // Get notifier for this task
+        let notifier_opt = {
+            let nmap = self.notifiers.read().await;
+            nmap.get(id).cloned()
+        };
+
+        if notifier_opt.is_none() {
+            // fallback to previous polling behavior if no notifier
+            let mut elapsed = std::time::Duration::from_secs(0);
+            let poll_interval = std::time::Duration::from_millis(200);
+            while elapsed < deadline {
+                if let Some(task_arc) = self.get_task(id).await {
+                    let t = task_arc.lock().await;
+                    match t.state {
+                        TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
+                        _ => {}
+                    }
+                } else { return None; }
+                tokio::time::sleep(poll_interval).await;
+                elapsed = Utc::now().signed_duration_since(start).to_std().unwrap_or_default();
+            }
             if let Some(task_arc) = self.get_task(id).await {
                 let t = task_arc.lock().await;
-                match t.state {
-                    TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
-                    _ => {}
-                }
-            } else {
-                return None;
+                return Some(t.clone());
             }
-            let sleep_d = Duration::from_millis(200);
-            let _ = timeout(deadline - elapsed, sleep(sleep_d)).await;
-            elapsed = Utc::now().signed_duration_since(start).to_std().unwrap_or_default();
+            return None;
         }
+
+        let notifier = notifier_opt.unwrap();
+        // Wait until notifier signals or timeout
+        loop {
+            let elapsed = Utc::now().signed_duration_since(start).to_std().unwrap_or_default();
+            if elapsed >= deadline { break; }
+            let remaining = deadline - elapsed;
+            // wait for notification with timeout = remaining
+            let notified = timeout(remaining, notifier.notified()).await;
+            match notified {
+                Ok(_) => {
+                    if let Some(task_arc) = self.get_task(id).await {
+                        let t = task_arc.lock().await;
+                        match t.state {
+                            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
+                            _ => continue,
+                        }
+                    } else { return None; }
+                }
+                Err(_) => break, // timeout
+            }
+        }
+
         // final read
         if let Some(task_arc) = self.get_task(id).await {
             let t = task_arc.lock().await;
@@ -110,13 +162,40 @@ impl TaskManager {
     pub async fn set_state(&self, id: &str, new_state: TaskState) {
         if let Some(task_arc) = self.get_task(id).await {
             let mut t = task_arc.lock().await;
-            t.state = new_state;
+            t.state = new_state.clone();
             if let TaskState::Running = t.state {
                 t.started_at = Some(Utc::now());
             }
             if let TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled = t.state {
                 t.finished_at = Some(Utc::now());
             }
+        }
+        // notify waiters if any
+        if let Some(n) = { let nmap = self.notifiers.read().await; nmap.get(id).cloned() } {
+            n.notify_waiters();
+        }
+    }
+
+    /// Update task fields based on worker update and notify waiters.
+    pub async fn update_from_worker(&self, id: &str, new_state: TaskState, result_location: Option<String>, error: Option<String>) {
+        if let Some(task_arc) = self.get_task(id).await {
+            let mut t = task_arc.lock().await;
+            t.state = new_state.clone();
+            if let Some(loc) = result_location {
+                t.result_location = Some(loc);
+            }
+            if let Some(err) = error {
+                t.error = Some(err);
+            }
+            if let TaskState::Running = t.state {
+                t.started_at = Some(Utc::now());
+            }
+            if let TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled = t.state {
+                t.finished_at = Some(Utc::now());
+            }
+        }
+        if let Some(n) = { let nmap = self.notifiers.read().await; nmap.get(id).cloned() } {
+            n.notify_waiters();
         }
     }
 }

@@ -33,6 +33,7 @@ impl MetastoreClient {
         {
             let mut opt_chan = shared_chan.lock().await;
             if let Some(chan) = opt_chan.as_ref() {
+                log::info!("Reusing cached metastore channel");
                 return Ok(Self { inner: MetastoreServiceClient::new(chan.clone()) });
             }
         }
@@ -51,12 +52,14 @@ impl MetastoreClient {
             }
         }
 
+        log::info!("Creating new metastore channel to {}", addr);
         let chan = ep.connect().await?;
 
         // Cache the channel for future requests
         {
             let mut opt_chan = shared_chan.lock().await;
             *opt_chan = Some(chan.clone());
+            log::info!("Cached metastore channel for reuse");
         }
 
         Ok(Self { inner: MetastoreServiceClient::new(chan) })

@@ -123,33 +123,23 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         let shared = self.shared_data.lock().await;
         let tm = shared.task_manager.clone();
 
-        if let Some(task_arc) = tm.get_task(&upd.task_id).await {
-            let mut t = task_arc.lock().await;
+        if let Some(_task_arc) = tm.get_task(&upd.task_id).await {
             let s = upd.status.to_lowercase();
-            match s.as_str() {
-                "running" => {
-                    t.state = crate::tasks::TaskState::Running;
-                }
+            let (state, result_loc, err) = match s.as_str() {
+                "running" => (crate::tasks::TaskState::Running, None, None),
                 "succeeded" | "success" | "ok" => {
-                    t.state = crate::tasks::TaskState::Succeeded;
-                    if !upd.result_location.is_empty() {
-                        t.result_location = Some(upd.result_location.clone());
-                    }
+                    let rl = if !upd.result_location.is_empty() { Some(upd.result_location.clone()) } else { None };
+                    (crate::tasks::TaskState::Succeeded, rl, None)
                 }
                 "failed" | "error" => {
-                    t.state = crate::tasks::TaskState::Failed;
-                    if !upd.error.is_empty() {
-                        t.error = Some(upd.error.clone());
-                    }
+                    let er = if !upd.error.is_empty() { Some(upd.error.clone()) } else { None };
+                    (crate::tasks::TaskState::Failed, None, er)
                 }
-                "cancelled" | "canceled" => {
-                    t.state = crate::tasks::TaskState::Cancelled;
-                }
-                _ => {
-                    // Unknown status, store it as error text
-                    t.error = Some(format!("unknown status from worker: {}", upd.status));
-                }
-            }
+                "cancelled" | "canceled" => (crate::tasks::TaskState::Cancelled, None, None),
+                _ => (crate::tasks::TaskState::Failed, None, Some(format!("unknown status from worker: {}", upd.status))),
+            };
+            // Update via TaskManager helper so waiters are notified
+            tm.update_from_worker(&upd.task_id, state, result_loc, err).await;
         } else {
             log::warn!("Task update for unknown task id: {}", upd.task_id);
             // Proceed, but indicate not-found; still return ok to avoid worker retries
