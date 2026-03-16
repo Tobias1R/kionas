@@ -134,5 +134,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
     println!("Server response: {:?}", response);
 
+    // create database
+    let querydb = "create database test_database;";
+
+    let reqdb = warehouse_service::QueryRequest {
+        query: querydb.to_string()
+    };
+    let mut grpc_request = Request::new(reqdb);
+    grpc_request.metadata_mut().insert("session_id", MetadataValue::from_str(&session_id).unwrap());
+    grpc_request.metadata_mut().insert("authorization", MetadataValue::from_str(&format!("Bearer {}", token)).unwrap());
+    let mut warehouse_client = warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response: {:?}", response);
+
     Ok(())
 }

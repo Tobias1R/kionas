@@ -5,6 +5,10 @@ use kionas::parser::datafusion_sql::sqlparser::ast::{
     OnCommit, Ident, Expr, OneOrManyWithParens, ClusteredBy, RowAccessPolicy, Tag, 
     StorageSerializationPolicy, RefreshModeKind, InitializeKind, WrappedCollection};
 use kionas::parser::datafusion_sql::sqlparser;
+use crate::statement_handler::helpers;
+use crate::warehouse::state::SharedData;
+use crate::services::metastore_client::metastore_service as ms;
+use crate::services::metastore_client::MetastoreClient;
 
 #[derive(Clone, Debug)]
 pub struct KionasTable {
@@ -201,5 +205,35 @@ impl DomainResource for KionasTable {
             return Err("table must have at least one column".to_string());
         }
         Ok(())
+    }
+}
+
+impl KionasTable {
+    pub async fn apply(self, session_id: &str, shared_data: &SharedData) -> Result<String, String> {
+        // Dispatch task to worker
+        let payload = self.name.to_string();
+        match helpers::run_task_for_input(shared_data, session_id, "create_table", payload.clone(), 30).await {
+            Ok(loc) => {
+                // Persist to metastore
+                let table_name = payload;
+                let creq = ms::CreateTableRequest {
+                    schema_name: String::new(),
+                    table_name: table_name.clone(),
+                    engine: String::new(),
+                    columns: Vec::new(),
+                };
+                let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
+                match MetastoreClient::connect_with_shared(shared_data).await {
+                    Ok(mut client) => {
+                        match client.execute(mreq).await {
+                            Ok(_) => Ok(format!("Table created successfully: {}", loc)),
+                            Err(e) => Err(format!("Metastore Execute failed for CreateTable {}: {}", table_name, e)),
+                        }
+                    }
+                    Err(e) => Err(format!("Failed to connect to metastore for CreateTable {}: {}", table_name, e)),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 }

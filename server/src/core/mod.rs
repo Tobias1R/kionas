@@ -12,9 +12,11 @@ pub trait DomainResource {
 pub mod catalog;
 pub mod table;
 pub mod warehouse;
+pub mod database;
 pub mod domain_service;
 
 pub use catalog::KionasCatalog;
 pub use table::KionasTable;
 pub use warehouse::KionasWarehouse;
+pub use database::KionasDatabase;
 pub use domain_service::DomainService;

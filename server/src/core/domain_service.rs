@@ -1,5 +1,5 @@
-use crate::core::{KionasCatalog, KionasTable, DomainResource};
-use kionas::parser::datafusion_sql::sqlparser::ast::{SchemaName, ColumnDef, Ident, CreateTable};
+use crate::core::{KionasCatalog, KionasTable, KionasDatabase, DomainResource};
+use kionas::parser::datafusion_sql::sqlparser::ast::{SchemaName, ColumnDef, Ident, CreateTable, ObjectName};
 
 pub struct DomainService {}
 
@@ -24,5 +24,12 @@ impl DomainService {
         let t = KionasTable::new((*ct).clone());
         DomainResource::validate(&t)?;
         Ok(t)
+    }
+
+    pub fn from_create_database(name: &ObjectName, owner: &str) -> Result<KionasDatabase, String> {
+        let n = name.to_string();
+        let d = KionasDatabase::new(n, owner.to_string());
+        d.validate()?;
+        Ok(d)
     }
 }

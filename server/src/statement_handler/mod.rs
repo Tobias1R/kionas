@@ -71,23 +71,10 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
                 }
             };
             match DomainService::from_create_schema(schema_name, &owner) {
-                Ok(_catalog) => {
-                    match helpers::run_task_for_input(shared_data, session_id, "create_schema", schema_name.to_string(), 30).await {
-                        Ok(loc) => {
-                            // Persist to metastore (use domain-derived request in future)
-                            let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: schema_name.to_string() })) };
-                            match MetastoreClient::connect_with_shared(shared_data).await {
-                                Ok(mut client) => {
-                                    match client.execute(mreq).await {
-                                        Ok(resp) => log::info!("Metastore Execute response for CreateSchema: {:?}", resp),
-                                        Err(e) => log::error!("Metastore Execute failed for CreateSchema: {}", e),
-                                    }
-                                }
-                                Err(e) => log::error!("Failed to connect to metastore for CreateSchema: {}", e),
-                            }
-                            format!("Schema created successfully: {}", loc)
-                        }
-                        Err(e) => e.to_string(),
+                Ok(catalog) => {
+                    match catalog.apply(session_id, shared_data).await {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Failed to create schema: {}", e),
                     }
                 }
                 Err(e) => format!("Domain validation failed: {}", e),
@@ -105,29 +92,51 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
                 }
             };
             match DomainService::from_create_table(create_table, &default_schema) {
-                Ok(_table) => {
-                    match helpers::run_task_for_input(shared_data, session_id, "create_table", name.to_string(), 30).await {
-                        Ok(loc) => {
-                            let table_name = name.to_string();
-                            let creq = ms::CreateTableRequest {
-                                schema_name: String::new(),
-                                table_name: table_name.clone(),
-                                engine: String::new(),
-                                columns: Vec::new(),
-                            };
-                            let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
-                            match MetastoreClient::connect_with_shared(shared_data).await {
-                                Ok(mut client) => {
-                                    match client.execute(mreq).await {
-                                        Ok(resp) => log::info!("Metastore Execute response for CreateTable {}: {:?}", table_name, resp),
-                                        Err(e) => log::error!("Metastore Execute failed for CreateTable {}: {}", table_name, e),
-                                    }
-                                }
-                                Err(e) => log::error!("Failed to connect to metastore for CreateTable {}: {}", table_name, e),
-                            }
-                            format!("Table created successfully: {}", loc)
-                        }
-                        Err(e) => e.to_string(),
+                Ok(table) => {
+                    match table.apply(session_id, shared_data).await {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Failed to create table: {}", e),
+                    }
+                }
+                Err(e) => format!("Domain validation failed: {}", e),
+            }
+        }
+        
+        Statement::CreateDatabase {
+            db_name, 
+            if_not_exists, 
+            location,
+            managed_location,
+            or_replace,
+            transient,
+            clone,
+            data_retention_time_in_days,
+            max_data_extension_time_in_days,
+            external_volume,
+            catalog,
+            replace_invalid_characters,
+            default_ddl_collation,
+            storage_serialization_policy,
+            comment,
+            catalog_sync,
+            catalog_sync_namespace_mode,
+            catalog_sync_namespace_flatten_delimiter,
+            with_tags,
+            with_contacts
+             , .. } => {
+            // Build domain object from AST and validate
+            let owner = {
+                let state = shared_data.lock().await;
+                match state.session_manager.get_session(session_id.to_string()).await {
+                    Some(s) => s.get_role(),
+                    None => "unknown".to_string(),
+                }
+            };
+            match DomainService::from_create_database(db_name, &owner) {
+                Ok(db) => {
+                    match db.apply(session_id, shared_data).await {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Failed to create database: {}", e),
                     }
                 }
                 Err(e) => format!("Domain validation failed: {}", e),
