@@ -31,3 +31,30 @@ pub async fn send_task_to_worker(conn: PooledConn, req: crate::services::worker_
         Err(_) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out executing task"))),
     }
 }
+
+pub async fn send_prepare_to_worker(conn: PooledConn, req: crate::services::worker_service_client::worker_service::PrepareRequest, timeout_secs: u64) -> Result<crate::services::worker_service_client::worker_service::PrepareResponse, Box<dyn Error + Send + Sync>> {
+    let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
+    match timeout(Duration::from_secs(timeout_secs), client.prepare(tonic::Request::new(req))).await {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("prepare error: {:?}", e)))),
+        Err(_) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out during prepare"))),
+    }
+}
+
+pub async fn send_commit_to_worker(conn: PooledConn, req: crate::services::worker_service_client::worker_service::CommitRequest, timeout_secs: u64) -> Result<crate::services::worker_service_client::worker_service::CommitResponse, Box<dyn Error + Send + Sync>> {
+    let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
+    match timeout(Duration::from_secs(timeout_secs), client.commit(tonic::Request::new(req))).await {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("commit error: {:?}", e)))),
+        Err(_) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out during commit"))),
+    }
+}
+
+pub async fn send_abort_to_worker(conn: PooledConn, req: crate::services::worker_service_client::worker_service::AbortRequest, timeout_secs: u64) -> Result<crate::services::worker_service_client::worker_service::AbortResponse, Box<dyn Error + Send + Sync>> {
+    let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
+    match timeout(Duration::from_secs(timeout_secs), client.abort(tonic::Request::new(req))).await {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("abort error: {:?}", e)))),
+        Err(_) => Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out during abort"))),
+    }
+}

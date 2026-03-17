@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
-use crate::config::AppConfig;
+use kionas::config::AppConfig;
 use crate::warehouse::Warehouse;
 use crate::workers_pool::WorkerPool;
 use crate::session;
@@ -144,14 +144,16 @@ impl SharedState {
 
         // Read CA from config if present
         let ca_bytes = if let Some(cfg) = &self.config {
-            if !cfg.interops.ca_cert.is_empty() {
-                match std::fs::read(parse_env_vars(&cfg.interops.ca_cert).as_str()) {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        log::warn!("Failed to read interops ca_cert {}: {}", cfg.interops.ca_cert, e);
-                        None
+            if let Some(iops) = cfg.services.interops.as_ref() {
+                if !iops.ca_cert.is_empty() {
+                    match std::fs::read(parse_env_vars(&iops.ca_cert).as_str()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            log::warn!("Failed to read interops ca_cert {}: {}", iops.ca_cert, e);
+                            None
+                        }
                     }
-                }
+                } else { None }
             } else { None }
         } else { None };
 

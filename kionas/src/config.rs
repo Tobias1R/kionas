@@ -1,0 +1,202 @@
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fs;
+use clap::Parser;
+use crate::parse_env_vars;
+use serde_json::Value as JsonValue;
+
+use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
+
+/// Typed application config used by all binaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    /*
+    This struct is designed to be flexible and support various deployment scenarios. 
+    The `mode` field can be used to indicate the role of the instance 
+    (e.g., "gateway", "server", "worker", "metastore"), 
+    allowing for different configurations based on the mode. 
+    The TLS certificate and key fields can be overridden by environment variables or 
+    Consul values, providing flexibility in how certificates are managed across different environments.
+     */
+    pub mode: String, // gateway, server, worker, metastore 
+    // Consul
+    pub consul_host: String,
+    // logging
+    pub logging: LoggingConfig,
+    // service endpoints
+    pub services: ServicesConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteropsConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls_cert: String,
+    pub tls_key: String,
+    pub ca_cert: String,
+    pub mode: String, // http or https
+    pub operation: String, // interops or metastore
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarehouseConfig {
+    pub host: String,
+    pub port: u16,
+    pub tls_cert: String,
+    pub tls_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServicesConfig {    
+    pub security: Option<SecurityConfig>,    
+    pub interops: Option<InteropsConfig>,
+    pub warehouse: Option<WarehouseConfig>,
+    pub postgres: Option<PostgresServiceConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub format: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    pub token: String,
+    pub secret: String,
+    pub data_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    pub storage_type: String,
+    pub bucket: String,
+    pub region: String,
+    pub endpoint: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    pub nodes: Vec<String>,
+    pub master: String,
+    pub storage: StorageConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PostgresServiceConfig {    
+    pub postgres_host: String,
+    pub postgres_port: u16,
+    pub postgres_db: String,
+    pub postgres_user: String,
+    pub postgres_password: String,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
+}
+
+/// Try to fetch a raw value from Consul for the given key. Returns Ok(None) if key not found.
+pub async fn fetch_consul_raw(consul_addr: &str, key: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let base = consul_addr.trim_end_matches('/');
+    let url = format!("{}/v1/kv/{}?raw", base, key);
+    let resp = reqwest::get(&url).await?;
+    match resp.status().as_u16() {
+        200 => {
+            let txt = resp.text().await?;
+            Ok(Some(txt))
+        }
+        404 => Ok(None),
+        s => Err(format!("consul returned unexpected status {} for {}", s, url).into()),
+    }
+}
+
+/// Load an `AppConfig` for a hostname. Resolution order:
+/// 1. Consul at `consul_addr` key `configs/<hostname>` (if `consul_addr` provided)
+/// 2. Local file `/workspace/configs/<hostname>.json` or `.toml`
+/// 3. Error
+pub async fn load_for_host(consul_addr: Option<&str>, hostname: &str) -> Result<AppConfig, Box<dyn Error + Send + Sync>> {
+    // Helper to walk a JSON value and substitute ${ENV} in all strings
+    fn substitute_env(v: JsonValue) -> JsonValue {
+        match v {
+            JsonValue::String(s) => JsonValue::String(parse_env_vars(&s)),
+            JsonValue::Array(arr) => JsonValue::Array(arr.into_iter().map(substitute_env).collect()),
+            JsonValue::Object(map) => {
+                let mapped = map.into_iter().map(|(k, val)| (k, substitute_env(val))).collect();
+                JsonValue::Object(mapped)
+            }
+            other => other,
+        }
+    }
+
+    // Try consul
+    if let Some(ca) = consul_addr {
+        if let Ok(Some(raw)) = fetch_consul_raw(ca, &format!("{}/{}", CONSUL_NODE_CONFIG_PREFIX, hostname)).await {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                let j: JsonValue = serde_json::from_str(&raw)?;
+                let j = substitute_env(j);
+                let cfg: AppConfig = serde_json::from_value(j)?;
+                return Ok(cfg);
+            } else {
+                // parse TOML then convert to JSON value for substitution
+                let t: toml::Value = toml::from_str(&raw)?;
+                let j = serde_json::to_value(t)?;
+                let j = substitute_env(j);
+                let cfg: AppConfig = serde_json::from_value(j)?;
+                return Ok(cfg);
+            }
+        }
+    }
+
+    // Local fallback (use CLI arg --config or default)
+    #[derive(Parser, Debug)]
+    #[command(author, version, about, long_about = None)]
+    struct Args {
+        #[arg(short, long, default_value = "configs/server.toml")]
+        config: String,
+    }
+
+    let args = Args::parse();
+    let path = args.config;
+    let content = fs::read_to_string(&path)?;
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let j: JsonValue = serde_json::from_str(&content)?;
+        let j = substitute_env(j);
+        let cfg: AppConfig = serde_json::from_value(j)?;
+        return Ok(cfg);
+    } else {
+        let t: toml::Value = toml::from_str(&content)?;
+        let j = serde_json::to_value(t)?;
+        let j = substitute_env(j);
+        let cfg: AppConfig = serde_json::from_value(j)?;
+        return Ok(cfg);
+    }
+}
+
+
+/// Load cluster-wide config: tries consul at `cluster/<key>` then `/workspace/configs/cluster.json`.
+pub async fn load_cluster_config(consul_addr: Option<&str>) -> Result<ClusterConfig, Box<dyn Error + Send + Sync>> {
+    if let Some(ca) = consul_addr {
+        if let Ok(Some(raw)) = fetch_consul_raw(ca, CONSUL_CLUSTER_KEY).await {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                let cfg: ClusterConfig = serde_json::from_str(&raw)?;
+                return Ok(cfg);
+            } else {
+                let cfg: ClusterConfig = toml::from_str(&raw)?;
+                return Ok(cfg);
+            }
+        }
+    }
+
+    let json_path = "/workspace/configs/cluster.json";
+    if let Ok(content) = fs::read_to_string(json_path) {
+        let cfg: ClusterConfig = serde_json::from_str(&content)?;
+        return Ok(cfg);
+    }
+
+    Err("failed to load cluster config from consul or /workspace/configs/cluster.json".into())
+}

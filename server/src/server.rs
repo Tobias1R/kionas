@@ -3,7 +3,8 @@ use kionas::utils::{print_memory_usage, print_server_info};
 
 use std::sync::Arc;
 
-use crate::{config::AppConfig, tls as tlsmod, warehouse::state::{SharedData, SharedState}};
+use kionas::config::AppConfig;
+use crate::{tls as tlsmod, warehouse::state::{SharedData, SharedState}};
 use crate::consul::{ConsulClient, ClusterConfig};
 
 use crate::handlers;
@@ -70,16 +71,22 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     // reflection descriptor bytes will be passed to handlers to build the reflection service
     let reflection_descriptor: &'static [u8] = include_bytes!("../../kionas/generated/grpc.reflection.v1alpha");
 
-    let security_info = config.security.clone();
-   
+    let security_info = match config.services.security.clone() {
+        Some(s) => s,
+        None => {
+            eprintln!("Missing security configuration under services.security");
+            std::process::exit(1);
+        }
+    };
+
     let jwt_secret = security_info.secret.clone();
     let data_path = security_info.data_path.clone();
 
     // Initialize authentication related pieces
     let (jwt_interceptor, auth_service) = match auth_setup::initialize_auth(
         crate::warehouse::state::SharedData::default(),
-        config.security.secret.clone(),
-        config.security.data_path.clone(),
+        jwt_secret.clone(),
+        data_path.clone(),
     ).await
     {
         Ok((jwt, auth)) => {
@@ -92,8 +99,23 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
     };
 
-    let warehouse_addr = resolve_hostname(&config.warehouse.host, config.warehouse.port).await?;
-    let interops_addr = resolve_hostname(&config.interops.host, config.interops.port).await?;
+    let warehouse_cfg = match config.services.warehouse.as_ref() {
+        Some(w) => w,
+        None => {
+            eprintln!("Missing services.warehouse configuration");
+            std::process::exit(1);
+        }
+    };
+    let interops_cfg = match config.services.interops.as_ref() {
+        Some(i) => i,
+        None => {
+            eprintln!("Missing services.interops configuration");
+            std::process::exit(1);
+        }
+    };
+
+    let warehouse_addr = resolve_hostname(&warehouse_cfg.host, warehouse_cfg.port).await?;
+    let interops_addr = resolve_hostname(&interops_cfg.host, interops_cfg.port).await?;
 
 
 
@@ -193,8 +215,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
     });
 
-    let address = config.warehouse.host.clone();
-    let port = config.warehouse.port.clone();
+    let address = warehouse_cfg.host.clone();
+    let port = warehouse_cfg.port.clone();
     log::info!("Starting server on {}:{}", address, port);
     print_server_info();
     print_memory_usage();

@@ -22,6 +22,10 @@ message MetastoreRequest {
     CreateSchemaRequest create_schema = 4;
     DropSchemaRequest drop_schema = 5;
     GetSchemaRequest get_schema = 6;
+    // Transaction-related requests
+    CreateTransactionRequest create_transaction = 20;
+    UpdateTransactionStateRequest update_transaction_state = 21;
+    GetTransactionRequest get_transaction = 22;
     // Additional requests can be added here
   }
 }
@@ -35,6 +39,10 @@ message MetastoreResponse {
     CreateSchemaResponse create_schema_response = 4;
     DropSchemaResponse drop_schema_response = 5;
     GetSchemaResponse get_schema_response = 6;
+    // Transaction-related responses
+    CreateTransactionResponse create_transaction_response = 20;
+    UpdateTransactionStateResponse update_transaction_state_response = 21;
+    GetTransactionResponse get_transaction_response = 22;
     // Additional responses can be added here
   }
 }
@@ -135,6 +143,61 @@ message SchemaMetadata {
   string schema_name = 2;
   string location = 3;
   string container = 4;
+}
+
+// Transaction messages
+enum TransactionState {
+  PREPARING = 0;
+  PREPARED = 1;
+  COMMITTING = 2;
+  COMMITTED = 3;
+  ABORTED = 4;
+}
+
+message Participant {
+  string id = 1;
+  string target = 2;
+  string staging_prefix = 3;
+}
+
+message Transaction {
+  string tx_id = 1;
+  TransactionState state = 2;
+  repeated Participant participants = 3;
+  string created_at = 4; // ISO8601
+  string updated_at = 5; // ISO8601
+}
+
+message CreateTransactionRequest {
+  string tx_id = 1;
+  repeated Participant participants = 2;
+}
+
+message CreateTransactionResponse {
+  bool success = 1;
+  string message = 2;
+  Transaction transaction = 3;
+}
+
+message UpdateTransactionStateRequest {
+  string tx_id = 1;
+  TransactionState state = 2;
+}
+
+message UpdateTransactionStateResponse {
+  bool success = 1;
+  string message = 2;
+  Transaction transaction = 3;
+}
+
+message GetTransactionRequest {
+  string tx_id = 1;
+}
+
+message GetTransactionResponse {
+  bool success = 1;
+  string message = 2;
+  Transaction transaction = 3;
 }
 
 message CatalogMetadata {

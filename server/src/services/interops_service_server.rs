@@ -50,13 +50,17 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         // attempt to read CA cert from config (if available) to trust worker TLS
         let cnf = shared_data.config.clone();
         let ca_bytes = if let Some(cfg) = cnf {
-            if !cfg.interops.ca_cert.is_empty() {
-                match std::fs::read(parse_env_vars(&cfg.interops.ca_cert).as_str()) {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        log::warn!("Failed to read interops ca_cert {}: {}", cfg.interops.ca_cert, e);
-                        None
+            if let Some(iops) = cfg.services.interops.as_ref() {
+                if !iops.ca_cert.is_empty() {
+                    match std::fs::read(parse_env_vars(&iops.ca_cert).as_str()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            log::warn!("Failed to read interops ca_cert {}: {}", iops.ca_cert, e);
+                            None
+                        }
                     }
+                } else {
+                    None
                 }
             } else {
                 None

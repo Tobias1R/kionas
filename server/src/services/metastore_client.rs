@@ -43,11 +43,13 @@ impl MetastoreClient {
         let mut ep = Endpoint::from_shared(addr.clone())?;
 
         if let Some(c) = cfg {
-            if !c.interops.ca_cert.is_empty() {
-                if let Ok(ca_bytes) = std::fs::read(kionas::parse_env_vars(&c.interops.ca_cert).as_str()) {
-                    let ca = tonic::transport::Certificate::from_pem(ca_bytes);
-                    let tls = ClientTlsConfig::new().ca_certificate(ca);
-                    ep = ep.tls_config(tls)?;
+            if let Some(iops) = c.services.interops.as_ref() {
+                if !iops.ca_cert.is_empty() {
+                    if let Ok(ca_bytes) = std::fs::read(kionas::parse_env_vars(&iops.ca_cert).as_str()) {
+                        let ca = tonic::transport::Certificate::from_pem(ca_bytes);
+                        let tls = ClientTlsConfig::new().ca_certificate(ca);
+                        ep = ep.tls_config(tls)?;
+                    }
                 }
             }
         }

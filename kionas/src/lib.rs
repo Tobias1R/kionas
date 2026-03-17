@@ -4,6 +4,7 @@ pub mod session;
 pub mod parser;
 pub mod consul;
 pub mod constants;
+pub mod config;
 
 use uuid::Uuid;
 use chrono::Utc;

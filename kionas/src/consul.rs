@@ -1,18 +1,14 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::constants::CONSUL_CLUSTER_KEY;
+use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ClusterInfo {
     pub nodes: Vec<String>,
-    pub server: serde_json::Value,
-    pub logging: serde_json::Value,
-    pub security: serde_json::Value,
+    pub master: String,
     pub storage: serde_json::Value,
-    pub warehouse: serde_json::Value,
-    pub interops: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -49,7 +45,7 @@ pub async fn download_cluster_info(consul_url: &str) -> Result<ClusterInfo, Box<
 // Download worker information. Worker configs are populate inside the key configs/<worker_id>
 pub async fn download_worker_info(consul_url: &str, worker_id: &str) -> Result<WorkerInfo, Box<dyn std::error::Error + Send + Sync>> {
     let client = Client::new();
-    let url = format!("{}/v1/kv/kionas/configs/{}?raw", consul_url, worker_id);
+    let url = format!("{}/v1/kv/{}{}?raw", consul_url, CONSUL_NODE_CONFIG_PREFIX, worker_id);
     println!("[DEBUG] Requesting worker info from: {}", url);
     let resp = client.get(&url).send().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?.text().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     println!("[DEBUG] Raw response: {}", resp);

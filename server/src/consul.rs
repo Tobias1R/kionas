@@ -1,7 +1,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::config::AppConfig;
+use kionas::config::AppConfig;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {

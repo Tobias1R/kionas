@@ -8,6 +8,8 @@ use crate::warehouse::state::SharedData;
 use crate::core::DomainService;
 use crate::session::Session;
 use crate::warehouse::Warehouse;
+use crate::transactions::Maestro;
+use crate::transactions::Participant;
 
 /// Discover worker address tied to session
 pub async fn get_worker_addr_for_session(shared_data: &SharedData, session_id: &str) -> Option<String> {
@@ -72,9 +74,27 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
             };
             match DomainService::from_create_schema(schema_name, &owner) {
                 Ok(catalog) => {
-                    match catalog.apply(session_id, shared_data).await {
-                        Ok(msg) => msg,
-                        Err(e) => format!("Failed to create schema: {}", e),
+                    // Transactional create: coordinate with Maestro
+                    match helpers::resolve_session_and_key(shared_data, session_id).await {
+                        Ok((_session, key)) => {
+                            let participant = Participant { id: key.clone(), target: key.clone(), staging_prefix: format!("schema-{}", schema_name.to_string()) };
+                            let maestro = Maestro::new(shared_data.clone());
+                            match maestro.execute_transaction(vec![participant], 3, 120).await {
+                                Ok(tx) => {
+                                    // Persist schema metadata
+                                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: schema_name.to_string() })) };
+                                    match MetastoreClient::connect_with_shared(shared_data).await {
+                                        Ok(mut client) => match client.execute(mreq).await {
+                                            Ok(_) => format!("Schema created successfully (tx={}): {}", tx, schema_name),
+                                            Err(e) => format!("Schema created but failed to persist in metastore: {}", e),
+                                        },
+                                        Err(e) => format!("Schema created but failed to connect to metastore: {}", e),
+                                    }
+                                }
+                                Err(e) => format!("Failed to create schema transactionally: {}", e),
+                            }
+                        }
+                        Err(e) => format!("Failed to resolve worker for schema create: {}", e),
                     }
                 }
                 Err(e) => format!("Domain validation failed: {}", e),
@@ -93,9 +113,34 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
             };
             match DomainService::from_create_table(create_table, &default_schema) {
                 Ok(table) => {
-                    match table.apply(session_id, shared_data).await {
-                        Ok(msg) => msg,
-                        Err(e) => format!("Failed to create table: {}", e),
+                    // Resolve participant (single-worker for now)
+                    match helpers::resolve_session_and_key(shared_data, session_id).await {
+                        Ok((_session, key)) => {
+                            let table_name = table.name.to_string();
+                            let participant = Participant { id: key.clone(), target: key.clone(), staging_prefix: format!("table-{}", table_name) };
+                            let maestro = Maestro::new(shared_data.clone());
+                            match maestro.execute_transaction(vec![participant], 3, 180).await {
+                                Ok(tx) => {
+                                    // Persist table metadata to metastore
+                                    let creq = ms::CreateTableRequest {
+                                        schema_name: default_schema.clone(),
+                                        table_name: table_name.clone(),
+                                        engine: String::new(),
+                                        columns: Vec::new(),
+                                    };
+                                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
+                                    match MetastoreClient::connect_with_shared(shared_data).await {
+                                        Ok(mut client) => match client.execute(mreq).await {
+                                            Ok(_) => format!("Table created successfully (tx={}): {}", tx, table_name),
+                                            Err(e) => format!("Table committed but failed to persist in metastore: {}", e),
+                                        },
+                                        Err(e) => format!("Table committed but failed to connect to metastore: {}", e),
+                                    }
+                                }
+                                Err(e) => format!("Failed to create table transactionally: {}", e),
+                            }
+                        }
+                        Err(e) => format!("Failed to resolve worker for table create: {}", e),
                     }
                 }
                 Err(e) => format!("Domain validation failed: {}", e),
@@ -134,9 +179,25 @@ pub async fn handle_statement(stmt: &Statement, session_id: &str, shared_data: &
             };
             match DomainService::from_create_database(db_name, &owner) {
                 Ok(db) => {
-                    match db.apply(session_id, shared_data).await {
-                        Ok(msg) => msg,
-                        Err(e) => format!("Failed to create database: {}", e),
+                    match helpers::resolve_session_and_key(shared_data, session_id).await {
+                        Ok((_session, key)) => {
+                            let participant = Participant { id: key.clone(), target: key.clone(), staging_prefix: format!("database-{}", db_name.to_string()) };
+                            let maestro = Maestro::new(shared_data.clone());
+                            match maestro.execute_transaction(vec![participant], 3, 180).await {
+                                Ok(tx) => {
+                                    let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateSchema(ms::CreateSchemaRequest { schema_name: db_name.to_string() })) };
+                                    match MetastoreClient::connect_with_shared(shared_data).await {
+                                        Ok(mut client) => match client.execute(mreq).await {
+                                            Ok(_) => format!("Database created successfully (tx={}): {}", tx, db_name),
+                                            Err(e) => format!("Database committed but failed to persist in metastore: {}", e),
+                                        },
+                                        Err(e) => format!("Database committed but failed to connect to metastore: {}", e),
+                                    }
+                                }
+                                Err(e) => format!("Failed to create database transactionally: {}", e),
+                            }
+                        }
+                        Err(e) => format!("Failed to resolve worker for database create: {}", e),
                     }
                 }
                 Err(e) => format!("Domain validation failed: {}", e),

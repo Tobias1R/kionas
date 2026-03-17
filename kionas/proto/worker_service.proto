@@ -60,4 +60,40 @@ service WorkerService {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ExecuteTask(TaskRequest) returns (TaskResponse);
   rpc GetFlightInfo(FlightInfoRequest) returns (FlightInfoResponse);
+  // Transactional helpers for 2PC-lite
+  rpc Prepare(PrepareRequest) returns (PrepareResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message PrepareRequest {
+  string tx_id = 1;
+  string session_id = 2;
+  string staging_prefix = 3;
+  repeated Task tasks = 4; // tasks to stage
+}
+
+message PrepareResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CommitRequest {
+  string tx_id = 1;
+  string staging_prefix = 2;
+}
+
+message CommitResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message AbortRequest {
+  string tx_id = 1;
+  string staging_prefix = 2;
+}
+
+message AbortResponse {
+  bool success = 1;
+  string message = 2;
 }
