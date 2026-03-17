@@ -1,19 +1,21 @@
+mod init;
+mod interops;
 mod services;
 mod state;
-mod init;
 mod storage;
+mod transactions;
+mod txn;
 
 pub mod interops_service {
     tonic::include_proto!("interops_service");
 }
 
-
-use std::error::Error;
-use kionas::utils::{resolve_hostname,};
 use kionas::config;
 use kionas::get_local_hostname;
-use std::env;
+use kionas::utils::resolve_hostname;
 use log;
+use std::env;
+use std::error::Error;
 
 // Try to install a default rustls CryptoProvider at startup to avoid runtime
 // ambiguity when multiple provider features are compiled into dependencies.
@@ -51,11 +53,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Try to load unified AppConfig for this worker
     let app_cfg = match config::load_for_host(consul_url.as_deref(), &worker_id).await {
         Ok(cfg) => {
-            println!("Loaded AppConfig for worker {}: consul_host={}", worker_id, cfg.consul_host);
+            println!(
+                "Loaded AppConfig for worker {}: consul_host={}",
+                worker_id, cfg.consul_host
+            );
             cfg
         }
         Err(_) => {
-            println!("No AppConfig found for worker {}, continuing with defaults or existing env vars", worker_id);
+            println!(
+                "No AppConfig found for worker {}, continuing with defaults or existing env vars",
+                worker_id
+            );
             std::process::exit(1);
         }
     };
@@ -64,10 +72,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!("Worker {} initialized successfully", worker_id);
     // print a line ----------
-    println!("-----------------------------");    
+    println!("-----------------------------");
     // debug worker config
     println!("Worker config: {:?}", &app_cfg);
-    let interops = app_cfg.services.interops.ok_or("missing services.interops in AppConfig")?;
+    let interops = app_cfg
+        .services
+        .interops
+        .ok_or("missing services.interops in AppConfig")?;
     println!("Interops config: {:?}", interops);
     println!("Cluster info: {:?}", cluster_info);
     // Build TLS config
@@ -76,10 +87,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let ca_cert = std::fs::read(&interops.ca_cert)?;
     let identity = tonic::transport::Identity::from_pem(cert, key);
     let ca = tonic::transport::Certificate::from_pem(ca_cert);
-    let tls_config = tonic::transport::ServerTlsConfig::new()
+    let _tls_config = tonic::transport::ServerTlsConfig::new()
         .identity(identity)
         .client_ca_root(ca);
-    println!("TLS configuration built successfully for worker {}", worker_id);
+    println!(
+        "TLS configuration built successfully for worker {}",
+        worker_id
+    );
 
     let addr = resolve_hostname(&interops.host, interops.port).await?;
 
@@ -91,7 +105,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         server_url: interops.host.clone(),
         tls_cert_path: interops.tls_cert.clone(),
         tls_key_path: interops.tls_key.clone(),
-        ca_cert_path: interops.ca_cert.clone()
+        ca_cert_path: interops.ca_cert.clone(),
     };
     let mut shared_data = crate::state::SharedData::new(worker_info, cluster_info);
 
@@ -102,20 +116,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!("Attached storage provider to shared state");
         }
         Err(e) => {
-            eprintln!("Warning: failed to build storage provider: {}. continuing without it", e);
+            eprintln!(
+                "Warning: failed to build storage provider: {}. continuing without it",
+                e
+            );
         }
     }
 
+    // NOTE: Pool creation is performed lazily inside the transactions maestro.
+    // Avoid building the interops pool at startup to prevent duplicate init
+    // paths and allow the worker to start even if master is temporarily
+    // unreachable. The pool will be created on demand when needed.
+    println!("Interops pool will be lazily initialized by transactions::maestro when required");
+
     // Start interops_server
-    
+
     let svc = services::worker_service_server::WorkerService { shared_data };
     println!("Starting interops_server on {}", addr);
-        tonic::transport::Server::builder()
+    tonic::transport::Server::builder()
         //.tls_config(tls_config)?
         .add_service(services::worker_service_server::worker_service::worker_service_server::WorkerServiceServer::new(svc))
         .serve(addr)
         .await?;
-    
-    
+
     Ok(())
 }

@@ -1,6 +1,6 @@
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
-use tonic::{service::Interceptor, Request, Status};
+use tonic::{Request, Status, service::Interceptor};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -43,12 +43,14 @@ impl Interceptor for JwtInterceptor {
 
         self.validate_token(token)?;
 
-        if let Some(session_id) = request.metadata().get("session_id").and_then(|header| header.to_str().ok()) {
+        if let Some(_session_id) = request
+            .metadata()
+            .get("session_id")
+            .and_then(|header| header.to_str().ok())
+        {
             Ok(request)
         } else {
             return Err(Status::unauthenticated("Missing session_id"));
         }
-
-        
     }
 }

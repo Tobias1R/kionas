@@ -1,16 +1,11 @@
-
 mod services;
 
-use kionas::config;
-use serde_json::Value as JsonValue;
 use crate::services::metastore_service::{MetastoreService, metastore_service};
 use crate::services::provider::postgres::PostgresProvider;
 use kionas::utils::resolve_hostname;
-use tonic::transport::{Identity, ServerTlsConfig, Server};
 use std::error::Error;
 use std::sync::Arc;
-
-use kionas::{parse_env_vars, };
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -24,15 +19,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let app_cfg = kionas::config::load_for_host(consul_url.as_deref(), &hostname).await?;
 
     // Map AppConfig -> use sections directly
-    let interops = app_cfg.services.interops.ok_or("missing services.interops in AppConfig")?;
-    let pg = app_cfg.services.postgres.ok_or("missing services.postgres in AppConfig")?;
+    let interops = app_cfg
+        .services
+        .interops
+        .ok_or("missing services.interops in AppConfig")?;
+    let pg = app_cfg
+        .services
+        .postgres
+        .ok_or("missing services.postgres in AppConfig")?;
 
     // TLS for metastore gRPC server comes from services.interops
     let cert = std::fs::read(kionas::parse_env_vars(&interops.tls_cert))?;
     let key = std::fs::read(kionas::parse_env_vars(&interops.tls_key))?;
     let identity = Identity::from_pem(cert, key);
     // TLS setup
-    let tls_config =ServerTlsConfig::new().identity(identity);
+    let tls_config = ServerTlsConfig::new().identity(identity);
 
     // Initialize Postgres provider using shared PostgresServiceConfig
     let pg_provider = Arc::new(PostgresProvider::new(&pg)?);

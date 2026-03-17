@@ -1,5 +1,5 @@
-use crate::core::{KionasCatalog, KionasTable, KionasDatabase, DomainResource};
-use kionas::parser::datafusion_sql::sqlparser::ast::{SchemaName, ColumnDef, Ident, CreateTable, ObjectName};
+use crate::core::{DomainResource, KionasCatalog, KionasDatabase, KionasTable};
+use kionas::parser::datafusion_sql::sqlparser::ast::{CreateTable, ObjectName, SchemaName};
 
 pub struct DomainService {}
 
@@ -12,10 +12,13 @@ impl DomainService {
         Ok(c)
     }
 
-    pub fn from_create_table(ct: &CreateTable, default_schema: &str) -> Result<KionasTable, String> {
-        let table_name = ct.name.to_string();
+    pub fn from_create_table(
+        ct: &CreateTable,
+        _default_schema: &str,
+    ) -> Result<KionasTable, String> {
+        let _table_name = ct.name.to_string();
         // Build simple column list (name, type) using debug formatting for type
-        let mut cols: Vec<(String,String)> = Vec::new();
+        let mut cols: Vec<(String, String)> = Vec::new();
         for col in ct.columns.iter() {
             let cname = col.name.to_string();
             let ctype = format!("{:?}", col.data_type);

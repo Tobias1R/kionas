@@ -1,13 +1,10 @@
-
-
-use core::hash;
-use std::sync::Arc;
+use crate::interops::manager::InteropsManager;
+use crate::storage::StorageProvider;
+use deadpool::managed::Pool;
 use kionas::consul::ClusterInfo;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use crate::storage::StorageProvider;
 use std::fmt;
-
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Clone, Default, Debug)]
 pub struct WorkerInformation {
@@ -26,6 +23,8 @@ pub struct SharedData {
     pub cluster_info: ClusterInfo,
     #[serde(skip)]
     pub storage_provider: Option<Arc<dyn StorageProvider + Send + Sync>>,
+    #[serde(skip)]
+    pub master_pool: Arc<tokio::sync::Mutex<Option<Arc<Pool<InteropsManager>>>>>,
 }
 
 impl fmt::Debug for SharedData {
@@ -41,12 +40,24 @@ impl SharedData {
     pub fn new(worker_info: WorkerInformation, cluster_info: ClusterInfo) -> Self {
         SharedData {
             worker_info,
-            cluster_info
-            , storage_provider: None
+            cluster_info,
+            storage_provider: None,
+            master_pool: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     pub fn set_storage_provider(&mut self, prov: Arc<dyn StorageProvider + Send + Sync>) {
         self.storage_provider = Some(prov);
+    }
+
+    pub fn set_master_pool(&mut self, pool: Arc<Pool<InteropsManager>>) {
+        // best-effort synchronous set for initialization paths
+        let mutex = self.master_pool.clone();
+        // spawn a task to set it since we can't block here
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut guard = mutex.lock().await;
+            *guard = Some(pool_clone);
+        });
     }
 }

@@ -1,16 +1,12 @@
-
-
-use tonic::{Request, Response, Status};
+use crate::warehouse::Warehouse;
+use crate::warehouse::state::{SharedData, WorkerEntry};
 use kionas::{get_digest, parse_env_vars};
 use std::sync::Arc;
-use crate::warehouse::state::{SharedData, WorkerEntry};
-use crate::warehouse::Warehouse;
-use crate::workers_pool::get_new_pool;
+use tonic::{Request, Response, Status};
 // Second gRPC service
 pub mod interops_service {
     tonic::include_proto!("interops_service");
 }
-
 
 #[derive(Default)]
 pub struct InteropsService {
@@ -45,7 +41,12 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         } else {
             format!("http://{}:{}", worker.host, worker.port)
         };
-        log::info!("Registering worker {} at {} (pool_addr={})", worker.name, worker.host, pool_addr);
+        log::info!(
+            "Registering worker {} at {} (pool_addr={})",
+            worker.name,
+            worker.host,
+            pool_addr
+        );
 
         // attempt to read CA cert from config (if available) to trust worker TLS
         let cnf = shared_data.config.clone();
@@ -70,7 +71,7 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
 
         // Create a WorkerEntry and insert into SharedState.workers for lazy pool creation later
-        let warehouses = Arc::clone(&shared_data.warehouses);
+        let _warehouses = Arc::clone(&shared_data.warehouses);
         let warehouse = Warehouse::new(
             worker.name.clone(),
             digested.clone(),
@@ -79,13 +80,20 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             worker.warehouse_type.clone(),
         );
         let entry = WorkerEntry::new(digested.clone(), warehouse.clone(), ca_bytes.clone());
-        shared_data.workers.lock().await.insert(digested.clone(), entry);
-        log::info!("Inserted worker entry for {} (key={})", worker.name, digested.clone());
-        
+        shared_data
+            .workers
+            .lock()
+            .await
+            .insert(digested.clone(), entry);
+        log::info!(
+            "Inserted worker entry for {} (key={})",
+            worker.name,
+            digested.clone()
+        );
 
         let response = interops_service::RegisterWorkerResponse {
             status: "ok".into(),
-            uuid: digested.clone()
+            uuid: digested.clone(),
         };
         log::info!("Worker registered: {:?}", digested);
         Ok(Response::new(response))
@@ -116,13 +124,17 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
         Ok(Response::new(response))
     }
-    
+
     async fn task_update(
         &self,
         request: Request<interops_service::TaskUpdateRequest>,
     ) -> Result<Response<interops_service::TaskUpdateResponse>, Status> {
         let upd = request.into_inner();
-        log::info!("Task update received: {} status={}", upd.task_id, upd.status);
+        log::info!(
+            "Task update received: {} status={}",
+            upd.task_id,
+            upd.status
+        );
 
         let shared = self.shared_data.lock().await;
         let tm = shared.task_manager.clone();
@@ -132,32 +144,51 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             let (state, result_loc, err) = match s.as_str() {
                 "running" => (crate::tasks::TaskState::Running, None, None),
                 "succeeded" | "success" | "ok" => {
-                    let rl = if !upd.result_location.is_empty() { Some(upd.result_location.clone()) } else { None };
+                    let rl = if !upd.result_location.is_empty() {
+                        Some(upd.result_location.clone())
+                    } else {
+                        None
+                    };
                     (crate::tasks::TaskState::Succeeded, rl, None)
                 }
                 "failed" | "error" => {
-                    let er = if !upd.error.is_empty() { Some(upd.error.clone()) } else { None };
+                    let er = if !upd.error.is_empty() {
+                        Some(upd.error.clone())
+                    } else {
+                        None
+                    };
                     (crate::tasks::TaskState::Failed, None, er)
                 }
                 "cancelled" | "canceled" => (crate::tasks::TaskState::Cancelled, None, None),
-                _ => (crate::tasks::TaskState::Failed, None, Some(format!("unknown status from worker: {}", upd.status))),
+                _ => (
+                    crate::tasks::TaskState::Failed,
+                    None,
+                    Some(format!("unknown status from worker: {}", upd.status)),
+                ),
             };
             // Update via TaskManager helper so waiters are notified
-            tm.update_from_worker(&upd.task_id, state, result_loc, err).await;
+            tm.update_from_worker(&upd.task_id, state, result_loc, err)
+                .await;
         } else {
             log::warn!("Task update for unknown task id: {}", upd.task_id);
             // Proceed, but indicate not-found; still return ok to avoid worker retries
-            let resp = interops_service::TaskUpdateResponse { status: "not_found".into() };
+            let resp = interops_service::TaskUpdateResponse {
+                status: "not_found".into(),
+            };
             return Ok(Response::new(resp));
         }
 
-        let resp = interops_service::TaskUpdateResponse { status: "ok".into() };
+        let resp = interops_service::TaskUpdateResponse {
+            status: "ok".into(),
+        };
         Ok(Response::new(resp))
     }
 }
 
 impl InteropsService {
     pub fn new(shared_data: SharedData) -> Self {
-        Self { shared_data: Arc::clone(&shared_data) }
+        Self {
+            shared_data: Arc::clone(&shared_data),
+        }
     }
 }

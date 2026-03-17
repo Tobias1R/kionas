@@ -1,13 +1,12 @@
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::warehouse::state::SharedData;
-use crate::services::metastore_client::metastore_service as ms;
 use crate::services::metastore_client::MetastoreClient;
-use crate::workers::PooledConn;
-use tokio::time::{timeout, Duration};
+use crate::services::metastore_client::metastore_service as ms;
+use crate::warehouse::state::SharedData;
 use tokio::time::sleep;
+use tokio::time::{Duration, timeout};
 
 /// Transaction states for the Maestro coordinator.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,12 +53,20 @@ pub struct Maestro {
 impl Maestro {
     /// Create a new Maestro instance bound to the shared server state.
     pub fn new(shared: SharedData) -> Self {
-        Self { shared, active: Arc::new(RwLock::new(Vec::new())) }
+        Self {
+            shared,
+            active: Arc::new(RwLock::new(Vec::new())),
+        }
     }
 
     /// High-level execution: begin -> prepare (with retries/backoff) -> commit
     /// Returns tx_id on success.
-    pub async fn execute_transaction(&self, participants: Vec<Participant>, max_retries: u8, overall_timeout_secs: u64) -> Result<String, String> {
+    pub async fn execute_transaction(
+        &self,
+        participants: Vec<Participant>,
+        max_retries: u8,
+        overall_timeout_secs: u64,
+    ) -> Result<String, String> {
         // Begin transaction and persist PREPARING
         let tx_id = self.begin_transaction(participants.clone()).await?;
 
@@ -80,7 +87,11 @@ impl Maestro {
                         if attempt > max_retries {
                             // give up and abort
                             let _ = this.abort(&tx_id_for_closure).await;
-                            return Err(format!("prepare failed after {} attempts: {}", attempt - 1, e));
+                            return Err(format!(
+                                "prepare failed after {} attempts: {}",
+                                attempt - 1,
+                                e
+                            ));
                         } else {
                             // backoff (exponential)
                             let backoff_ms = 250u64.checked_shl(attempt as u32).unwrap_or(1000);
@@ -113,7 +124,10 @@ impl Maestro {
 
     /// Begin a new transaction with the given participants.
     /// This creates an in-memory Transaction and returns the tx id.
-    pub async fn begin_transaction(&self, participants: Vec<Participant>) -> Result<String, String> {
+    pub async fn begin_transaction(
+        &self,
+        participants: Vec<Participant>,
+    ) -> Result<String, String> {
         let tx_id = uuid::Uuid::new_v4().to_string();
         let tx = Transaction {
             tx_id: tx_id.clone(),
@@ -141,22 +155,30 @@ impl Maestro {
             let active = self.active.read().await;
             // find the transaction we just added
             match active.iter().find(|t| t.tx_id == tx_id) {
-                Some(t) => t.participants.iter().map(|p| ms::Participant {
-                    id: p.id.clone(),
-                    target: p.target.clone(),
-                    staging_prefix: p.staging_prefix.clone(),
-                }).collect(),
+                Some(t) => t
+                    .participants
+                    .iter()
+                    .map(|p| ms::Participant {
+                        id: p.id.clone(),
+                        target: p.target.clone(),
+                        staging_prefix: p.staging_prefix.clone(),
+                    })
+                    .collect(),
                 None => Vec::new(),
             }
         };
 
-        let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTransaction(ms::CreateTransactionRequest {
-            tx_id: tx_id.clone(),
-            participants: ms_participants,
-        })) };
+        let mreq = ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::CreateTransaction(
+                ms::CreateTransactionRequest {
+                    tx_id: tx_id.clone(),
+                    participants: ms_participants,
+                },
+            )),
+        };
 
         match client.execute(mreq).await {
-            Ok(resp) => {
+            Ok(_resp) => {
                 // If metastore accepted, return tx id. We could update in-memory state from response.transaction
                 Ok(tx_id)
             }
@@ -192,7 +214,9 @@ impl Maestro {
             };
 
             // Acquire a connection (validates heartbeat)
-            let conn = match crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 10).await {
+            let conn = match crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 10)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => return Err(format!("failed to acquire conn for {}: {}", p.target, e)),
             };
@@ -211,7 +235,10 @@ impl Maestro {
                     if !resp.success {
                         // Abort all participants on first failure
                         let _ = self.abort(tx_id).await;
-                        return Err(format!("participant {} prepare failed: {}", p.id, resp.message));
+                        return Err(format!(
+                            "participant {} prepare failed: {}",
+                            p.id, resp.message
+                        ));
                     }
                 }
                 Err(e) => {
@@ -222,11 +249,17 @@ impl Maestro {
         }
 
         // Persist PREPARED state in metastore
-        let mut client = MetastoreClient::connect_with_shared(&self.shared).await.map_err(|e| format!("metastore connect failed: {}", e))?;
-        let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::UpdateTransactionState(ms::UpdateTransactionStateRequest {
-            tx_id: tx_id.to_string(),
-            state: ms::TransactionState::Prepared as i32,
-        })) };
+        let mut client = MetastoreClient::connect_with_shared(&self.shared)
+            .await
+            .map_err(|e| format!("metastore connect failed: {}", e))?;
+        let mreq = ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::UpdateTransactionState(
+                ms::UpdateTransactionStateRequest {
+                    tx_id: tx_id.to_string(),
+                    state: ms::TransactionState::Prepared as i32,
+                },
+            )),
+        };
 
         match client.execute(mreq).await {
             Ok(_) => {
@@ -259,12 +292,21 @@ impl Maestro {
         };
 
         // Persist COMMITTING state first
-        let mut client = MetastoreClient::connect_with_shared(&self.shared).await.map_err(|e| format!("metastore connect failed: {}", e))?;
-        let mreq_committing = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::UpdateTransactionState(ms::UpdateTransactionStateRequest {
-            tx_id: tx_id.to_string(),
-            state: ms::TransactionState::Committing as i32,
-        })) };
-        client.execute(mreq_committing).await.map_err(|e| format!("failed to persist COMMITTING: {}", e))?;
+        let mut client = MetastoreClient::connect_with_shared(&self.shared)
+            .await
+            .map_err(|e| format!("metastore connect failed: {}", e))?;
+        let mreq_committing = ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::UpdateTransactionState(
+                ms::UpdateTransactionStateRequest {
+                    tx_id: tx_id.to_string(),
+                    state: ms::TransactionState::Committing as i32,
+                },
+            )),
+        };
+        client
+            .execute(mreq_committing)
+            .await
+            .map_err(|e| format!("failed to persist COMMITTING: {}", e))?;
 
         // Instruct participants to commit
         for p in participants.iter() {
@@ -275,7 +317,9 @@ impl Maestro {
                     Err(e) => return Err(format!("failed to get pool for {}: {}", p.target, e)),
                 }
             };
-            let conn = match crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 10).await {
+            let conn = match crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 10)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => return Err(format!("failed to acquire conn for {}: {}", p.target, e)),
             };
@@ -290,7 +334,10 @@ impl Maestro {
                     if !resp.success {
                         // If commit failed for participant, abort remaining and mark ABORTED
                         let _ = self.abort(tx_id).await;
-                        return Err(format!("participant {} commit failed: {}", p.id, resp.message));
+                        return Err(format!(
+                            "participant {} commit failed: {}",
+                            p.id, resp.message
+                        ));
                     }
                 }
                 Err(e) => {
@@ -301,11 +348,18 @@ impl Maestro {
         }
 
         // Persist COMMITTED state
-        let mreq_committed = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::UpdateTransactionState(ms::UpdateTransactionStateRequest {
-            tx_id: tx_id.to_string(),
-            state: ms::TransactionState::Committed as i32,
-        })) };
-        client.execute(mreq_committed).await.map_err(|e| format!("failed to persist COMMITTED: {}", e))?;
+        let mreq_committed = ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::UpdateTransactionState(
+                ms::UpdateTransactionStateRequest {
+                    tx_id: tx_id.to_string(),
+                    state: ms::TransactionState::Committed as i32,
+                },
+            )),
+        };
+        client
+            .execute(mreq_committed)
+            .await
+            .map_err(|e| format!("failed to persist COMMITTED: {}", e))?;
 
         // update in-memory
         let mut active = self.active.write().await;
@@ -333,22 +387,31 @@ impl Maestro {
                 let state = self.shared.lock().await;
                 state.get_or_create_pool_for_key(&p.target).await
             } {
-                if let Ok(conn) = crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 5).await {
-                    let areq = crate::services::worker_service_client::worker_service::AbortRequest {
-                        tx_id: tx_id.to_string(),
-                        staging_prefix: p.staging_prefix.clone(),
-                    };
+                if let Ok(conn) =
+                    crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 5).await
+                {
+                    let areq =
+                        crate::services::worker_service_client::worker_service::AbortRequest {
+                            tx_id: tx_id.to_string(),
+                            staging_prefix: p.staging_prefix.clone(),
+                        };
                     let _ = crate::workers::send_abort_to_worker(conn, areq, 10).await;
                 }
             }
         }
 
         // Persist ABORTED state
-        let mut client = MetastoreClient::connect_with_shared(&self.shared).await.map_err(|e| format!("metastore connect failed: {}", e))?;
-        let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::UpdateTransactionState(ms::UpdateTransactionStateRequest {
-            tx_id: tx_id.to_string(),
-            state: ms::TransactionState::Aborted as i32,
-        })) };
+        let mut client = MetastoreClient::connect_with_shared(&self.shared)
+            .await
+            .map_err(|e| format!("metastore connect failed: {}", e))?;
+        let mreq = ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::UpdateTransactionState(
+                ms::UpdateTransactionStateRequest {
+                    tx_id: tx_id.to_string(),
+                    state: ms::TransactionState::Aborted as i32,
+                },
+            )),
+        };
         match client.execute(mreq).await {
             Ok(_) => {
                 let mut active = self.active.write().await;
@@ -381,31 +444,48 @@ impl Maestro {
             }
 
             let tx_id = tx.tx_id.clone();
-            let participants = tx.participants.clone();
+            let _participants = tx.participants.clone();
             let this = self.clone_for_recovery();
 
             // Spawn a background task to resume the transaction
             tokio::spawn(async move {
-                log::info!("recover_inflight: resuming transaction {} state={:?}", tx_id, tx.state);
+                log::info!(
+                    "recover_inflight: resuming transaction {} state={:?}",
+                    tx_id,
+                    tx.state
+                );
                 // If Preparing -> try prepare then commit
                 if tx.state == TransactionState::Preparing {
                     if let Err(e) = this.prepare_participants(&tx_id).await {
-                        log::error!("recover_inflight: prepare failed for {}: {} — aborting", tx_id, e);
+                        log::error!(
+                            "recover_inflight: prepare failed for {}: {} — aborting",
+                            tx_id,
+                            e
+                        );
                         let _ = this.abort(&tx_id).await;
                         return;
                     }
                 }
 
                 // If Prepared or Preparing succeeded -> commit
-                if tx.state == TransactionState::Prepared || tx.state == TransactionState::Preparing {
+                if tx.state == TransactionState::Prepared || tx.state == TransactionState::Preparing
+                {
                     if let Err(e) = this.commit(&tx_id).await {
-                        log::error!("recover_inflight: commit failed for {}: {} — aborting", tx_id, e);
+                        log::error!(
+                            "recover_inflight: commit failed for {}: {} — aborting",
+                            tx_id,
+                            e
+                        );
                         let _ = this.abort(&tx_id).await;
                     }
                 } else if tx.state == TransactionState::Committing {
                     // If already committing, attempt to finish commit
                     if let Err(e) = this.commit(&tx_id).await {
-                        log::error!("recover_inflight: commit(retry) failed for {}: {} — aborting", tx_id, e);
+                        log::error!(
+                            "recover_inflight: commit(retry) failed for {}: {} — aborting",
+                            tx_id,
+                            e
+                        );
                         let _ = this.abort(&tx_id).await;
                     }
                 }
@@ -419,6 +499,9 @@ impl Maestro {
 impl Maestro {
     /// Helper to create a lightweight clone of `Maestro` for spawning tasks.
     fn clone_for_recovery(&self) -> Self {
-        Maestro { shared: self.shared.clone(), active: self.active.clone() }
+        Maestro {
+            shared: self.shared.clone(),
+            active: self.active.clone(),
+        }
     }
 }

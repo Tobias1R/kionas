@@ -1,31 +1,29 @@
-
-
 /*
  * Main entry point for the Kionas Warehouse Server
  * Initializes configuration, logging, TLS, and starts gRPC servers
  */
-mod tls;
-mod server;
-mod consul;
 mod auth;
-mod handlers;
-mod services;
-mod workers_pool;
-mod warehouse;
-mod session;
 mod auth_setup;
+mod consul;
+mod core;
+mod handlers;
+mod server;
+mod services;
+mod session;
 mod statement_handler;
 mod tasks;
-mod workers;
-mod core;
+mod tls;
 mod transactions;
+mod warehouse;
+mod workers;
+mod workers_pool;
 
-use kionas::config::AppConfig;
 use kionas::config as kconfig;
+use kionas::config::AppConfig;
 use kionas::get_local_hostname;
 use std::env;
 
- #[tokio::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Try to load host-specific config from Consul or /workspace/configs
     let consul_url = env::var("CONSUL_URL").ok();

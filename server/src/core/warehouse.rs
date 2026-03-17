@@ -22,7 +22,9 @@ impl KionasWarehouse {
 }
 
 impl DomainResource for KionasWarehouse {
-    fn kind(&self) -> &'static str { "warehouse" }
+    fn kind(&self) -> &'static str {
+        "warehouse"
+    }
 
     fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {

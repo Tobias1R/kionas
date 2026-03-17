@@ -1,14 +1,15 @@
 use crate::core::DomainResource;
-use kionas::parser::datafusion_sql::sqlparser::ast::{
-    ObjectName, ColumnDef, TableConstraint, HiveDistributionStyle, HiveFormat, 
-    CreateTableOptions, FileFormat, Query, CreateTableLikeKind, TableVersion, CommentDef, 
-    OnCommit, Ident, Expr, OneOrManyWithParens, ClusteredBy, RowAccessPolicy, Tag, 
-    StorageSerializationPolicy, RefreshModeKind, InitializeKind, WrappedCollection};
-use kionas::parser::datafusion_sql::sqlparser;
+use crate::services::metastore_client::MetastoreClient;
+use crate::services::metastore_client::metastore_service as ms;
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
-use crate::services::metastore_client::metastore_service as ms;
-use crate::services::metastore_client::MetastoreClient;
+use kionas::parser::datafusion_sql::sqlparser;
+use kionas::parser::datafusion_sql::sqlparser::ast::{
+    ClusteredBy, ColumnDef, CommentDef, CreateTableLikeKind, CreateTableOptions, Expr, FileFormat,
+    HiveDistributionStyle, HiveFormat, Ident, InitializeKind, ObjectName, OnCommit,
+    OneOrManyWithParens, Query, RefreshModeKind, RowAccessPolicy, StorageSerializationPolicy,
+    TableConstraint, TableVersion, Tag, WrappedCollection,
+};
 
 #[derive(Clone, Debug)]
 pub struct KionasTable {
@@ -74,61 +75,42 @@ pub struct KionasTable {
     /// then strict typing rules apply to that table.
     pub strict: bool,
     /// Snowflake "COPY GRANTS" clause
-    
     pub copy_grants: bool,
     /// Snowflake "ENABLE_SCHEMA_EVOLUTION" clause
-    
     pub enable_schema_evolution: Option<bool>,
     /// Snowflake "CHANGE_TRACKING" clause
-    
     pub change_tracking: Option<bool>,
     /// Snowflake "DATA_RETENTION_TIME_IN_DAYS" clause
-    
     pub data_retention_time_in_days: Option<u64>,
     /// Snowflake "MAX_DATA_EXTENSION_TIME_IN_DAYS" clause
-    
     pub max_data_extension_time_in_days: Option<u64>,
     /// Snowflake "DEFAULT_DDL_COLLATION" clause
-    
     pub default_ddl_collation: Option<String>,
     /// Snowflake "WITH AGGREGATION POLICY" clause
-    
     pub with_aggregation_policy: Option<ObjectName>,
     /// Snowflake "WITH ROW ACCESS POLICY" clause
-    
     pub with_row_access_policy: Option<RowAccessPolicy>,
     /// Snowflake "WITH TAG" clause
-    
     pub with_tags: Option<Vec<Tag>>,
     /// Snowflake "EXTERNAL_VOLUME" clause for Iceberg tables
-    
     pub external_volume: Option<String>,
     /// Snowflake "BASE_LOCATION" clause for Iceberg tables
-    
     pub base_location: Option<String>,
     /// Snowflake "CATALOG" clause for Iceberg tables
-    
     pub catalog: Option<String>,
     /// Snowflake "CATALOG_SYNC" clause for Iceberg tables
-    
     pub catalog_sync: Option<String>,
     /// Snowflake "STORAGE_SERIALIZATION_POLICY" clause for Iceberg tables
-    
     pub storage_serialization_policy: Option<StorageSerializationPolicy>,
     /// Snowflake "TARGET_LAG" clause for dybamic tables
-    
     pub target_lag: Option<String>,
     /// Snowflake "WAREHOUSE" clause for dybamic tables
-    
     pub warehouse: Option<Ident>,
     /// Snowflake "REFRESH_MODE" clause for dybamic tables
-    
     pub refresh_mode: Option<RefreshModeKind>,
     /// Snowflake "INITIALIZE" clause for dybamic tables
-    
     pub initialize: Option<InitializeKind>,
     /// Snowflake "REQUIRE USER" clause for dybamic tables
-    
     pub require_user: bool,
 }
 
@@ -145,11 +127,11 @@ impl KionasTable {
             transient: statement.transient,
             volatile: statement.volatile,
             iceberg: statement.iceberg,
-            name:  statement.name,
+            name: statement.name,
             /// Optional schema
-            columns:  statement.columns,
-            constraints:  statement.constraints,
-            hive_distribution:  statement.hive_distribution,
+            columns: statement.columns,
+            constraints: statement.constraints,
+            hive_distribution: statement.hive_distribution,
             hive_formats: statement.hive_formats,
             table_options: statement.table_options,
             file_format: statement.file_format,
@@ -188,13 +170,14 @@ impl KionasTable {
             refresh_mode: statement.refresh_mode,
             initialize: statement.initialize,
             require_user: statement.require_user,
-            
         }
     }
 }
 
 impl DomainResource for KionasTable {
-    fn kind(&self) -> &'static str { "table" }
+    fn kind(&self) -> &'static str {
+        "table"
+    }
 
     fn validate(&self) -> Result<(), String> {
         let name = self.name.to_string();
@@ -212,7 +195,15 @@ impl KionasTable {
     pub async fn apply(self, session_id: &str, shared_data: &SharedData) -> Result<String, String> {
         // Dispatch task to worker
         let payload = self.name.to_string();
-        match helpers::run_task_for_input(shared_data, session_id, "create_table", payload.clone(), 30).await {
+        match helpers::run_task_for_input(
+            shared_data,
+            session_id,
+            "create_table",
+            payload.clone(),
+            30,
+        )
+        .await
+        {
             Ok(loc) => {
                 // Persist to metastore
                 let table_name = payload;
@@ -222,15 +213,21 @@ impl KionasTable {
                     engine: String::new(),
                     columns: Vec::new(),
                 };
-                let mreq = ms::MetastoreRequest { action: Some(ms::metastore_request::Action::CreateTable(creq)) };
+                let mreq = ms::MetastoreRequest {
+                    action: Some(ms::metastore_request::Action::CreateTable(creq)),
+                };
                 match MetastoreClient::connect_with_shared(shared_data).await {
-                    Ok(mut client) => {
-                        match client.execute(mreq).await {
-                            Ok(_) => Ok(format!("Table created successfully: {}", loc)),
-                            Err(e) => Err(format!("Metastore Execute failed for CreateTable {}: {}", table_name, e)),
-                        }
-                    }
-                    Err(e) => Err(format!("Failed to connect to metastore for CreateTable {}: {}", table_name, e)),
+                    Ok(mut client) => match client.execute(mreq).await {
+                        Ok(_) => Ok(format!("Table created successfully: {}", loc)),
+                        Err(e) => Err(format!(
+                            "Metastore Execute failed for CreateTable {}: {}",
+                            table_name, e
+                        )),
+                    },
+                    Err(e) => Err(format!(
+                        "Failed to connect to metastore for CreateTable {}: {}",
+                        table_name, e
+                    )),
                 }
             }
             Err(e) => Err(e.to_string()),

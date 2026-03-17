@@ -3,4 +3,4 @@
 
 pub mod maestro;
 
-pub use maestro::{Maestro, Transaction, TransactionState, Participant};
+pub use maestro::{Maestro, Participant};

@@ -1,12 +1,11 @@
-
 pub(crate) mod create_schema;
-pub(crate) mod drop_schema;
-pub(crate) mod get_schema;
 pub(crate) mod create_table;
-pub(crate) mod drop_table;
-pub(crate) mod get_table;
-pub(crate) mod update_table_statistics;
-pub(crate) mod get_table_statistics;
 pub(crate) mod create_transaction;
-pub(crate) mod update_transaction_state;
+pub(crate) mod drop_schema;
+pub(crate) mod drop_table;
+pub(crate) mod get_schema;
+pub(crate) mod get_table;
+pub(crate) mod get_table_statistics;
 pub(crate) mod get_transaction;
+pub(crate) mod update_table_statistics;
+pub(crate) mod update_transaction_state;

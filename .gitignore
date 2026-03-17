@@ -22,3 +22,6 @@ ai/*
 
 worker_storage
 worker_storage/*
+
+cargotree.log
+*.log

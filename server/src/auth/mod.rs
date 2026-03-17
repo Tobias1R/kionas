@@ -15,7 +15,7 @@ impl Interceptor for NoOpInterceptor {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct User {
     pub username: String,
-    pub password: String,    
+    pub password: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

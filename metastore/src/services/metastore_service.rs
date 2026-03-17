@@ -36,7 +36,8 @@ impl metastore_service::metastore_service_server::MetastoreService for Metastore
                 response.result = Some(actions::get_table::handle(&self.provider, get).await);
             }
             Some(metastore_service::metastore_request::Action::CreateSchema(create)) => {
-                response.result = Some(actions::create_schema::handle(&self.provider, create).await);
+                response.result =
+                    Some(actions::create_schema::handle(&self.provider, create).await);
             }
             Some(metastore_service::metastore_request::Action::DropSchema(drop)) => {
                 response.result = Some(actions::drop_schema::handle(&self.provider, drop).await);
@@ -44,13 +45,15 @@ impl metastore_service::metastore_service_server::MetastoreService for Metastore
             Some(metastore_service::metastore_request::Action::GetSchema(get)) => {
                 response.result = Some(actions::get_schema::handle(&self.provider, get).await);
             }
-            
-             // Transaction actions
-             Some(metastore_service::metastore_request::Action::CreateTransaction(create)) => {
-                response.result = Some(actions::create_transaction::handle(&self.provider, create).await);
+
+            // Transaction actions
+            Some(metastore_service::metastore_request::Action::CreateTransaction(create)) => {
+                response.result =
+                    Some(actions::create_transaction::handle(&self.provider, create).await);
             }
             Some(metastore_service::metastore_request::Action::UpdateTransactionState(update)) => {
-                response.result = Some(actions::update_transaction_state::handle(&self.provider, update).await);
+                response.result =
+                    Some(actions::update_transaction_state::handle(&self.provider, update).await);
             }
             Some(metastore_service::metastore_request::Action::GetTransaction(get)) => {
                 response.result = Some(actions::get_transaction::handle(&self.provider, get).await);

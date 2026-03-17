@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
-use kionas::config::AppConfig;
+use crate::session;
+use crate::tasks::TaskManager;
 use crate::warehouse::Warehouse;
 use crate::workers_pool::WorkerPool;
-use crate::session;
 use chrono::{DateTime, Utc};
-use tonic::transport::Channel;
-use std::collections::hash_map::Entry as HashEntry;
-use crate::tasks::TaskManager;
+use kionas::config::AppConfig;
 use kionas::parse_env_vars;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry as HashEntry;
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+use tonic::transport::Channel;
 /*
 Shared state structure
 
@@ -21,7 +21,7 @@ pub struct SharedState {
     pub counter: Arc<AsyncMutex<u32>>,
     pub warehouses: Arc<AsyncMutex<HashMap<String, Warehouse>>>,
     pub session_manager: Arc<session::SessionManager>,
-    pub worker_pools: Arc<AsyncMutex<HashMap<String,WorkerPool>>>,
+    pub worker_pools: Arc<AsyncMutex<HashMap<String, WorkerPool>>>,
     pub task_manager: Arc<TaskManager>,
     pub workers: Arc<AsyncMutex<HashMap<String, WorkerEntry>>>,
     pub metastore_channel: Arc<AsyncMutex<Option<Channel>>>,
@@ -30,7 +30,7 @@ pub struct SharedState {
 
 impl SharedState {
     pub fn new(config: AppConfig) -> Self {
-        let worker_pools:HashMap<String,WorkerPool> = HashMap::new();
+        let worker_pools: HashMap<String, WorkerPool> = HashMap::new();
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -46,7 +46,7 @@ impl SharedState {
 
 impl Default for SharedState {
     fn default() -> Self {
-        let worker_pools:HashMap<String,WorkerPool> = HashMap::new();
+        let worker_pools: HashMap<String, WorkerPool> = HashMap::new();
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -86,7 +86,10 @@ impl SharedState {
     /// Uses session affinity first, falls back to fuzzy warehouse name matching.
     pub async fn resolve_worker_key(&self, session_id: &str) -> Option<String> {
         // Get session
-        let session_opt = self.session_manager.get_session(session_id.to_string()).await;
+        let session_opt = self
+            .session_manager
+            .get_session(session_id.to_string())
+            .await;
         let session = match session_opt {
             Some(s) => s,
             None => return None,
@@ -107,7 +110,8 @@ impl SharedState {
         for (k, w) in warehouses.iter() {
             let wname = w.get_name();
             let whost = w.get_host();
-            if wname == plain || wname.ends_with(&plain) || wname.contains(&plain) || whost == plain {
+            if wname == plain || wname.ends_with(&plain) || wname.contains(&plain) || whost == plain
+            {
                 return Some(k.clone());
             }
         }
@@ -116,7 +120,10 @@ impl SharedState {
 
     /// Return an existing pool for `key` or create it from warehouse metadata and config.
     /// Double-checks insertion to avoid races.
-    pub async fn get_or_create_pool_for_key(&self, key: &str) -> Result<WorkerPool, std::io::Error> {
+    pub async fn get_or_create_pool_for_key(
+        &self,
+        key: &str,
+    ) -> Result<WorkerPool, std::io::Error> {
         // Fast path: check existing pool
         {
             let pools = self.worker_pools.lock().await;
@@ -132,7 +139,12 @@ impl SharedState {
         };
         let warehouse = match warehouse_opt {
             Some(w) => w,
-            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "warehouse metadata not found for key")),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "warehouse metadata not found for key",
+                ));
+            }
         };
 
         // Build pool address
@@ -153,9 +165,15 @@ impl SharedState {
                             None
                         }
                     }
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Create new pool
         let new_pool = crate::workers_pool::get_new_pool(pool_addr, warehouse.get_name(), ca_bytes);

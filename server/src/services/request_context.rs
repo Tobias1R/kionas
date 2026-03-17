@@ -1,7 +1,6 @@
-use std::sync::Arc;
-use tonic::Status;
-use tonic::Request;
 use crate::warehouse::state::SharedData;
+use tonic::Request;
+use tonic::Status;
 
 #[derive(Clone)]
 pub struct RequestContext {
@@ -14,7 +13,10 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    pub async fn from_request<T>(shared_data: SharedData, request: &Request<T>) -> Result<Self, Status> {
+    pub async fn from_request<T>(
+        shared_data: SharedData,
+        request: &Request<T>,
+    ) -> Result<Self, Status> {
         let session_id_opt = request
             .metadata()
             .get("session_id")
@@ -34,18 +36,20 @@ impl RequestContext {
         }
 
         let worker_uuid = if !warehouse_name.is_empty() {
-            if let Some(wh) = crate::session::find_warehouse_by_name(&shared_data, &warehouse_name).await {
+            if let Some(wh) =
+                crate::session::find_warehouse_by_name(&shared_data, &warehouse_name).await
+            {
                 wh.get_uuid()
             } else {
                 // return Err(Status::not_found(format!("warehouse not found: {}", warehouse_name)));
-                // lets bypass this for now and just return an empty string if the warehouse is not found, since the worker uuid is not critical for query execution at this point.                
+                // lets bypass this for now and just return an empty string if the warehouse is not found, since the worker uuid is not critical for query execution at this point.
                 "somecooluuid-to-be-removed".to_string()
             }
         } else {
             "".to_string()
         };
 
-        let query_id = kionas::gen_random_uuid();
+        let _query_id = kionas::gen_random_uuid();
 
         let query_id = kionas::gen_random_uuid();
 

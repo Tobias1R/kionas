@@ -1,9 +1,9 @@
+use crate::parse_env_vars;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use std::error::Error;
 use std::fs;
-use clap::Parser;
-use crate::parse_env_vars;
-use serde_json::Value as JsonValue;
 
 use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 
@@ -11,14 +11,14 @@ use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /*
-    This struct is designed to be flexible and support various deployment scenarios. 
-    The `mode` field can be used to indicate the role of the instance 
-    (e.g., "gateway", "server", "worker", "metastore"), 
-    allowing for different configurations based on the mode. 
-    The TLS certificate and key fields can be overridden by environment variables or 
+    This struct is designed to be flexible and support various deployment scenarios.
+    The `mode` field can be used to indicate the role of the instance
+    (e.g., "gateway", "server", "worker", "metastore"),
+    allowing for different configurations based on the mode.
+    The TLS certificate and key fields can be overridden by environment variables or
     Consul values, providing flexibility in how certificates are managed across different environments.
      */
-    pub mode: String, // gateway, server, worker, metastore 
+    pub mode: String, // gateway, server, worker, metastore
     // Consul
     pub consul_host: String,
     // logging
@@ -34,10 +34,9 @@ pub struct InteropsConfig {
     pub tls_cert: String,
     pub tls_key: String,
     pub ca_cert: String,
-    pub mode: String, // http or https
+    pub mode: String,      // http or https
     pub operation: String, // interops or metastore
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WarehouseConfig {
@@ -48,8 +47,8 @@ pub struct WarehouseConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServicesConfig {    
-    pub security: Option<SecurityConfig>,    
+pub struct ServicesConfig {
+    pub security: Option<SecurityConfig>,
     pub interops: Option<InteropsConfig>,
     pub warehouse: Option<WarehouseConfig>,
     pub postgres: Option<PostgresServiceConfig>,
@@ -87,7 +86,7 @@ pub struct ClusterConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct PostgresServiceConfig {    
+pub struct PostgresServiceConfig {
     pub postgres_host: String,
     pub postgres_port: u16,
     pub postgres_db: String,
@@ -98,7 +97,10 @@ pub struct PostgresServiceConfig {
 }
 
 /// Try to fetch a raw value from Consul for the given key. Returns Ok(None) if key not found.
-pub async fn fetch_consul_raw(consul_addr: &str, key: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+pub async fn fetch_consul_raw(
+    consul_addr: &str,
+    key: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
     let base = consul_addr.trim_end_matches('/');
     let url = format!("{}/v1/kv/{}?raw", base, key);
     let resp = reqwest::get(&url).await?;
@@ -116,14 +118,22 @@ pub async fn fetch_consul_raw(consul_addr: &str, key: &str) -> Result<Option<Str
 /// 1. Consul at `consul_addr` key `configs/<hostname>` (if `consul_addr` provided)
 /// 2. Local file `/workspace/configs/<hostname>.json` or `.toml`
 /// 3. Error
-pub async fn load_for_host(consul_addr: Option<&str>, hostname: &str) -> Result<AppConfig, Box<dyn Error + Send + Sync>> {
+pub async fn load_for_host(
+    consul_addr: Option<&str>,
+    hostname: &str,
+) -> Result<AppConfig, Box<dyn Error + Send + Sync>> {
     // Helper to walk a JSON value and substitute ${ENV} in all strings
     fn substitute_env(v: JsonValue) -> JsonValue {
         match v {
             JsonValue::String(s) => JsonValue::String(parse_env_vars(&s)),
-            JsonValue::Array(arr) => JsonValue::Array(arr.into_iter().map(substitute_env).collect()),
+            JsonValue::Array(arr) => {
+                JsonValue::Array(arr.into_iter().map(substitute_env).collect())
+            }
             JsonValue::Object(map) => {
-                let mapped = map.into_iter().map(|(k, val)| (k, substitute_env(val))).collect();
+                let mapped = map
+                    .into_iter()
+                    .map(|(k, val)| (k, substitute_env(val)))
+                    .collect();
                 JsonValue::Object(mapped)
             }
             other => other,
@@ -132,7 +142,9 @@ pub async fn load_for_host(consul_addr: Option<&str>, hostname: &str) -> Result<
 
     // Try consul
     if let Some(ca) = consul_addr {
-        if let Ok(Some(raw)) = fetch_consul_raw(ca, &format!("{}/{}", CONSUL_NODE_CONFIG_PREFIX, hostname)).await {
+        if let Ok(Some(raw)) =
+            fetch_consul_raw(ca, &format!("{}/{}", CONSUL_NODE_CONFIG_PREFIX, hostname)).await
+        {
             let trimmed = raw.trim();
             if trimmed.starts_with('{') || trimmed.starts_with('[') {
                 let j: JsonValue = serde_json::from_str(&raw)?;
@@ -176,9 +188,10 @@ pub async fn load_for_host(consul_addr: Option<&str>, hostname: &str) -> Result<
     }
 }
 
-
 /// Load cluster-wide config: tries consul at `cluster/<key>` then `/workspace/configs/cluster.json`.
-pub async fn load_cluster_config(consul_addr: Option<&str>) -> Result<ClusterConfig, Box<dyn Error + Send + Sync>> {
+pub async fn load_cluster_config(
+    consul_addr: Option<&str>,
+) -> Result<ClusterConfig, Box<dyn Error + Send + Sync>> {
     if let Some(ca) = consul_addr {
         if let Ok(Some(raw)) = fetch_consul_raw(ca, CONSUL_CLUSTER_KEY).await {
             let trimmed = raw.trim();

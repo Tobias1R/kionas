@@ -1,8 +1,8 @@
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone)]
 pub enum TaskState {
@@ -62,10 +62,19 @@ pub struct TaskManager {
 
 impl TaskManager {
     pub fn new() -> Self {
-        TaskManager { tasks: Arc::new(RwLock::new(HashMap::new())), notifiers: Arc::new(RwLock::new(HashMap::new())) }
+        TaskManager {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            notifiers: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
-    pub async fn create_task(&self, query_id: String, session_id: String, operation: String, payload: String) -> String {
+    pub async fn create_task(
+        &self,
+        query_id: String,
+        session_id: String,
+        operation: String,
+        payload: String,
+    ) -> String {
         let t = Task::new(query_id, session_id, operation, payload);
         let id = t.id.clone();
         let at = Arc::new(Mutex::new(t));
@@ -85,7 +94,7 @@ impl TaskManager {
 
     /// Wait for task to reach a terminal state or timeout.
     pub async fn wait_for_completion(&self, id: &str, timeout_secs: u64) -> Option<Task> {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
         let start = Utc::now();
         let deadline = Duration::from_secs(timeout_secs);
 
@@ -93,7 +102,9 @@ impl TaskManager {
         if let Some(task_arc) = self.get_task(id).await {
             let t = task_arc.lock().await;
             match t.state {
-                TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
+                TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => {
+                    return Some(t.clone());
+                }
                 _ => {}
             }
         } else {
@@ -117,8 +128,13 @@ impl TaskManager {
         let notifier = notifier_opt.unwrap();
         // Wait until notifier signals or timeout
         loop {
-            let elapsed = Utc::now().signed_duration_since(start).to_std().unwrap_or_default();
-            if elapsed >= deadline { break; }
+            let elapsed = Utc::now()
+                .signed_duration_since(start)
+                .to_std()
+                .unwrap_or_default();
+            if elapsed >= deadline {
+                break;
+            }
             let remaining = deadline - elapsed;
             // wait for notification with timeout = remaining
             let notified = timeout(remaining, notifier.notified()).await;
@@ -127,10 +143,14 @@ impl TaskManager {
                     if let Some(task_arc) = self.get_task(id).await {
                         let t = task_arc.lock().await;
                         match t.state {
-                            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => return Some(t.clone()),
+                            TaskState::Succeeded | TaskState::Failed | TaskState::Cancelled => {
+                                return Some(t.clone());
+                            }
                             _ => continue,
                         }
-                    } else { return None; }
+                    } else {
+                        return None;
+                    }
                 }
                 Err(_) => break, // timeout
             }
@@ -157,13 +177,22 @@ impl TaskManager {
             }
         }
         // notify waiters if any
-        if let Some(n) = { let nmap = self.notifiers.read().await; nmap.get(id).cloned() } {
+        if let Some(n) = {
+            let nmap = self.notifiers.read().await;
+            nmap.get(id).cloned()
+        } {
             n.notify_waiters();
         }
     }
 
     /// Update task fields based on worker update and notify waiters.
-    pub async fn update_from_worker(&self, id: &str, new_state: TaskState, result_location: Option<String>, error: Option<String>) {
+    pub async fn update_from_worker(
+        &self,
+        id: &str,
+        new_state: TaskState,
+        result_location: Option<String>,
+        error: Option<String>,
+    ) {
         if let Some(task_arc) = self.get_task(id).await {
             let mut t = task_arc.lock().await;
             t.state = new_state.clone();
@@ -180,13 +209,18 @@ impl TaskManager {
                 t.finished_at = Some(Utc::now());
             }
         }
-        if let Some(n) = { let nmap = self.notifiers.read().await; nmap.get(id).cloned() } {
+        if let Some(n) = {
+            let nmap = self.notifiers.read().await;
+            nmap.get(id).cloned()
+        } {
             n.notify_waiters();
         }
     }
 }
 
-pub fn sample_task_request_from_task(_task: &Task) -> crate::services::worker_service_client::worker_service::TaskRequest {
+pub fn sample_task_request_from_task(
+    _task: &Task,
+) -> crate::services::worker_service_client::worker_service::TaskRequest {
     // Placeholder conversion; handlers should build proper TaskRequest
     crate::services::worker_service_client::worker_service::TaskRequest {
         session_id: "".to_string(),
@@ -194,16 +228,20 @@ pub fn sample_task_request_from_task(_task: &Task) -> crate::services::worker_se
     }
 }
 
-pub fn task_to_request(task: &Task) -> crate::services::worker_service_client::worker_service::TaskRequest {
-    let mut params = std::collections::HashMap::new();
+pub fn task_to_request(
+    task: &Task,
+) -> crate::services::worker_service_client::worker_service::TaskRequest {
+    let params = std::collections::HashMap::new();
     crate::services::worker_service_client::worker_service::TaskRequest {
         session_id: task.session_id.clone(),
-        tasks: vec![crate::services::worker_service_client::worker_service::Task {
-            task_id: task.id.clone(),
-            input: task.payload.clone(),
-            operation: task.operation.clone(),
-            output: String::new(),
-            params,
-        }],
+        tasks: vec![
+            crate::services::worker_service_client::worker_service::Task {
+                task_id: task.id.clone(),
+                input: task.payload.clone(),
+                operation: task.operation.clone(),
+                output: String::new(),
+                params,
+            },
+        ],
     }
 }

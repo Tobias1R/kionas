@@ -1,31 +1,33 @@
-use crate::state;
 use crate::interops_service::interops_service_client::InteropsServiceClient;
+use crate::state;
 
-use tonic::{Request};
-use tonic::transport::{Identity, ClientTlsConfig};
+use kionas::{get_digest, get_local_hostname, get_local_ip};
 use std::error::Error;
-use kionas::{get_local_ip, get_digest, get_local_hostname};
 use tonic::transport::Channel;
+use tonic::transport::{ClientTlsConfig, Identity};
 
-use crate::interops_service::{RegisterWorkerRequest, RegisterWorkerResponse};
+use crate::interops_service::RegisterWorkerRequest;
 
-use std::env;
-
-use kionas::consul::{download_cluster_info, download_worker_info};
 use kionas::config::AppConfig;
+use kionas::consul::download_cluster_info;
 
-
-pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::consul::ClusterInfo, Box<dyn Error + Send + Sync>> {
-    let consul_url = std::env::var("CONSUL_URL").unwrap_or_else(|_| "http://kionas-consul:8500".to_string());
+pub async fn init_worker(
+    worker_id: &str,
+    app_cfg: AppConfig,
+) -> Result<kionas::consul::ClusterInfo, Box<dyn Error + Send + Sync>> {
+    let consul_url =
+        std::env::var("CONSUL_URL").unwrap_or_else(|_| "http://kionas-consul:8500".to_string());
     let cluster_info = download_cluster_info(&consul_url).await?;
-    
+
     println!("Cluster info: {:?}", cluster_info);
-    
 
     // Determine worker config: prefer provided AppConfig, fallback to consul-stored worker info
     let cfg = app_cfg;
     // Construct a WorkerInfo from AppConfig.interops and consul info
-    let interops = cfg.services.interops.ok_or("missing services.interops in AppConfig")?;
+    let interops = cfg
+        .services
+        .interops
+        .ok_or("missing services.interops in AppConfig")?;
     let mut wi = kionas::consul::WorkerInfo::default();
     wi.worker_id = worker_id.to_string();
     wi.consul_url = cfg.consul_host.clone();
@@ -44,14 +46,17 @@ pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::
     if let Err(e) = kionas::logging::init_logging(&log_level, &log_output, &log_format) {
         eprintln!("Failed to initialize logging: {}", e);
     } else {
-        println!("Logging initialized with level: {}, output: {}, format: {}", log_level, log_output, log_format);
-    }       
-    
+        println!(
+            "Logging initialized with level: {}, output: {}, format: {}",
+            log_level, log_output, log_format
+        );
+    }
+
     //let worker_config = cfg.clone();
 
     //println!("Worker config: {:?}", worker_config.clone());
 
-    let tls_cert_path =interops.tls_cert.clone();
+    let tls_cert_path = interops.tls_cert.clone();
     let tls_key_path = interops.tls_key.clone();
     let ca_cert_path = interops.ca_cert.clone();
     let worker_port = interops.port;
@@ -67,7 +72,10 @@ pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::
 
     let local_ip = get_local_ip().unwrap();
     let local_hostname = get_local_hostname().unwrap_or_else(|| "unknown".to_string());
-    println!("Worker local IP: {}, hostname: {}", local_ip, local_hostname);
+    println!(
+        "Worker local IP: {}, hostname: {}",
+        local_ip, local_hostname
+    );
     let worker_id_hash = get_digest(&local_hostname);
 
     let worker_info = state::WorkerInformation {
@@ -77,9 +85,9 @@ pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::
         server_url: master_addr.clone().to_string(),
         tls_cert_path: tls_cert_path,
         tls_key_path: tls_key_path,
-        ca_cert_path: ca_cert_path
+        ca_cert_path: ca_cert_path,
     };
-    let shared_data = state::SharedData::new(worker_info.clone(), cluster_info.clone());
+    let _shared_data = state::SharedData::new(worker_info.clone(), cluster_info.clone());
 
     let channel = Channel::from_shared(master_addr.to_string())
         .unwrap()
@@ -87,7 +95,7 @@ pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::
         .connect()
         .await?;
     println!("Channel opened to master server: {}", master_addr);
-    
+
     // Create a client for the InteropsService
     let mut client = InteropsServiceClient::new(channel);
 

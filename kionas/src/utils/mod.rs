@@ -9,15 +9,21 @@ pub async fn resolve_hostname(
     let mut addrs = tokio::net::lookup_host(addr)
         .await
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    addrs
-        .next()
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No address found")) as Box<dyn std::error::Error + Send + Sync>)
+    addrs.next().ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No address found",
+        )) as Box<dyn std::error::Error + Send + Sync>
+    })
 }
 
 pub async fn check_tcp_addr(host: &str, port: u16, name: &str) -> bool {
     let addr = format!("{}:{}", host, port);
-    match tokio::time::timeout(std::time::Duration::from_secs(3), tokio::net::TcpStream::connect(addr))
-        .await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
     {
         Ok(Ok(_stream)) => {
             log::info!("{} reachable at {}:{}", name, host, port);

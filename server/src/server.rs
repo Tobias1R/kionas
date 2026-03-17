@@ -1,15 +1,15 @@
 use kionas::utils::{print_memory_usage, print_server_info};
 
-
 use std::sync::Arc;
 
+use crate::{
+    tls as tlsmod,
+    warehouse::state::{SharedData, SharedState},
+};
 use kionas::config::AppConfig;
-use crate::{tls as tlsmod, warehouse::state::{SharedData, SharedState}};
-use crate::consul::{ConsulClient, ClusterConfig};
 
-use crate::handlers;
 use crate::auth_setup;
-use kionas::constants::CONSUL_CLUSTER_KEY;
+use crate::handlers;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -20,24 +20,28 @@ use kionas::utils::resolve_hostname;
 use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-
-
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
-   
     // Initialize logging
-    if let Err(e) = kionas::logging::init_logging(&config.logging.level, &config.logging.output, &config.logging.format) {
+    if let Err(e) = kionas::logging::init_logging(
+        &config.logging.level,
+        &config.logging.output,
+        &config.logging.format,
+    ) {
         eprintln!("Failed to initialize logging: {}", e);
     } else {
-        println!("Logging initialized with level: {}, output: {}, format: {}", config.logging.level, config.logging.output, config.logging.format);
+        println!(
+            "Logging initialized with level: {}, output: {}, format: {}",
+            config.logging.level, config.logging.output, config.logging.format
+        );
     }
 
-    // Initialize cluster config in Consul    
+    // Initialize cluster config in Consul
     // let consul = ConsulClient::new(&config.server.consul_host);
     // if let Err(e) = consul.put_config(CONSUL_CLUSTER_KEY, &config).await {
     //     eprintln!("Failed to write cluster config to Consul: {}", e);
     // } else {
     //     println!("Cluster config registered in Consul");
-    // }    
+    // }
 
     // Build TLS configuration
     let tls_config = match tlsmod::build_server_tls(&config).await {
@@ -51,7 +55,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
     };
 
-    let (iops_tls_config, ca_cert) = match tlsmod::build_interops_tls(&config).await {
+    let (iops_tls_config, _ca_cert) = match tlsmod::build_interops_tls(&config).await {
         Ok((cfg, cert)) => {
             println!("Interops TLS configuration loaded successfully");
             (cfg, cert)
@@ -62,14 +66,13 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         }
     };
 
-    let shared_data: SharedData = Arc::new(Mutex::new(SharedState::new(
-        config.clone()
-    )));
+    let shared_data: SharedData = Arc::new(Mutex::new(SharedState::new(config.clone())));
 
     let interops_service = InteropsService::new(Arc::clone(&shared_data));
     let warehouse_service = WarehouseService::initialize(Arc::clone(&shared_data)).await;
     // reflection descriptor bytes will be passed to handlers to build the reflection service
-    let reflection_descriptor: &'static [u8] = include_bytes!("../../kionas/generated/grpc.reflection.v1alpha");
+    let reflection_descriptor: &'static [u8] =
+        include_bytes!("../../kionas/generated/grpc.reflection.v1alpha");
 
     let security_info = match config.services.security.clone() {
         Some(s) => s,
@@ -87,7 +90,8 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         crate::warehouse::state::SharedData::default(),
         jwt_secret.clone(),
         data_path.clone(),
-    ).await
+    )
+    .await
     {
         Ok((jwt, auth)) => {
             println!("Authentication initialized successfully");
@@ -116,8 +120,6 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
 
     let warehouse_addr = resolve_hostname(&warehouse_cfg.host, warehouse_cfg.port).await?;
     let interops_addr = resolve_hostname(&interops_cfg.host, interops_cfg.port).await?;
-
-
 
     // Build the server futures for warehouse and interops
     let (warehouse_server, interops_server) = handlers::build_servers(
@@ -198,7 +200,9 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
                     Ok(b) => b,
                     Err(_) => {
                         let _ = socket
-                            .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n")
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+                            )
                             .await;
                         return;
                     }
@@ -221,9 +225,6 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     print_server_info();
     print_memory_usage();
 
-   
     tokio::try_join!(warehouse_server, interops_server)?;
     Ok(())
 }
-
-

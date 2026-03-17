@@ -17,11 +17,12 @@ pub struct Warehouse {
 
 impl Warehouse {
     pub fn new(
-            name: String,
-            uuid: String,
-            host: String,
-            port: u32,
-            warehouse_type: String) -> Self {
+        name: String,
+        uuid: String,
+        host: String,
+        port: u32,
+        warehouse_type: String,
+    ) -> Self {
         Self {
             name,
             uuid,
@@ -59,7 +60,6 @@ impl Warehouse {
     pub fn set_last_heartbeat(&mut self, last_heartbeat: chrono::DateTime<chrono::Utc>) {
         self.last_heartbeat = last_heartbeat;
     }
-
 }
 
 // implement trait hash for Warehouse

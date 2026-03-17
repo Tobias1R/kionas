@@ -1,7 +1,6 @@
+use kionas::config::AppConfig;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use kionas::config::AppConfig;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
@@ -29,7 +28,11 @@ impl ConsulClient {
         Ok(())
     }
 
-    pub async fn get_config(&self, table: &str, key: &str) -> Result<Option<AppConfig>, reqwest::Error> {
+    pub async fn get_config(
+        &self,
+        table: &str,
+        key: &str,
+    ) -> Result<Option<AppConfig>, reqwest::Error> {
         let url = format!("{}/{}/{}", self.base_url, table, key);
         let resp = self.client.get(&url).send().await?;
         if resp.status().is_success() {
