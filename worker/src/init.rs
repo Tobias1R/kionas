@@ -1,7 +1,8 @@
 use crate::state;
 use crate::interops_service::interops_service_client::InteropsServiceClient;
 
-use tonic::{transport::Identity, transport::ClientTlsConfig, Request};
+use tonic::{Request};
+use tonic::transport::{Identity, ClientTlsConfig};
 use std::error::Error;
 use kionas::{get_local_ip, get_digest, get_local_hostname};
 use tonic::transport::Channel;
@@ -56,6 +57,7 @@ pub async fn init_worker(worker_id: &str, app_cfg: AppConfig) -> Result<kionas::
     let worker_port = interops.port;
     let master_addr = cluster_info.master.clone();
 
+    // Build TLS client configuration to securely connect to master server.
     let cert = std::fs::read(tls_cert_path.clone())?;
     let key = std::fs::read(tls_key_path.clone())?;
     let ca_cert = std::fs::read(ca_cert_path.clone())?;

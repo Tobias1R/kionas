@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     println!("Unsupported query type.");
     // }
 
-    let query_use_warehouse = "use warehouse worker1;";
+    let query_use_warehouse = "use warehouse kionas-worker1;";
     let request = warehouse_service::QueryRequest {
         query: query_use_warehouse.to_string()
     };

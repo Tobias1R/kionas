@@ -141,45 +141,82 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         let req = request.into_inner();
         log::info!("Prepare called for tx={} staging_prefix={}", req.tx_id, req.staging_prefix);
 
-        // Build staging path: ./worker_storage/staging/{staging_prefix}/{tx_id}
-        let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
-
-        // Create staging directory
-        if let Err(e) = tokio_fs::create_dir_all(&staging_dir).await {
-            log::error!("failed to create staging dir {}: {}", staging_dir, e);
-            return Err(tonic::Status::internal(format!("failed to create staging dir: {}", e)));
-        }
-
-        // For each task, write a JSON file containing the task descriptor
-        for t in req.tasks.iter() {
-            let task_file = format!("{}/{}.json", staging_dir, t.task_id);
-            let payload = json!({
-                "task_id": t.task_id.clone(),
-                "operation": t.operation.clone(),
-                "input": t.input.clone(),
-                "output": t.output.clone(),
-                "params": t.params.clone(),
-            });
-            match tokio_fs::write(&task_file, serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| payload.to_string().into_bytes())).await {
-                Ok(_) => {}
-                Err(e) => {
-                    log::error!("failed to write staged task file {}: {}", task_file, e);
-                    return Err(tonic::Status::internal(format!("failed to write staged task file: {}", e)));
+        // When a storage provider is configured, store staged tasks there
+        // under `staging/{staging_prefix}/{tx_id}/...`. Otherwise fall back
+        // to using the local filesystem at `worker_storage/staging/...`.
+        if let Some(provider) = self.shared_data.storage_provider.clone() {
+            let base_key_prefix = format!("staging/{}/{}/", req.staging_prefix, req.tx_id);
+            // Put each task descriptor as an object
+            for t in req.tasks.iter() {
+                let key = format!("{}{}.json", base_key_prefix, t.task_id);
+                let payload = json!({
+                    "task_id": t.task_id.clone(),
+                    "operation": t.operation.clone(),
+                    "input": t.input.clone(),
+                    "output": t.output.clone(),
+                    "params": t.params.clone(),
+                });
+                let bytes = serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| payload.to_string().into_bytes());
+                if let Err(e) = provider.put_object(&key, bytes).await {
+                    log::error!("failed to put staged object {}: {}", key, e);
+                    return Err(tonic::Status::internal(format!("failed to put staged object: {}", e)));
                 }
             }
-        }
 
-        // Write a manifest describing the staged tx
-        let manifest = json!({
-            "tx_id": req.tx_id.clone(),
-            "staging_prefix": req.staging_prefix.clone(),
-            "tasks": req.tasks.iter().map(|t| t.task_id.clone()).collect::<Vec<_>>(),
-            "created_at": chrono::Utc::now().to_rfc3339(),
-        });
-        let manifest_path = format!("{}/manifest_{}.json", staging_dir, req.tx_id);
-        if let Err(e) = tokio_fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes())).await {
-            log::error!("failed to write manifest {}: {}", manifest_path, e);
-            return Err(tonic::Status::internal(format!("failed to write manifest: {}", e)));
+            // Write manifest object into the staging folder
+            let manifest = json!({
+                "tx_id": req.tx_id.clone(),
+                "staging_prefix": req.staging_prefix.clone(),
+                "tasks": req.tasks.iter().map(|t| t.task_id.clone()).collect::<Vec<_>>(),
+                "created_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let manifest_key = format!("{}{}/manifest_{}.json", "staging/", req.staging_prefix, req.tx_id);
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes());
+            if let Err(e) = provider.put_object(&manifest_key, manifest_bytes).await {
+                log::error!("failed to put staging manifest {}: {}", manifest_key, e);
+                return Err(tonic::Status::internal(format!("failed to put staging manifest: {}", e)));
+            }
+        } else {
+            // Build staging path: ./worker_storage/staging/{staging_prefix}/{tx_id}
+            let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
+
+            // Create staging directory
+            if let Err(e) = tokio_fs::create_dir_all(&staging_dir).await {
+                log::error!("failed to create staging dir {}: {}", staging_dir, e);
+                return Err(tonic::Status::internal(format!("failed to create staging dir: {}", e)));
+            }
+
+            // For each task, write a JSON file containing the task descriptor
+            for t in req.tasks.iter() {
+                let task_file = format!("{}/{}.json", staging_dir, t.task_id);
+                let payload = json!({
+                    "task_id": t.task_id.clone(),
+                    "operation": t.operation.clone(),
+                    "input": t.input.clone(),
+                    "output": t.output.clone(),
+                    "params": t.params.clone(),
+                });
+                match tokio_fs::write(&task_file, serde_json::to_vec_pretty(&payload).unwrap_or_else(|_| payload.to_string().into_bytes())).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::error!("failed to write staged task file {}: {}", task_file, e);
+                        return Err(tonic::Status::internal(format!("failed to write staged task file: {}", e)));
+                    }
+                }
+            }
+
+            // Write a manifest describing the staged tx
+            let manifest = json!({
+                "tx_id": req.tx_id.clone(),
+                "staging_prefix": req.staging_prefix.clone(),
+                "tasks": req.tasks.iter().map(|t| t.task_id.clone()).collect::<Vec<_>>(),
+                "created_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let manifest_path = format!("{}/manifest_{}.json", staging_dir, req.tx_id);
+            if let Err(e) = tokio_fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes())).await {
+                log::error!("failed to write manifest {}: {}", manifest_path, e);
+                return Err(tonic::Status::internal(format!("failed to write manifest: {}", e)));
+            }
         }
 
         let resp = worker_service::PrepareResponse { success: true, message: "staged".to_string() };
@@ -193,32 +230,79 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         let req = request.into_inner();
         log::info!("Commit called for tx={} staging_prefix={}", req.tx_id, req.staging_prefix);
 
-        let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
-        let final_parent = format!("worker_storage/final/{}", req.staging_prefix);
-        let final_dir = format!("{}/{}", final_parent, req.tx_id);
+        let staging_prefix = format!("staging/{}/{}/", req.staging_prefix, req.tx_id);
+        let final_prefix = format!("final/{}/{}/", req.staging_prefix, req.tx_id);
 
-        // Ensure final parent exists
-        if let Err(e) = tokio_fs::create_dir_all(&final_parent).await {
-            log::error!("failed to create final parent {}: {}", final_parent, e);
-            return Err(tonic::Status::internal(format!("failed to create final parent: {}", e)));
-        }
+        if let Some(provider) = self.shared_data.storage_provider.clone() {
+            // List objects under staging prefix
+            match provider.list_objects(&staging_prefix).await {
+                Ok(keys) => {
+                    for key in keys.iter() {
+                        // read object
+                        match provider.get_object(key).await {
+                            Ok(Some(bytes)) => {
+                                // compute destination key by replacing staging_prefix with final_prefix
+                                let dest_key = key.replacen(&staging_prefix, &final_prefix, 1);
+                                if let Err(e) = provider.put_object(&dest_key, bytes).await {
+                                    log::error!("failed to copy staging {} -> {}: {}", key, dest_key, e);
+                                    return Err(tonic::Status::internal(format!("failed to copy staged object: {}", e)));
+                                }
+                                // delete original
+                                if let Err(e) = provider.delete_object(key).await {
+                                    log::warn!("failed to delete staging object {}: {}", key, e);
+                                }
+                            }
+                            Ok(None) => log::warn!("staged object {} disappeared during commit", key),
+                            Err(e) => {
+                                log::error!("failed to read staged object {}: {}", key, e);
+                                return Err(tonic::Status::internal(format!("failed to read staged object: {}", e)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => return Err(tonic::Status::internal(format!("failed to list staging objects: {}", e))),
+            }
 
-        // Move (rename) staging_dir -> final_dir (atomic on same fs)
-        if let Err(e) = tokio_fs::rename(&staging_dir, &final_dir).await {
-            log::error!("failed to promote staging {} -> {}: {}", staging_dir, final_dir, e);
-            return Err(tonic::Status::internal(format!("failed to promote staged objects: {}", e)));
-        }
+            // write final manifest into final parent for visibility
+            let manifest = json!({
+                "tx_id": req.tx_id.clone(),
+                "final_prefix": final_prefix.clone(),
+                "committed_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let manifest_key = format!("final/{}/manifest_{}.json", req.staging_prefix, req.tx_id);
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes());
+            if let Err(e) = provider.put_object(&manifest_key, manifest_bytes).await {
+                log::error!("failed to put final manifest {}: {}", manifest_key, e);
+                return Err(tonic::Status::internal(format!("failed to put final manifest: {}", e)));
+            }
+        } else {
+            let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
+            let final_parent = format!("worker_storage/final/{}", req.staging_prefix);
+            let final_dir = format!("{}/{}", final_parent, req.tx_id);
 
-        // Create/Write a manifest pointer into final parent for visibility
-        let manifest = json!({
-            "tx_id": req.tx_id.clone(),
-            "final_path": final_dir.clone(),
-            "committed_at": chrono::Utc::now().to_rfc3339(),
-        });
-        let manifest_path = format!("{}/manifest_{}.json", final_parent, req.tx_id);
-        if let Err(e) = tokio_fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes())).await {
-            log::error!("failed to write final manifest {}: {}", manifest_path, e);
-            return Err(tonic::Status::internal(format!("failed to write final manifest: {}", e)));
+            // Ensure final parent exists
+            if let Err(e) = tokio_fs::create_dir_all(&final_parent).await {
+                log::error!("failed to create final parent {}: {}", final_parent, e);
+                return Err(tonic::Status::internal(format!("failed to create final parent: {}", e)));
+            }
+
+            // Move (rename) staging_dir -> final_dir (atomic on same fs)
+            if let Err(e) = tokio_fs::rename(&staging_dir, &final_dir).await {
+                log::error!("failed to promote staging {} -> {}: {}", staging_dir, final_dir, e);
+                return Err(tonic::Status::internal(format!("failed to promote staged objects: {}", e)));
+            }
+
+            // Create/Write a manifest pointer into final parent for visibility
+            let manifest = json!({
+                "tx_id": req.tx_id.clone(),
+                "final_path": final_dir.clone(),
+                "committed_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let manifest_path = format!("{}/manifest_{}.json", final_parent, req.tx_id);
+            if let Err(e) = tokio_fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap_or_else(|_| manifest.to_string().into_bytes())).await {
+                log::error!("failed to write final manifest {}: {}", manifest_path, e);
+                return Err(tonic::Status::internal(format!("failed to write final manifest: {}", e)));
+            }
         }
 
         let resp = worker_service::CommitResponse { success: true, message: "committed".to_string() };
@@ -232,20 +316,36 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         let req = request.into_inner();
         log::info!("Abort called for tx={} staging_prefix={}", req.tx_id, req.staging_prefix);
 
-        let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
-        match tokio_fs::remove_dir_all(&staging_dir).await {
-            Ok(_) => {
-                let resp = worker_service::AbortResponse { success: true, message: "aborted".to_string() };
-                Ok(tonic::Response::new(resp))
+        let staging_prefix = format!("staging/{}/{}/", req.staging_prefix, req.tx_id);
+        if let Some(provider) = self.shared_data.storage_provider.clone() {
+            match provider.list_objects(&staging_prefix).await {
+                Ok(keys) => {
+                    for k in keys.iter() {
+                        if let Err(e) = provider.delete_object(k).await {
+                            log::warn!("failed to delete staged object {}: {}", k, e);
+                        }
+                    }
+                    let resp = worker_service::AbortResponse { success: true, message: "aborted".to_string() };
+                    return Ok(tonic::Response::new(resp));
+                }
+                Err(e) => return Err(tonic::Status::internal(format!("failed to list staging objects for abort: {}", e))),
             }
-            Err(e) => {
-                // If missing, consider it successful cleanup
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    let resp = worker_service::AbortResponse { success: true, message: "nothing to abort".to_string() };
+        } else {
+            let staging_dir = format!("worker_storage/staging/{}/{}", req.staging_prefix, req.tx_id);
+            match tokio_fs::remove_dir_all(&staging_dir).await {
+                Ok(_) => {
+                    let resp = worker_service::AbortResponse { success: true, message: "aborted".to_string() };
                     Ok(tonic::Response::new(resp))
-                } else {
-                    log::error!("failed to remove staging dir {}: {}", staging_dir, e);
-                    Err(tonic::Status::internal(format!("failed to remove staging dir: {}", e)))
+                }
+                Err(e) => {
+                    // If missing, consider it successful cleanup
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        let resp = worker_service::AbortResponse { success: true, message: "nothing to abort".to_string() };
+                        Ok(tonic::Response::new(resp))
+                    } else {
+                        log::error!("failed to remove staging dir {}: {}", staging_dir, e);
+                        Err(tonic::Status::internal(format!("failed to remove staging dir: {}", e)))
+                    }
                 }
             }
         }

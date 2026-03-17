@@ -1,6 +1,7 @@
 mod services;
 mod state;
 mod init;
+mod storage;
 
 pub mod interops_service {
     tonic::include_proto!("interops_service");
@@ -12,6 +13,29 @@ use kionas::utils::{resolve_hostname,};
 use kionas::config;
 use kionas::get_local_hostname;
 use std::env;
+use log;
+
+// Try to install a default rustls CryptoProvider at startup to avoid runtime
+// ambiguity when multiple provider features are compiled into dependencies.
+// This is the recommended approach from rustls when both 'ring' and
+// 'aws-lc-rs' may appear in the dependency graph.
+fn try_install_rustls_crypto_provider() {
+    // Construct the crate-default provider depending on which rustls feature
+    // was enabled at compile time, and install it as the process default.
+    // This avoids the runtime panic about ambiguous provider selection.
+    let res = std::panic::catch_unwind(|| {
+        // Prefer aws_lc_rs provider explicitly. Worker crate depends on rustls
+        // with the aws_lc_rs feature enabled, so this symbol is available
+        // and can be installed as the process default before any TLS uses it.
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let _ = provider.install_default();
+    });
+
+    match res {
+        Ok(_) => log::debug!("rustls CryptoProvider installed default successfully"),
+        Err(_) => log::debug!("rustls CryptoProvider.install_default() panicked or unavailable"),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -22,6 +46,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let consul_url = env::var("CONSUL_URL").ok();
     let worker_id = get_local_hostname().unwrap_or_else(|| "worker".to_string());
+    // Install rustls provider before any TLS code runs
+    try_install_rustls_crypto_provider();
     // Try to load unified AppConfig for this worker
     let app_cfg = match config::load_for_host(consul_url.as_deref(), &worker_id).await {
         Ok(cfg) => {
@@ -67,26 +93,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         tls_key_path: interops.tls_key.clone(),
         ca_cert_path: interops.ca_cert.clone()
     };
-    let shared_data = crate::state::SharedData::new(worker_info, cluster_info);
+    let mut shared_data = crate::state::SharedData::new(worker_info, cluster_info);
+
+    // Build storage provider from cluster info and attach to shared state (best-effort)
+    match crate::storage::build_provider_from_cluster(&shared_data.cluster_info.storage).await {
+        Ok(prov) => {
+            shared_data.set_storage_provider(prov);
+            println!("Attached storage provider to shared state");
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to build storage provider: {}. continuing without it", e);
+        }
+    }
 
     // Start interops_server
     
     let svc = services::worker_service_server::WorkerService { shared_data };
     println!("Starting interops_server on {}", addr);
-    if interops.port == 443 {
-        println!("Interops server will use TLS on port 443");
         tonic::transport::Server::builder()
-        .tls_config(tls_config)?
+        //.tls_config(tls_config)?
         .add_service(services::worker_service_server::worker_service::worker_service_server::WorkerServiceServer::new(svc))
         .serve(addr)
         .await?;
-    } else {
-        println!("Interops server will use port {}", interops.port);
-        tonic::transport::Server::builder()
-        .add_service(services::worker_service_server::worker_service::worker_service_server::WorkerServiceServer::new(svc))
-        .serve(addr)
-        .await?;
-    }
+    
     
     Ok(())
 }

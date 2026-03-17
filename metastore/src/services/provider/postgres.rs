@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use deadpool_postgres::{Manager, Pool as PostgresPool};
 use tokio_postgres::NoTls;
+use log;
 
 #[async_trait]
 pub trait MetastoreProvider: Send + Sync {
@@ -74,7 +75,7 @@ impl MetastoreProvider for PostgresProvider {
         let stmt = "INSERT INTO catalogs (name, owner) VALUES ($1, $2) RETURNING id";
         let owner = "kionas";
         // print
-        println!("Creating schema '{}' with owner '{}'", req.schema_name, owner);
+        log::debug!("Creating schema '{}' with owner '{}'", req.schema_name, owner);
         match client.query_one(stmt, &[&req.schema_name, &owner]).await {
             Ok(_row) => CreateSchemaResponse {
                 success: true,
@@ -124,27 +125,25 @@ impl MetastoreProvider for PostgresProvider {
         let parts_str = parts_json.to_string();
 
         let tx_id_str = &req.tx_id;
-        // Safely escape single quotes in JSON string for SQL literal embedding
-        let participants_escaped = parts_str.replace("'", "''");
-        let stmt = format!(
-            "INSERT INTO transactions (tx_id, state, participants) VALUES ('{}'::uuid, 'PREPARING', '{}'::jsonb) RETURNING tx_id",
-            tx_id_str, participants_escaped
-        );
-        println!("[metastore::postgres] Executing SQL: {}", stmt);
-        match client.query_one(&stmt, &[]).await {
+        // Use parameterized query to avoid SQL injection and driver ToSql issues
+        // Cast parameter 1 as text then to uuid so we can pass tx_id as &str
+        // Cast $3 as text then to jsonb so we can pass participants as a string
+        let stmt = "INSERT INTO transactions (tx_id, state, participants) VALUES ($1::text::uuid, $2, $3::text::jsonb) RETURNING tx_id::text";
+        log::debug!("[metastore::postgres] Executing parameterized SQL: {}", stmt);
+        match client.query_one(stmt, &[&tx_id_str, &"PREPARING", &parts_str]).await {
             Ok(row) => {
                 let returned: Result<&str, _> = row.try_get(0);
                 match returned {
                     Ok(s) => match Uuid::parse_str(s) {
-                        Ok(id) => println!("[metastore::postgres] Insert returned tx_id={}", id),
-                        Err(pe) => println!("[metastore::postgres] Insert returned tx_id string but failed to parse UUID: {} (raw='{}')", pe, s),
+                        Ok(id) => log::debug!("[metastore::postgres] Insert returned tx_id={}", id),
+                        Err(pe) => log::debug!("[metastore::postgres] Insert returned tx_id string but failed to parse UUID: {} (raw='{}')", pe, s),
                     },
-                    Err(e) => println!("[metastore::postgres] Insert returned a row (unable to extract tx_id): {}", e),
+                    Err(e) => log::debug!("[metastore::postgres] Insert returned a row (unable to extract tx_id): {}", e),
                 }
                 CreateTransactionResponse { success: true, message: format!("Transaction {} created", req.tx_id), transaction: None }
             }
             Err(e) => {
-                println!("[metastore::postgres] Failed to create transaction: {}", e);
+                log::debug!("[metastore::postgres] Failed to create transaction: {}", e);
                 CreateTransactionResponse { success: false, message: format!("Failed to create transaction: {}", e), transaction: None }
             }
         }

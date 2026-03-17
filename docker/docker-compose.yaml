@@ -28,6 +28,12 @@ services:
       context: ..
       dockerfile: ./docker/Dockerfile.dev
     container_name: kionas-dev
+    environment:
+      RUST_LOG: debug
+      RUST_BACKTRACE: full
+      KIONAS_HOME: /workspace
+      CONSUL_URL: http://kionas-consul:8500
+      REDIS_URL: redis://kionas-redis:6379      
     networks:
       - warehouse_network
     volumes:
@@ -110,6 +116,8 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CONSUL_URL: http://kionas-consul:8500
+      REDIS_URL: redis://kionas-redis:6379     
     volumes:
       - ..:/workspace:cached
     depends_on:
@@ -130,6 +138,8 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CONSUL_URL: http://kionas-consul:8500
+      REDIS_URL: redis://kionas-redis:6379
     volumes:
       - ..:/workspace:cached
     depends_on:
@@ -147,6 +157,13 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CONSUL_URL: http://kionas-consul:8500
+      REDIS_URL: redis://kionas-redis:6379
+      # storage endpoint and credentials for worker to access MinIO
+      AWS_ACCESS_KEY_ID: root
+      AWS_SECRET_ACCESS_KEY: rootpassword
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://kionas-minio:9000
     volumes:
       - ..:/workspace:cached
     depends_on:
