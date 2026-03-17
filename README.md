@@ -6,7 +6,7 @@
 - Kionas is a Rust-native, modular data platform prototype (server, worker, metastore, client) focused on pluggable storage, gRPC interop, and coordinated transactions. It is early-stage and welcomes contributions.
 
 **What Do We Have So Far**
-- **Crates**: : workspace crates including [server](server), [worker](worker), [metastore](metastore), [client](client), and the shared `kionas` crate.
+- **Crates**: : workspace crates including [server](server), [wor405555ker](worker), [metastore](metastore), [client](client), and the shared `kionas` crate.
 - **Staging**: : storage staging helpers and a staging manifest workflow.
 - **Minio provider**: : S3/MinIO-compatible storage provider implementation.
 - **Transactions**: : `transactions::maestro` for coordination of prepare/commit/abort flows.
