@@ -1,37 +1,47 @@
-mod config;
 mod services;
 
-use crate::config::MetastoreConfig;
 use crate::services::metastore_service::{MetastoreService, metastore_service};
 use crate::services::provider::postgres::PostgresProvider;
 use kionas::utils::resolve_hostname;
-use tonic::transport::{Identity, ServerTlsConfig, Server};
 use std::error::Error;
 use std::sync::Arc;
-
-use kionas::{parse_env_vars, };
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize logging
     env_logger::init();
 
-    // Load config
-    let metastore_config_path: String = "${KIONAS_HOME}/configs/metastore.toml".to_string();
-    let config = MetastoreConfig::from_file(parse_env_vars(metastore_config_path.as_str()).as_str())?;
-    let cert = std::fs::read(parse_env_vars(&config.tls_cert_path))?;
-    let key = std::fs::read(parse_env_vars(&config.tls_key_path))?;
+    // Load a unified AppConfig (Consul -> local) and use its sections directly
+    let consul_url = std::env::var("CONSUL_URL").ok();
+    let hostname = kionas::get_local_hostname().unwrap_or_else(|| "metastore".to_string());
+
+    let app_cfg = kionas::config::load_for_host(consul_url.as_deref(), &hostname).await?;
+
+    // Map AppConfig -> use sections directly
+    let interops = app_cfg
+        .services
+        .interops
+        .ok_or("missing services.interops in AppConfig")?;
+    let pg = app_cfg
+        .services
+        .postgres
+        .ok_or("missing services.postgres in AppConfig")?;
+
+    // TLS for metastore gRPC server comes from services.interops
+    let cert = std::fs::read(kionas::parse_env_vars(&interops.tls_cert))?;
+    let key = std::fs::read(kionas::parse_env_vars(&interops.tls_key))?;
     let identity = Identity::from_pem(cert, key);
     // TLS setup
-    let tls_config =ServerTlsConfig::new().identity(identity);
+    let tls_config = ServerTlsConfig::new().identity(identity);
 
-    // Initialize Postgres provider
-    let pg_provider = Arc::new(PostgresProvider::new(&config)?);
+    // Initialize Postgres provider using shared PostgresServiceConfig
+    let pg_provider = Arc::new(PostgresProvider::new(&pg)?);
 
     // Service implementation (pass provider to service)
     let svc = MetastoreService::new(pg_provider.clone());
 
-    let addr = resolve_hostname(config.grpc_host.as_str(), config.grpc_port).await?;
+    let addr = resolve_hostname(interops.host.as_str(), interops.port).await?;
 
     // Start gRPC server
     Server::builder()

@@ -1,19 +1,20 @@
-pub mod utils;
-pub mod logging;
-pub mod session;
-pub mod parser;
-pub mod consul;
+pub mod config;
 pub mod constants;
+pub mod consul;
+pub mod logging;
+pub mod parser;
+pub mod session;
+pub mod utils;
 
-use uuid::Uuid;
 use chrono::Utc;
+use get_if_addrs::get_if_addrs;
+use hostname;
+use md5;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
-use md5;
-use get_if_addrs::get_if_addrs;
 use std::net::IpAddr;
-use hostname; 
+use std::path::Path;
+use uuid::Uuid;
 
 use regex::Regex;
 use std::env;
@@ -25,7 +26,7 @@ extern crate alloc;
 pub enum RedisDatabases {
     Session = 0,
     Config = 1,
-    Status = 2
+    Status = 2,
 }
 
 impl RedisDatabases {
@@ -58,10 +59,6 @@ pub fn get_redis_url_session() -> String {
     get_redis_url(RedisDatabases::SESSION)
 }
 
-
-
-
-
 pub fn get_local_ip() -> Option<IpAddr> {
     let if_addrs = get_if_addrs().unwrap();
     for iface in if_addrs {
@@ -77,7 +74,8 @@ pub fn parse_env_vars(input: &str) -> String {
     re.replace_all(input, |caps: &regex::Captures| {
         let var_name = &caps[1];
         env::var(var_name).unwrap_or_else(|_| format!("${{{}}}", var_name))
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Generate a UUID based on the current timestamp and a string parameter.

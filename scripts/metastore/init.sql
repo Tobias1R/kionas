@@ -64,3 +64,17 @@ CREATE TABLE IF NOT EXISTS statistics (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (table_id) REFERENCES tables(id) ON DELETE CASCADE
 );
+
+-- Transactions table for 2PC-lite staging/commit coordination
+CREATE TABLE IF NOT EXISTS transactions (
+    id BIGSERIAL PRIMARY KEY,
+    tx_id UUID NOT NULL UNIQUE,
+    state VARCHAR(32) NOT NULL,
+    participants JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_tx_id ON transactions(tx_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_state ON transactions(state);
+

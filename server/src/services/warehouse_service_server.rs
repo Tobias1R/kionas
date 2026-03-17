@@ -1,26 +1,19 @@
 // Minimal, clean service implementation for `warehouse_service`.
 // This file intentionally keeps handler logic simple so the crate builds.
 
-use tonic::{Request, Response, Status};
+use crate::statement_handler::handle_statement;
 use crate::warehouse::state::SharedData;
 use kionas::parser::sql::parse_query;
-use crate::statement_handler::handle_statement;
+use tonic::{Request, Response, Status};
 
 pub mod warehouse_service {
     tonic::include_proto!("warehouse_service");
 }
 
 use warehouse_service::warehouse_service_server::WarehouseService as WarehouseServiceTrait;
-use warehouse_service::{
-    QueryStatusRequest, QueryStatusResponse,
-    QueryRequest, QueryResponse    
-};
+use warehouse_service::{QueryRequest, QueryResponse, QueryStatusRequest, QueryStatusResponse};
 
 use crate::services::request_context::RequestContext;
-use crate::tasks::{TaskManager, TaskState};
-use kionas::parser::datafusion_sql::sqlparser::ast::{Statement, ObjectName};
-use crate::services::metastore_client::metastore_service as ms;
-use chrono::Utc;
 
 #[derive(Clone)]
 pub struct WarehouseService {
@@ -64,7 +57,7 @@ impl WarehouseServiceTrait for WarehouseService {
         log::info!("Received query: {}", query_text);
 
         // Use the query id from the context so callers can correlate work.
-        let query_id = ctx.query_id.clone();
+        let _query_id = ctx.query_id.clone();
 
         // Prepare a single mutable response and populate it based on interpretation of the query.
         let mut resp = QueryResponse {
@@ -75,9 +68,8 @@ impl WarehouseServiceTrait for WarehouseService {
             data: Vec::new(),
         };
 
-
         let shared_data = self.shared_data.clone();
-        
+
         // Attempt to fetch and log the full session (if available) for better observability
         if !ctx.session_id.is_empty() {
             let session_manager = {
@@ -91,7 +83,13 @@ impl WarehouseServiceTrait for WarehouseService {
         // Centralized handler for simple commands (e.g. `USE WAREHOUSE`) that
         // do not produce a normal SQL AST. The logic lives in the
         // `statement_handler` package so command handling is centralized.
-        if let Some(msg) = crate::statement_handler::maybe_handle_direct_command(&query_text, &session_id, &shared_data).await {
+        if let Some(msg) = crate::statement_handler::maybe_handle_direct_command(
+            &query_text,
+            &session_id,
+            &shared_data,
+        )
+        .await
+        {
             resp.message = msg;
             return Ok(Response::new(resp));
         }
@@ -101,17 +99,17 @@ impl WarehouseServiceTrait for WarehouseService {
                 println!("Parsed statements: {:?}", statements);
 
                 // Acquire TaskManager reference without holding shared_data lock across awaits
-                let task_manager = {
+                let _task_manager = {
                     let state = shared_data.lock().await;
                     state.task_manager.clone()
                 };
 
                 for stmt in &statements {
-                        // Execute handler synchronously (existing logic performs dispatch to worker)
-                        let result = handle_statement(stmt, &session_id, &shared_data).await;
-                        println!("Execution result: {}", result);
+                    // Execute handler synchronously (existing logic performs dispatch to worker)
+                    let result = handle_statement(stmt, &session_id, &shared_data).await;
+                    println!("Execution result: {}", result);
 
-                        // statement_handler now performs any metastore actions after dispatch.
+                    // statement_handler now performs any metastore actions after dispatch.
                 }
             }
             Err(e) => {
@@ -121,6 +119,4 @@ impl WarehouseServiceTrait for WarehouseService {
 
         Ok(Response::new(resp))
     }
-
-    
 }

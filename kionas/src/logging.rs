@@ -1,15 +1,18 @@
-use log::LevelFilter;
-use env_logger::{Builder, Target};
-use std::io::Write;
 use chrono::Local;
+use env_logger::{Builder, Target};
+use log::LevelFilter;
+use std::io::Write;
 
 /// Initialize the logger based on configuration
-pub fn init_logging(level: &str, output: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn init_logging(
+    level: &str,
+    output: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Extract logging settings
     let level = level;
     let output = output;
     let format = format;
-
 
     // Map level string to LevelFilter
     let log_level = match level.to_string().as_str() {

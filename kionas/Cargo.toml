@@ -22,3 +22,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hostname = "0.3"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }

@@ -1,8 +1,8 @@
-use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
-use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::tokenizer::{Tokenizer, Token};
+use datafusion::sql::sqlparser::dialect::SnowflakeDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
+use datafusion::sql::sqlparser::parser::Parser;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
 pub fn parse_query(query: &str) -> Result<Vec<Statement>, String> {
     // Use Snowflake dialect for now; later we may switch to `KionasDialect`.
@@ -24,15 +24,21 @@ pub fn parse_query(query: &str) -> Result<Vec<Statement>, String> {
                             Token::Word(w2) => {
                                 if w2.keyword == Keyword::WAREHOUSE {
                                     // naive name extraction from original text: third whitespace token
-                                    let parts: Vec<&str> = query.trim().split_whitespace().collect();
+                                    let parts: Vec<&str> =
+                                        query.trim().split_whitespace().collect();
                                     if parts.len() >= 3 {
                                         let mut name = parts[2].trim().to_string();
                                         if name.ends_with(';') {
                                             name = name.trim_end_matches(';').to_string();
                                         }
-                                        return Err(format!("KIONAS_DIRECT_COMMAND:USE_WAREHOUSE:{}", name));
+                                        return Err(format!(
+                                            "KIONAS_DIRECT_COMMAND:USE_WAREHOUSE:{}",
+                                            name
+                                        ));
                                     } else {
-                                        return Err("KIONAS_DIRECT_COMMAND:USE_WAREHOUSE:".to_string());
+                                        return Err(
+                                            "KIONAS_DIRECT_COMMAND:USE_WAREHOUSE:".to_string()
+                                        );
                                     }
                                 } else {
                                     break;

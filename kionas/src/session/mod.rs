@@ -1,4 +1,3 @@
-
 /*
 A client for redis
  */
@@ -48,10 +47,7 @@ impl SessionProvider {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         con.keys(pattern).await
     }
-
-
 }
-
 
 pub struct SyncSessionProvider {
     client: redis::Client,
@@ -89,14 +85,10 @@ impl SyncSessionProvider {
     pub fn keys(&mut self, pattern: &str) -> redis::RedisResult<Vec<String>> {
         self.con.keys(pattern)
     }
-
-    
 }
 
 /*
 Kionas Session
 
-This object hold all the information about 
+This object hold all the information about
 */
-
-

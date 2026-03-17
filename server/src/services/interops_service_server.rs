@@ -1,16 +1,12 @@
-
-
-use tonic::{Request, Response, Status};
+use crate::warehouse::Warehouse;
+use crate::warehouse::state::{SharedData, WorkerEntry};
 use kionas::{get_digest, parse_env_vars};
 use std::sync::Arc;
-use crate::warehouse::state::{SharedData, WorkerEntry};
-use crate::warehouse::Warehouse;
-use crate::workers_pool::get_new_pool;
+use tonic::{Request, Response, Status};
 // Second gRPC service
 pub mod interops_service {
     tonic::include_proto!("interops_service");
 }
-
 
 #[derive(Default)]
 pub struct InteropsService {
@@ -45,18 +41,27 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         } else {
             format!("http://{}:{}", worker.host, worker.port)
         };
-        log::info!("Registering worker {} at {} (pool_addr={})", worker.name, worker.host, pool_addr);
+        log::info!(
+            "Registering worker {} at {} (pool_addr={})",
+            worker.name,
+            worker.host,
+            pool_addr
+        );
 
         // attempt to read CA cert from config (if available) to trust worker TLS
         let cnf = shared_data.config.clone();
         let ca_bytes = if let Some(cfg) = cnf {
-            if !cfg.interops.ca_cert.is_empty() {
-                match std::fs::read(parse_env_vars(&cfg.interops.ca_cert).as_str()) {
-                    Ok(b) => Some(b),
-                    Err(e) => {
-                        log::warn!("Failed to read interops ca_cert {}: {}", cfg.interops.ca_cert, e);
-                        None
+            if let Some(iops) = cfg.services.interops.as_ref() {
+                if !iops.ca_cert.is_empty() {
+                    match std::fs::read(parse_env_vars(&iops.ca_cert).as_str()) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            log::warn!("Failed to read interops ca_cert {}: {}", iops.ca_cert, e);
+                            None
+                        }
                     }
+                } else {
+                    None
                 }
             } else {
                 None
@@ -66,7 +71,7 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
 
         // Create a WorkerEntry and insert into SharedState.workers for lazy pool creation later
-        let warehouses = Arc::clone(&shared_data.warehouses);
+        let _warehouses = Arc::clone(&shared_data.warehouses);
         let warehouse = Warehouse::new(
             worker.name.clone(),
             digested.clone(),
@@ -75,13 +80,20 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             worker.warehouse_type.clone(),
         );
         let entry = WorkerEntry::new(digested.clone(), warehouse.clone(), ca_bytes.clone());
-        shared_data.workers.lock().await.insert(digested.clone(), entry);
-        log::info!("Inserted worker entry for {} (key={})", worker.name, digested.clone());
-        
+        shared_data
+            .workers
+            .lock()
+            .await
+            .insert(digested.clone(), entry);
+        log::info!(
+            "Inserted worker entry for {} (key={})",
+            worker.name,
+            digested.clone()
+        );
 
         let response = interops_service::RegisterWorkerResponse {
             status: "ok".into(),
-            uuid: digested.clone()
+            uuid: digested.clone(),
         };
         log::info!("Worker registered: {:?}", digested);
         Ok(Response::new(response))
@@ -112,58 +124,71 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
         Ok(Response::new(response))
     }
-    
+
     async fn task_update(
         &self,
         request: Request<interops_service::TaskUpdateRequest>,
     ) -> Result<Response<interops_service::TaskUpdateResponse>, Status> {
         let upd = request.into_inner();
-        log::info!("Task update received: {} status={}", upd.task_id, upd.status);
+        log::info!(
+            "Task update received: {} status={}",
+            upd.task_id,
+            upd.status
+        );
 
         let shared = self.shared_data.lock().await;
         let tm = shared.task_manager.clone();
 
-        if let Some(task_arc) = tm.get_task(&upd.task_id).await {
-            let mut t = task_arc.lock().await;
+        if let Some(_task_arc) = tm.get_task(&upd.task_id).await {
             let s = upd.status.to_lowercase();
-            match s.as_str() {
-                "running" => {
-                    t.state = crate::tasks::TaskState::Running;
-                }
+            let (state, result_loc, err) = match s.as_str() {
+                "running" => (crate::tasks::TaskState::Running, None, None),
                 "succeeded" | "success" | "ok" => {
-                    t.state = crate::tasks::TaskState::Succeeded;
-                    if !upd.result_location.is_empty() {
-                        t.result_location = Some(upd.result_location.clone());
-                    }
+                    let rl = if !upd.result_location.is_empty() {
+                        Some(upd.result_location.clone())
+                    } else {
+                        None
+                    };
+                    (crate::tasks::TaskState::Succeeded, rl, None)
                 }
                 "failed" | "error" => {
-                    t.state = crate::tasks::TaskState::Failed;
-                    if !upd.error.is_empty() {
-                        t.error = Some(upd.error.clone());
-                    }
+                    let er = if !upd.error.is_empty() {
+                        Some(upd.error.clone())
+                    } else {
+                        None
+                    };
+                    (crate::tasks::TaskState::Failed, None, er)
                 }
-                "cancelled" | "canceled" => {
-                    t.state = crate::tasks::TaskState::Cancelled;
-                }
-                _ => {
-                    // Unknown status, store it as error text
-                    t.error = Some(format!("unknown status from worker: {}", upd.status));
-                }
-            }
+                "cancelled" | "canceled" => (crate::tasks::TaskState::Cancelled, None, None),
+                _ => (
+                    crate::tasks::TaskState::Failed,
+                    None,
+                    Some(format!("unknown status from worker: {}", upd.status)),
+                ),
+            };
+            // Update via TaskManager helper so waiters are notified
+            tm.update_from_worker(&upd.task_id, state, result_loc, err)
+                .await;
         } else {
             log::warn!("Task update for unknown task id: {}", upd.task_id);
             // Proceed, but indicate not-found; still return ok to avoid worker retries
-            let resp = interops_service::TaskUpdateResponse { status: "not_found".into() };
+            let resp = interops_service::TaskUpdateResponse {
+                status: "not_found".into(),
+            };
             return Ok(Response::new(resp));
         }
 
-        let resp = interops_service::TaskUpdateResponse { status: "ok".into() };
+        let resp = interops_service::TaskUpdateResponse {
+            status: "ok".into(),
+        };
         Ok(Response::new(resp))
     }
 }
 
 impl InteropsService {
     pub fn new(shared_data: SharedData) -> Self {
-        Self { shared_data: Arc::clone(&shared_data) }
+        Self {
+            shared_data: Arc::clone(&shared_data),
+        }
     }
 }

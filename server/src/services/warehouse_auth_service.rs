@@ -2,7 +2,7 @@ use crate::auth::persistence::Persistence;
 use crate::auth::{Token, User};
 use crate::warehouse::state::SharedData;
 
-use jsonwebtoken::{encode, EncodingKey, Header};
+use jsonwebtoken::{EncodingKey, Header, encode};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
@@ -105,7 +105,7 @@ impl WarehouseAuthService for WarehouseAuthServiceBackend {
         let tokens = self.tokens.lock().await;
         let req = request.into_inner();
         let session = self
-            .session_manager            
+            .session_manager
             .get_token_session(req.token.clone())
             .await;
         if let Some(mut session) = session {
@@ -271,6 +271,4 @@ impl WarehouseAuthService for WarehouseAuthServiceBackend {
         }
         Err(Status::unauthenticated("Invalid token"))
     }
-
-    
 }

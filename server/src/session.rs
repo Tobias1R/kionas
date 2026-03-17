@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use kionas::get_digest;
 use kionas::session::SessionProvider;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
@@ -23,7 +23,7 @@ impl Session {
         auth_token: String,
         role: String,
         warehouse: String,
-        remote_addr: String,        
+        remote_addr: String,
     ) -> Self {
         Self {
             id,
@@ -104,7 +104,7 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new() -> Self {
-        Self {            
+        Self {
             provider: SessionProvider::new("redis://redis:6379/0"),
         }
     }
@@ -156,7 +156,7 @@ impl SessionManager {
                 Err(_) => {}
             }
         }
-        for (key, session) in sessions {
+        for (_key, session) in sessions {
             let session = session.lock().await;
             if session.get_auth_token() == token {
                 return Some(session.clone());

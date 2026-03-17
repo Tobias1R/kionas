@@ -1,4 +1,6 @@
-use super::super::metastore_service::{metastore_service, metastore_service::DropTableRequest, metastore_service::metastore_response::Result};
+use super::super::metastore_service::{
+    metastore_service::DropTableRequest, metastore_service::metastore_response::Result,
+};
 use crate::services::provider::postgres::MetastoreProvider;
 use std::sync::Arc;
 

@@ -9,4 +9,3 @@ pub mod worker_service {
 pub struct WorkerServiceClient {
     shared_data: SharedData,
 }
-

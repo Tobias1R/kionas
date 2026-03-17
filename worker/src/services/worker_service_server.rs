@@ -1,5 +1,7 @@
 use crate::state::SharedData;
 
+use serde_json::Value;
+
 pub mod worker_service {
     tonic::include_proto!("worker_service");
 }
@@ -28,7 +30,7 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         &self,
         request: tonic::Request<worker_service::HeartbeatRequest>,
     ) -> Result<tonic::Response<worker_service::HeartbeatResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let _req = request.into_inner();
         // TODO: Heartbeat logic
         let resp = worker_service::HeartbeatResponse {
             status: "alive".to_string(),
@@ -41,93 +43,115 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         request: tonic::Request<worker_service::TaskRequest>,
     ) -> Result<tonic::Response<worker_service::TaskResponse>, tonic::Status> {
         let req = request.into_inner();
-        // TODO: Task execution logic
-        // print something
         log::info!("Received task: {}", req.session_id);
 
-        // Spawn a background task to simulate work and report completion to the master
-        let task_id = req.tasks.get(0).map(|t| t.task_id.clone()).unwrap_or_else(|| "".to_string());
-        let result_location = "arrow-flight-endpoint".to_string();
-        let shared = self.shared_data.clone();
-        tokio::spawn(async move {
-            // simulate work
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            
-            // Read master address and TLS settings from shared.worker_info
-            let interops = &shared.worker_info;
-            let host = interops.server_url.clone();
-            
-            let ca_path_opt = Some(interops.ca_cert_path.clone());
-            // construct master URI
-            
-            let master = host.to_string(); // assume host includes port, e.g. "master:50051"
+        let resp = crate::transactions::maestro::handle_execute_task(self.shared_data.clone(), req);
+        Ok(tonic::Response::new(resp))
+    }
 
-            // create channel and client; support TLS when master uses https.
-            match tonic::transport::Channel::from_shared(master.clone()) {
-                Ok(base_ep) => {
-                    // build a configured endpoint; if TLS config fails, fall back to base_ep
-                    let configured_endpoint = if master.starts_with("https") {
-                        if let Some(ca_path) = ca_path_opt.as_ref() {
-                            if let Ok(ca_bytes) = std::fs::read(ca_path) {
-                                let ca_cert = tonic::transport::Certificate::from_pem(ca_bytes);
-                                let mut tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca_cert);
-                                if !interops.tls_cert_path.is_empty() && !interops.tls_key_path.is_empty() {
-                                    match (std::fs::read(kionas::parse_env_vars(&interops.tls_cert_path)), std::fs::read(kionas::parse_env_vars(&interops.tls_key_path))) {
-                                        (Ok(cert), Ok(key)) => {
-                                            let id = tonic::transport::Identity::from_pem(cert, key);
-                                            tls = tls.identity(id);
-                                        }
-                                        _ => log::warn!("Failed to read interops tls_cert/tls_key, proceeding without client identity"),
-                                    }
-                                }
-                                match base_ep.clone().tls_config(tls) {
-                                    Ok(e) => e,
-                                    Err(err) => {
-                                        log::error!("Failed to apply tls_config for master {}: {}", master, err);
-                                        base_ep.clone()
-                                    }
-                                }
-                            } else {
-                                log::error!("Failed to read CA path {}", ca_path);
-                                base_ep.clone()
-                            }
-                        } else {
-                            log::error!("No CA path configured in shared.cluster_info.interops; cannot validate master TLS for {}", master);
-                            base_ep.clone()
-                        }
-                    } else {
-                        base_ep.clone()
-                    };
+    async fn prepare(
+        &self,
+        request: tonic::Request<worker_service::PrepareRequest>,
+    ) -> Result<tonic::Response<worker_service::PrepareResponse>, tonic::Status> {
+        let req = request.into_inner();
+        log::info!(
+            "Prepare called for tx={} staging_prefix={}",
+            req.tx_id,
+            req.staging_prefix
+        );
+        let tasks_json: Vec<Value> = req
+            .tasks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "task_id": t.task_id.clone(),
+                    "operation": t.operation.clone(),
+                    "input": t.input.clone(),
+                    "output": t.output.clone(),
+                    "params": t.params.clone(),
+                })
+            })
+            .collect();
 
-                    match configured_endpoint.connect().await {
-                        Ok(chan) => {
-                            let mut client = crate::interops_service::interops_service_client::InteropsServiceClient::new(chan);
-                            let update = crate::interops_service::TaskUpdateRequest {
-                                task_id: task_id.clone(),
-                                status: "succeeded".to_string(),
-                                result_location: result_location.clone(),
-                                error: String::new(),
-                            };
-                            match client.task_update(tonic::Request::new(update)).await {
-                                Ok(resp) => {
-                                    log::info!("Sent TaskUpdate for {} -> {:?}", task_id, resp.into_inner());
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to send TaskUpdate for {}: {}", task_id, e);
-                                }
-                            }
-                        }
-                        Err(e) => log::error!("Failed to connect to master {}: {}", master, e),
-                    }
-                }
-                Err(e) => log::error!("Invalid master address {}: {}", master, e),
-            }
-        });
+        if let Err(e) = crate::transactions::maestro::prepare_tx(
+            self.shared_data.clone(),
+            &req.tx_id,
+            &req.staging_prefix,
+            &tasks_json,
+        )
+        .await
+        {
+            log::error!("failed to stage tx {}: {}", req.tx_id, e);
+            return Err(tonic::Status::internal(format!(
+                "failed to stage tx: {}",
+                e
+            )));
+        }
 
-        let resp = worker_service::TaskResponse {
-            status: "ok".to_string(),
-            error: String::new(),
-            result_location: "arrow-flight-endpoint".to_string(),
+        let resp = worker_service::PrepareResponse {
+            success: true,
+            message: "staged".to_string(),
+        };
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn commit(
+        &self,
+        request: tonic::Request<worker_service::CommitRequest>,
+    ) -> Result<tonic::Response<worker_service::CommitResponse>, tonic::Status> {
+        let req = request.into_inner();
+        log::info!(
+            "Commit called for tx={} staging_prefix={}",
+            req.tx_id,
+            req.staging_prefix
+        );
+        if let Err(e) = crate::transactions::maestro::commit_tx(
+            self.shared_data.clone(),
+            &req.tx_id,
+            &req.staging_prefix,
+        )
+        .await
+        {
+            log::error!("failed to promote tx {}: {}", req.tx_id, e);
+            return Err(tonic::Status::internal(format!(
+                "failed to promote staged objects: {}",
+                e
+            )));
+        }
+
+        let resp = worker_service::CommitResponse {
+            success: true,
+            message: "committed".to_string(),
+        };
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn abort(
+        &self,
+        request: tonic::Request<worker_service::AbortRequest>,
+    ) -> Result<tonic::Response<worker_service::AbortResponse>, tonic::Status> {
+        let req = request.into_inner();
+        log::info!(
+            "Abort called for tx={} staging_prefix={}",
+            req.tx_id,
+            req.staging_prefix
+        );
+        if let Err(e) = crate::transactions::maestro::abort_tx(
+            self.shared_data.clone(),
+            &req.tx_id,
+            &req.staging_prefix,
+        )
+        .await
+        {
+            log::error!("failed to abort tx {}: {}", req.tx_id, e);
+            return Err(tonic::Status::internal(format!(
+                "failed to abort staged objects: {}",
+                e
+            )));
+        }
+        let resp = worker_service::AbortResponse {
+            success: true,
+            message: "aborted".to_string(),
         };
         Ok(tonic::Response::new(resp))
     }
