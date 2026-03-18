@@ -208,10 +208,13 @@ impl KionasTable {
                 // Persist to metastore
                 let table_name = payload;
                 let creq = ms::CreateTableRequest {
+                    database_name: String::new(),
                     schema_name: String::new(),
                     table_name: table_name.clone(),
                     engine: String::new(),
                     columns: Vec::new(),
+                    location: String::new(),
+                    ast_payload_json: String::new(),
                 };
                 let mreq = ms::MetastoreRequest {
                     action: Some(ms::metastore_request::Action::CreateTable(creq)),

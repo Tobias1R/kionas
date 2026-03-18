@@ -37,13 +37,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ca_certificate = Certificate::from_pem(ca_cert);
 
     // generate a random database name for testing
-    let random_db_name = format!("testdb_{}", 1 // rand::random::<u16>()
-);
+    let random_db_name = format!(
+        "testdb_{}",
+        5 // rand::random::<u16>()
+    );
     // generate a random schema name for testing
-    let random_schema_name = format!("testschema_{}", 1 // rand::random::<u16>()
-);
+    let random_schema_name = format!(
+        "testschema_{}",
+        2 // rand::random::<u16>()
+    );
     // random table name
-    let random_table_name = format!("testtable_{}", 1 //rand::random::<u16>()
+    let random_table_name = format!(
+        "testtable_{}",
+        2 //rand::random::<u16>()
     );
 
     // Configure TLS settings with the CA certificate

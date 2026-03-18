@@ -2,9 +2,7 @@ use crate::state::SharedData;
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use kionas::parser::datafusion_sql::sqlparser::ast::{
-    ColumnOption, Expr, SetExpr, Statement, Value as SqlValue,
-};
+use kionas::parser::datafusion_sql::sqlparser::ast::{Expr, SetExpr, Statement, Value as SqlValue};
 use kionas::parser::sql::parse_query;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -24,19 +22,6 @@ struct ParsedInsertPayload {
     rows: Vec<Vec<InsertScalar>>,
 }
 
-#[derive(Clone, Debug)]
-struct CreateTableColumn {
-    name: String,
-    data_type: String,
-    nullable: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ParsedCreateTablePayload {
-    table_name: String,
-    columns: Vec<CreateTableColumn>,
-}
-
 /// What: Build a Delta table URI from storage config and a SQL table name.
 ///
 /// Inputs:
@@ -47,14 +32,39 @@ struct ParsedCreateTablePayload {
 /// - Optional `s3://` URI that points to the table root
 ///
 /// Details:
-/// - Uses configured bucket and maps `schema.table` to `schema/table`.
+/// - Uses configured bucket and maps canonical `database.schema.table` to
+///   `databases/<db>/schemas/<schema>/tables/<table>`.
+/// - Preserves a legacy fallback path mapping for non-3-part names.
 fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Option<String> {
+    fn normalize_segment(raw: &str) -> String {
+        raw.trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_ascii_lowercase()
+    }
+
     let bucket = storage.get("bucket").and_then(|v| v.as_str())?.trim();
     if bucket.is_empty() {
         return None;
     }
-    let clean_table = table_name
-        .trim()
+
+    let clean_table = table_name.trim();
+    let parts = clean_table
+        .split('.')
+        .map(normalize_segment)
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+
+    if parts.len() == 3 {
+        return Some(format!(
+            "s3://{}/databases/{}/schemas/{}/tables/{}",
+            bucket, parts[0], parts[1], parts[2]
+        ));
+    }
+
+    let clean_table = clean_table
         .trim_matches('"')
         .trim_matches('`')
         .replace('.', "/");
@@ -62,6 +72,34 @@ fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Optio
         return None;
     }
     Some(format!("s3://{}/{}", bucket, clean_table))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_table_uri_from_storage;
+    use serde_json::json;
+
+    #[test]
+    fn derive_insert_uri_uses_canonical_three_part_layout() {
+        let storage = json!({ "bucket": "warehouse" });
+        let uri = derive_table_uri_from_storage(&storage, "testdb_4.testschema_2.testtable_2")
+            .expect("uri must be derived");
+        assert_eq!(
+            uri,
+            "s3://warehouse/databases/testdb_4/schemas/testschema_2/tables/testtable_2"
+        );
+    }
+
+    #[test]
+    fn derive_insert_uri_normalizes_quoted_three_part_layout() {
+        let storage = json!({ "bucket": "warehouse" });
+        let uri = derive_table_uri_from_storage(&storage, "\"TestDB\".\"Schema\".\"Table\"")
+            .expect("uri must be derived");
+        assert_eq!(
+            uri,
+            "s3://warehouse/databases/testdb/schemas/schema/tables/table"
+        );
+    }
 }
 
 /// What: Parse an INSERT SQL payload into table metadata and row values.
@@ -144,101 +182,6 @@ fn parse_insert_payload(sql: &str) -> Result<ParsedInsertPayload, String> {
         columns,
         rows,
     })
-}
-
-/// What: Parse a CREATE TABLE SQL payload into table name and columns.
-///
-/// Inputs:
-/// - `sql`: Raw SQL payload from task input
-///
-/// Output:
-/// - Parsed table name and column descriptors
-///
-/// Details:
-/// - Column nullability defaults to true unless `NOT NULL` is explicitly present.
-fn parse_create_table_payload(sql: &str) -> Result<ParsedCreateTablePayload, String> {
-    let statements = parse_query(sql).map_err(|e| format!("create parse error: {}", e))?;
-    let stmt = statements
-        .first()
-        .ok_or_else(|| "create parse error: empty statement list".to_string())?;
-
-    let create = match stmt {
-        Statement::CreateTable(create_stmt) => create_stmt,
-        _ => return Err("task payload is not a CREATE TABLE statement".to_string()),
-    };
-
-    if create.columns.is_empty() {
-        return Err("CREATE TABLE has no columns".to_string());
-    }
-
-    let columns = create
-        .columns
-        .iter()
-        .map(|col| {
-            let not_null = col
-                .options
-                .iter()
-                .any(|opt| matches!(opt.option, ColumnOption::NotNull));
-            CreateTableColumn {
-                name: col.name.to_string(),
-                data_type: col.data_type.to_string(),
-                nullable: !not_null,
-            }
-        })
-        .collect();
-
-    Ok(ParsedCreateTablePayload {
-        table_name: create.name.to_string(),
-        columns,
-    })
-}
-
-/// What: Build an Arrow schema from parsed CREATE TABLE columns.
-///
-/// Inputs:
-/// - `parsed`: Parsed create-table payload
-///
-/// Output:
-/// - Arrow schema compatible with Delta table initialization
-///
-/// Details:
-/// - Uses a conservative SQL-to-Arrow type mapping and falls back to Utf8.
-fn build_schema_from_create_table(parsed: &ParsedCreateTablePayload) -> Result<Schema, String> {
-    if parsed.columns.is_empty() {
-        return Err("create table payload has no columns".to_string());
-    }
-
-    let fields = parsed
-        .columns
-        .iter()
-        .map(|col| {
-            let dt = col.data_type.to_ascii_lowercase();
-            let arrow_type = if dt.contains("bigint") || dt == "int8" || dt == "long" {
-                DataType::Int64
-            } else if dt.contains("smallint") || dt == "int2" {
-                DataType::Int16
-            } else if dt.contains("int") || dt == "integer" || dt == "int4" {
-                DataType::Int32
-            } else if dt.contains("boolean") || dt == "bool" {
-                DataType::Boolean
-            } else if dt.contains("float") || dt.contains("real") {
-                DataType::Float32
-            } else if dt.contains("double") {
-                DataType::Float64
-            } else if dt.contains("timestamp") {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            } else if dt == "date" {
-                DataType::Date32
-            } else if dt.contains("binary") {
-                DataType::Binary
-            } else {
-                DataType::Utf8
-            };
-            Field::new(col.name.clone(), arrow_type, col.nullable)
-        })
-        .collect::<Vec<_>>();
-
-    Ok(Schema::new(fields))
 }
 
 /// What: Convert parsed INSERT values to an Arrow RecordBatch.
@@ -368,50 +311,6 @@ pub async fn prepare_tx(
     staging_prefix: &str,
     tasks: &[JsonValue],
 ) -> Result<(), String> {
-    for task in tasks {
-        let operation = task
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if operation != "create_table" {
-            continue;
-        }
-
-        let input = task
-            .get("input")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let parsed = parse_create_table_payload(input)?;
-
-        let explicit_uri = task
-            .get("params")
-            .and_then(|v| v.get("table_uri"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.trim().is_empty());
-        let table_uri = explicit_uri
-            .or_else(|| {
-                derive_table_uri_from_storage(&shared.cluster_info.storage, &parsed.table_name)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "failed to derive table uri for CREATE TABLE {}",
-                    parsed.table_name
-                )
-            })?;
-
-        let schema = build_schema_from_create_table(&parsed)?;
-        if let Err(e) =
-            crate::storage::deltalake::create_table(shared.clone(), &table_uri, &schema).await
-        {
-            return Err(format!(
-                "failed to initialize delta table {} at {}: {}",
-                parsed.table_name, table_uri, e
-            ));
-        }
-    }
-
     if let Some(provider) = shared.storage_provider.clone() {
         // stage_tx returns a Vec<String> of staged keys; ignore result and map errors
         match crate::storage::staging::stage_tx(provider, tx_id, staging_prefix, tasks).await {
@@ -591,6 +490,36 @@ pub async fn handle_execute_task(
         };
 
         match crate::services::create_schema::execute_create_schema_task(&shared, task).await {
+            Ok(location) => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "ok".to_string(),
+                    error: String::new(),
+                    result_location: location,
+                };
+            }
+            Err(e) => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: e,
+                    result_location: String::new(),
+                };
+            }
+        }
+    }
+
+    if operation == "create_table" {
+        let task = match first_task.as_ref() {
+            Some(t) => t,
+            None => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: "create_table task payload is missing".to_string(),
+                    result_location: String::new(),
+                };
+            }
+        };
+
+        match crate::services::create_table::execute_create_table_task(&shared, task).await {
             Ok(location) => {
                 return crate::services::worker_service_server::worker_service::TaskResponse {
                     status: "ok".to_string(),

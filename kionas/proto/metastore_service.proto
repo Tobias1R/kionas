@@ -55,11 +55,13 @@ message MetastoreResponse {
 
 // Table related messages
 message CreateTableRequest {
-  string schema_name = 1;
-  string table_name = 2;
-  string engine = 3; // e.g., "parquet", "csv"
-    repeated ColumnSchema columns = 4;
-
+  string database_name = 1;
+  string schema_name = 2;
+  string table_name = 3;
+  string engine = 4; // e.g., "parquet", "csv"
+  repeated ColumnSchema columns = 5;
+  string location = 6;
+  string ast_payload_json = 7;
 }
 
 message DropTableRequest {
@@ -68,9 +70,10 @@ message DropTableRequest {
 }
 
 message GetTableRequest {
-  string schema_name = 1;
-  string table_name = 2;
-  string location = 3; // Optional: location of the table data
+  string database_name = 1;
+  string schema_name = 2;
+  string table_name = 3;
+  string location = 4; // Optional: location of the table data
 }
 
 message CreateTableResponse {
@@ -156,6 +159,7 @@ message TableMetadata {
   string location = 5;
   string container = 6;
   repeated ColumnSchema columns = 7;
+  string database_name = 8;
 }
 
 message PartitionMetadata {

@@ -67,11 +67,128 @@ impl PostgresProvider {
 
 #[async_trait]
 impl MetastoreProvider for PostgresProvider {
-    async fn create_table(&self, _req: CreateTableRequest) -> CreateTableResponse {
-        // TODO: Implement Postgres logic
-        CreateTableResponse {
-            success: true,
-            message: "Table created".to_string(),
+    async fn create_table(&self, req: CreateTableRequest) -> CreateTableResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return CreateTableResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let database_name = req.database_name.trim().to_ascii_lowercase();
+        let schema_name = req.schema_name.trim().to_ascii_lowercase();
+        let table_name = req.table_name.trim().to_ascii_lowercase();
+        if database_name.is_empty() || schema_name.is_empty() || table_name.is_empty() {
+            return CreateTableResponse {
+                success: false,
+                message: "database_name, schema_name and table_name are required".to_string(),
+            };
+        }
+
+        let qualified_schema = format!("{}.{}", database_name, schema_name);
+        let get_catalog_stmt = "SELECT id::text FROM catalogs WHERE name = $1 LIMIT 1";
+        let catalog_id = match client
+            .query_opt(get_catalog_stmt, &[&qualified_schema])
+            .await
+        {
+            Ok(Some(row)) => {
+                let id: String = row.get(0);
+                id
+            }
+            Ok(None) => {
+                return CreateTableResponse {
+                    success: false,
+                    message: format!("schema not found: {}", qualified_schema),
+                };
+            }
+            Err(e) => {
+                return CreateTableResponse {
+                    success: false,
+                    message: format!("Failed to resolve schema catalog: {}", e),
+                };
+            }
+        };
+
+        let exists_stmt =
+            "SELECT id::text FROM tables WHERE catalog_id::text = $1 AND name = $2 LIMIT 1";
+        match client
+            .query_opt(exists_stmt, &[&catalog_id, &table_name])
+            .await
+        {
+            Ok(Some(_)) => {
+                return CreateTableResponse {
+                    success: false,
+                    message: format!(
+                        "table already exists: {}.{}.{}",
+                        database_name, schema_name, table_name
+                    ),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return CreateTableResponse {
+                    success: false,
+                    message: format!("Failed to validate table existence: {}", e),
+                };
+            }
+        }
+
+        let columns_json = req
+            .columns
+            .iter()
+            .map(|col| {
+                serde_json::json!({
+                    "name": col.name,
+                    "data_type": col.data_type,
+                    "nullable": col.nullable,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let schema_json = if req.ast_payload_json.trim().is_empty() {
+            serde_json::json!({
+                "columns": columns_json,
+            })
+        } else {
+            match serde_json::from_str::<serde_json::Value>(&req.ast_payload_json) {
+                Ok(v) => v,
+                Err(_) => serde_json::json!({
+                    "columns": columns_json,
+                    "ast_payload_raw": req.ast_payload_json,
+                }),
+            }
+        };
+
+        let insert_stmt = "INSERT INTO tables (catalog_id, name, engine, schema, location, owner) SELECT id, $2, $3, $4::text::jsonb, $5, $6 FROM catalogs WHERE name = $1 RETURNING id::text";
+        let owner = "kionas";
+        match client
+            .query_one(
+                insert_stmt,
+                &[
+                    &qualified_schema,
+                    &table_name,
+                    &req.engine,
+                    &schema_json.to_string(),
+                    &req.location,
+                    &owner,
+                ],
+            )
+            .await
+        {
+            Ok(_row) => CreateTableResponse {
+                success: true,
+                message: format!(
+                    "Table created: {}.{}.{}",
+                    database_name, schema_name, table_name
+                ),
+            },
+            Err(e) => CreateTableResponse {
+                success: false,
+                message: format!("Failed to create table: {}", e),
+            },
         }
     }
 
@@ -125,11 +242,127 @@ impl MetastoreProvider for PostgresProvider {
             message: "Table dropped".to_string(),
         }
     }
-    async fn get_table(&self, _req: GetTableRequest) -> GetTableResponse {
-        GetTableResponse {
-            success: true,
-            message: "Table fetched".to_string(),
-            metadata: None,
+    async fn get_table(&self, req: GetTableRequest) -> GetTableResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return GetTableResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                    metadata: None,
+                };
+            }
+        };
+
+        let database_name = req.database_name.trim().to_ascii_lowercase();
+        let schema_name = req.schema_name.trim().to_ascii_lowercase();
+        let table_name = req.table_name.trim().to_ascii_lowercase();
+        if database_name.is_empty() || schema_name.is_empty() || table_name.is_empty() {
+            return GetTableResponse {
+                success: false,
+                message: "table not found".to_string(),
+                metadata: None,
+            };
+        }
+
+        let qualified_schema = format!("{}.{}", database_name, schema_name);
+        let get_catalog_stmt = "SELECT id::text FROM catalogs WHERE name = $1 LIMIT 1";
+        let catalog_id = match client
+            .query_opt(get_catalog_stmt, &[&qualified_schema])
+            .await
+        {
+            Ok(Some(row)) => {
+                let id: String = row.get(0);
+                id
+            }
+            Ok(None) => {
+                return GetTableResponse {
+                    success: false,
+                    message: "table not found".to_string(),
+                    metadata: None,
+                };
+            }
+            Err(e) => {
+                return GetTableResponse {
+                    success: false,
+                    message: format!("Failed to resolve schema catalog: {}", e),
+                    metadata: None,
+                };
+            }
+        };
+
+        let stmt = "SELECT id::text, engine, location, schema::text FROM tables WHERE catalog_id::text = $1 AND name = $2 LIMIT 1";
+        match client.query_opt(stmt, &[&catalog_id, &table_name]).await {
+            Ok(Some(row)) => {
+                let table_id: String = row.get(0);
+                let engine: String = row.get(1);
+                let location: String = row.get(2);
+                let schema_raw: String = row.get(3);
+                let schema_json = serde_json::from_str::<serde_json::Value>(&schema_raw)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+
+                let mut columns = Vec::new();
+                if let Some(raw_columns) = schema_json
+                    .get("columns")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for col in raw_columns {
+                        let name = col
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let data_type = col
+                            .get("data_type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let nullable = col
+                            .get("nullable")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true);
+                        if !name.is_empty() {
+                            columns.push(
+                                crate::services::metastore_service::metastore_service::ColumnSchema {
+                                    name,
+                                    data_type,
+                                    nullable,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                GetTableResponse {
+                    success: true,
+                    message: format!(
+                        "Table found: {}.{}.{}",
+                        database_name, schema_name, table_name
+                    ),
+                    metadata: Some(
+                        crate::services::metastore_service::metastore_service::TableMetadata {
+                            uuid: table_id,
+                            schema_name,
+                            table_name,
+                            table_type: engine,
+                            location,
+                            container: String::new(),
+                            columns,
+                            database_name,
+                        },
+                    ),
+                }
+            }
+            Ok(None) => GetTableResponse {
+                success: false,
+                message: "table not found".to_string(),
+                metadata: None,
+            },
+            Err(e) => GetTableResponse {
+                success: false,
+                message: format!("Failed to get table: {}", e),
+                metadata: None,
+            },
         }
     }
     async fn drop_schema(&self, _req: DropSchemaRequest) -> DropSchemaResponse {
@@ -161,17 +394,17 @@ impl MetastoreProvider for PostgresProvider {
         }
 
         let qualified_name = format!("{}.{}", database_name, schema_name);
-        let stmt = "SELECT id, name FROM catalogs WHERE name = $1 LIMIT 1";
+        let stmt = "SELECT id::text, name FROM catalogs WHERE name = $1 LIMIT 1";
         match client.query_opt(stmt, &[&qualified_name]).await {
             Ok(Some(row)) => {
-                let id: i64 = row.get(0);
+                let id: String = row.get(0);
                 let name: String = row.get(1);
                 GetSchemaResponse {
                     success: true,
                     message: format!("Schema '{}' found", name),
                     metadata: Some(
                         crate::services::metastore_service::metastore_service::SchemaMetadata {
-                            uuid: id.to_string(),
+                            uuid: id,
                             schema_name,
                             location: String::new(),
                             container: String::new(),
@@ -230,17 +463,17 @@ impl MetastoreProvider for PostgresProvider {
             }
         };
 
-        let stmt = "SELECT id, name FROM catalogs WHERE name = $1 LIMIT 1";
+        let stmt = "SELECT id::text, name FROM catalogs WHERE name = $1 LIMIT 1";
         match client.query_opt(stmt, &[&req.database_name]).await {
             Ok(Some(row)) => {
-                let id: i64 = row.get(0);
+                let id: String = row.get(0);
                 let name: String = row.get(1);
                 GetDatabaseResponse {
                     success: true,
                     message: format!("Database '{}' found", name),
                     metadata: Some(
                         crate::services::metastore_service::metastore_service::DatabaseMetadata {
-                            uuid: id.to_string(),
+                            uuid: id,
                             database_name: name,
                             location: String::new(),
                             container: String::new(),
