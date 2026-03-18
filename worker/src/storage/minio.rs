@@ -1,4 +1,5 @@
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_types::region::Region;
 use serde_json::Value;
@@ -53,6 +54,32 @@ pub struct MinioProvider {
 }
 
 impl MinioProvider {
+    /// What: Determine if an S3 SDK error indicates a missing object key.
+    ///
+    /// Inputs:
+    /// - `err`: S3 SDK error returned from `get_object`.
+    ///
+    /// Output:
+    /// - `true` when the error semantically means "object not found".
+    ///
+    /// Details:
+    /// - Prefers structured service error metadata code and falls back to textual checks.
+    fn is_missing_key_error(
+        err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+    ) -> bool {
+        if let Some(service_err) = err.as_service_error()
+            && let Some(code) = service_err.code()
+            && (code.eq_ignore_ascii_case("NoSuchKey")
+                || code.eq_ignore_ascii_case("NotFound")
+                || code.eq_ignore_ascii_case("NoSuchObject"))
+        {
+            return true;
+        }
+
+        let msg = err.to_string();
+        msg.contains("NoSuchKey") || msg.contains("NotFound") || msg.contains("404")
+    }
+
     pub async fn new(cfg: MinioConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Load shared config, override region and endpoint if provided
         let region = Region::new(cfg.region.clone());
@@ -166,11 +193,11 @@ impl MinioProvider {
                 Ok(Some(data.into_bytes().to_vec()))
             }
             Err(e) => {
-                // return Ok(None) if not found, otherwise propagate
-                let msg = format!("{}", e);
-                if msg.contains("NotFound") || msg.contains("NoSuchKey") {
+                // Return Ok(None) for missing keys and propagate other service failures.
+                if Self::is_missing_key_error(&e) {
                     Ok(None)
                 } else {
+                    log::warn!("S3 get_object failed for {}/{}: {:?}", self.bucket, key, e);
                     Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                 }
             }
