@@ -1,4 +1,5 @@
 use crate::state::SharedData;
+use base64::Engine;
 
 use serde_json::Value;
 
@@ -9,6 +10,24 @@ pub mod worker_service {
 #[derive(Default)]
 pub struct WorkerService {
     pub shared_data: SharedData,
+}
+
+fn resolve_flight_port(default_worker_port: u32) -> u32 {
+    std::env::var("WORKER_FLIGHT_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(default_worker_port.saturating_add(1))
+}
+
+fn resolve_flight_endpoint(worker_host: &str, worker_port: u32) -> String {
+    let flight_port = resolve_flight_port(worker_port);
+    format!("https://{}:{}", worker_host, flight_port)
+}
+
+fn build_flight_ticket(session_id: &str, task_id: &str, worker_id: &str) -> String {
+    let raw = format!("{}:{}:{}", session_id, task_id, worker_id);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
 }
 
 #[tonic::async_trait]
@@ -162,11 +181,28 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         request: tonic::Request<worker_service::FlightInfoRequest>,
     ) -> Result<tonic::Response<worker_service::FlightInfoResponse>, tonic::Status> {
         let req = request.into_inner();
-        // TODO: Arrow Flight info logic
+        if req.task_id.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument("task_id is required"));
+        }
+        if req.session_id.trim().is_empty() {
+            return Err(tonic::Status::invalid_argument("session_id is required"));
+        }
+
+        let endpoint = resolve_flight_endpoint(
+            &self.shared_data.worker_info.host,
+            self.shared_data.worker_info.port,
+        );
+        let ticket = build_flight_ticket(
+            &req.session_id,
+            &req.task_id,
+            &self.shared_data.worker_info.worker_id,
+        );
+
         let resp = worker_service::FlightInfoResponse {
-            endpoint: "arrow-flight-endpoint".to_string(),
-            schema: "arrow-schema".to_string(),
-            ticket: req.task_id.clone(),
+            endpoint,
+            // Schema negotiation will be filled when DoGet is implemented.
+            schema: "{}".to_string(),
+            ticket,
         };
         Ok(tonic::Response::new(resp))
     }

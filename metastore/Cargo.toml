@@ -18,8 +18,8 @@ prost-types = "0.13.5"
 kionas = { path = "../kionas" }
 base64 = "0.22"
 toml = "0.8"
-arrow = "57.2.0"
-parquet = "57.2.0"
+arrow.workspace = true
+parquet.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 async-trait.workspace = true

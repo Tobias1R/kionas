@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 tokio.workspace = true
 tonic.workspace = true
+tonic14 = { package = "tonic", version = "0.14.5", features = ["transport"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,8 +23,9 @@ kionas = { path = "../kionas" }
 base64 = "0.22"
 toml = "0.8"
 deadpool = "0.12.1"
-arrow = "57.2.0"
-parquet = "57.2.0"
+arrow.workspace = true
+parquet.workspace = true
+arrow-flight.workspace = true
 uuid = "1.22.0"
 chrono.workspace = true
 bytes = "1"
