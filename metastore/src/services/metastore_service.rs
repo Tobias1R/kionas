@@ -45,6 +45,13 @@ impl metastore_service::metastore_service_server::MetastoreService for Metastore
             Some(metastore_service::metastore_request::Action::GetSchema(get)) => {
                 response.result = Some(actions::get_schema::handle(&self.provider, get).await);
             }
+            Some(metastore_service::metastore_request::Action::CreateDatabase(create)) => {
+                response.result =
+                    Some(actions::create_database::handle(&self.provider, create).await);
+            }
+            Some(metastore_service::metastore_request::Action::GetDatabase(get)) => {
+                response.result = Some(actions::get_database::handle(&self.provider, get).await);
+            }
 
             // Transaction actions
             Some(metastore_service::metastore_request::Action::CreateTransaction(create)) => {

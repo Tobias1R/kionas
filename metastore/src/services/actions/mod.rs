@@ -1,8 +1,10 @@
+pub(crate) mod create_database;
 pub(crate) mod create_schema;
 pub(crate) mod create_table;
 pub(crate) mod create_transaction;
 pub(crate) mod drop_schema;
 pub(crate) mod drop_table;
+pub(crate) mod get_database;
 pub(crate) mod get_schema;
 pub(crate) mod get_table;
 pub(crate) mod get_table_statistics;

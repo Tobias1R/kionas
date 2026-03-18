@@ -1,3 +1,4 @@
+pub(crate) mod create_database;
 pub(crate) mod helpers;
 pub mod use_warehouse;
 
@@ -290,82 +291,55 @@ pub async fn handle_statement(
 
         Statement::CreateDatabase {
             db_name,
-            if_not_exists: _,
-            location: _,
-            managed_location: _,
-            or_replace: _,
-            transient: _,
-            clone: _,
-            data_retention_time_in_days: _,
-            max_data_extension_time_in_days: _,
-            external_volume: _,
-            catalog: _,
-            replace_invalid_characters: _,
-            default_ddl_collation: _,
-            storage_serialization_policy: _,
-            comment: _,
-            catalog_sync: _,
-            catalog_sync_namespace_mode: _,
-            catalog_sync_namespace_flatten_delimiter: _,
-            with_tags: _,
-            with_contacts: _,
+            if_not_exists,
+            location,
+            managed_location,
+            or_replace,
+            transient,
+            clone,
+            data_retention_time_in_days,
+            max_data_extension_time_in_days,
+            external_volume,
+            catalog,
+            replace_invalid_characters,
+            default_ddl_collation,
+            storage_serialization_policy,
+            comment,
+            catalog_sync,
+            catalog_sync_namespace_mode,
+            catalog_sync_namespace_flatten_delimiter,
+            with_tags,
+            with_contacts,
             ..
         } => {
-            // Build domain object from AST and validate
-            let owner = {
-                let state = shared_data.lock().await;
-                match state
-                    .session_manager
-                    .get_session(session_id.to_string())
-                    .await
-                {
-                    Some(s) => s.get_role(),
-                    None => "unknown".to_string(),
-                }
-            };
-            match DomainService::from_create_database(db_name, &owner) {
-                Ok(_db) => match helpers::resolve_session_and_key(shared_data, session_id).await {
-                    Ok((_session, key)) => {
-                        let participant = Participant {
-                            id: key.clone(),
-                            target: key.clone(),
-                            staging_prefix: format!("database-{}", db_name.to_string()),
-                            tasks: Vec::new(),
-                        };
-                        let maestro = Maestro::new(shared_data.clone());
-                        match maestro.execute_transaction(vec![participant], 3, 180).await {
-                            Ok(tx) => {
-                                let mreq = ms::MetastoreRequest {
-                                    action: Some(ms::metastore_request::Action::CreateSchema(
-                                        ms::CreateSchemaRequest {
-                                            schema_name: db_name.to_string(),
-                                        },
-                                    )),
-                                };
-                                match MetastoreClient::connect_with_shared(shared_data).await {
-                                    Ok(mut client) => match client.execute(mreq).await {
-                                        Ok(_) => format!(
-                                            "Database created successfully (tx={}): {}",
-                                            tx, db_name
-                                        ),
-                                        Err(e) => format!(
-                                            "Database committed but failed to persist in metastore: {}",
-                                            e
-                                        ),
-                                    },
-                                    Err(e) => format!(
-                                        "Database committed but failed to connect to metastore: {}",
-                                        e
-                                    ),
-                                }
-                            }
-                            Err(e) => format!("Failed to create database transactionally: {}", e),
-                        }
-                    }
-                    Err(e) => format!("Failed to resolve worker for database create: {}", e),
+            create_database::handle_create_database(
+                shared_data,
+                session_id,
+                create_database::CreateDatabaseAst {
+                    db_name,
+                    if_not_exists: *if_not_exists,
+                    location: location.as_ref(),
+                    managed_location: managed_location.as_ref(),
+                    or_replace: *or_replace,
+                    transient: *transient,
+                    clone: clone.as_ref(),
+                    data_retention_time_in_days: *data_retention_time_in_days,
+                    max_data_extension_time_in_days: *max_data_extension_time_in_days,
+                    external_volume: external_volume.as_ref(),
+                    catalog: catalog.as_ref(),
+                    replace_invalid_characters: *replace_invalid_characters,
+                    default_ddl_collation: default_ddl_collation.as_ref(),
+                    storage_serialization_policy: storage_serialization_policy.as_ref(),
+                    comment: comment.as_ref(),
+                    catalog_sync: catalog_sync.as_ref(),
+                    catalog_sync_namespace_mode: catalog_sync_namespace_mode.as_ref(),
+                    catalog_sync_namespace_flatten_delimiter:
+                        catalog_sync_namespace_flatten_delimiter.as_ref(),
+                    with_tags: with_tags.as_ref(),
+                    with_contacts: with_contacts.as_ref(),
                 },
-                Err(e) => format!("Domain validation failed: {}", e),
-            }
+            )
+            .await
         }
         // Add more statement handlers here
         _ => "Unsupported statement".to_string(),

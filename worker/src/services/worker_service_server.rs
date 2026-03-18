@@ -45,7 +45,8 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         let req = request.into_inner();
         log::info!("Received task: {}", req.session_id);
 
-        let resp = crate::transactions::maestro::handle_execute_task(self.shared_data.clone(), req);
+        let resp =
+            crate::transactions::maestro::handle_execute_task(self.shared_data.clone(), req).await;
         Ok(tonic::Response::new(resp))
     }
 

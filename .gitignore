@@ -28,3 +28,5 @@ cargotree.log
 
 memories
 memories/*
+
+grpc.reflection.v1alpha
