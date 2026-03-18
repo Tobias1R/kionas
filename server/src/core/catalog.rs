@@ -53,6 +53,8 @@ impl KionasCatalog {
                     action: Some(ms::metastore_request::Action::CreateSchema(
                         ms::CreateSchemaRequest {
                             schema_name: self.name,
+                            database_name: String::new(),
+                            ast_payload_json: String::new(),
                         },
                     )),
                 };

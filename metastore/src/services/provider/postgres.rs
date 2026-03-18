@@ -85,18 +85,32 @@ impl MetastoreProvider for PostgresProvider {
                 };
             }
         };
-        let stmt = "INSERT INTO catalogs (name, owner) VALUES ($1, $2) RETURNING id";
+        let database_name = req.database_name.trim().to_ascii_lowercase();
+        let schema_name = req.schema_name.trim().to_ascii_lowercase();
+        if database_name.is_empty() || schema_name.is_empty() {
+            return CreateSchemaResponse {
+                success: false,
+                message: "database_name and schema_name are required".to_string(),
+            };
+        }
+
+        let qualified_name = format!("{}.{}", database_name, schema_name);
+        let stmt =
+            "INSERT INTO catalogs (name, owner, description) VALUES ($1, $2, $3) RETURNING id";
         let owner = "kionas";
-        // print
         log::debug!(
-            "Creating schema '{}' with owner '{}'",
-            req.schema_name,
+            "Creating schema '{}.{}' with owner '{}'",
+            database_name,
+            schema_name,
             owner
         );
-        match client.query_one(stmt, &[&req.schema_name, &owner]).await {
+        match client
+            .query_one(stmt, &[&qualified_name, &owner, &req.ast_payload_json])
+            .await
+        {
             Ok(_row) => CreateSchemaResponse {
                 success: true,
-                message: format!("Schema '{}' created", req.schema_name),
+                message: format!("Schema '{}.{}' created", database_name, schema_name),
             },
             Err(e) => CreateSchemaResponse {
                 success: false,
@@ -124,11 +138,58 @@ impl MetastoreProvider for PostgresProvider {
             message: "Schema dropped".to_string(),
         }
     }
-    async fn get_schema(&self, _req: GetSchemaRequest) -> GetSchemaResponse {
-        GetSchemaResponse {
-            success: true,
-            message: "Schema fetched".to_string(),
-            metadata: None,
+    async fn get_schema(&self, req: GetSchemaRequest) -> GetSchemaResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return GetSchemaResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                    metadata: None,
+                };
+            }
+        };
+
+        let database_name = req.database_name.trim().to_ascii_lowercase();
+        let schema_name = req.schema_name.trim().to_ascii_lowercase();
+        if database_name.is_empty() || schema_name.is_empty() {
+            return GetSchemaResponse {
+                success: false,
+                message: "schema not found".to_string(),
+                metadata: None,
+            };
+        }
+
+        let qualified_name = format!("{}.{}", database_name, schema_name);
+        let stmt = "SELECT id, name FROM catalogs WHERE name = $1 LIMIT 1";
+        match client.query_opt(stmt, &[&qualified_name]).await {
+            Ok(Some(row)) => {
+                let id: i64 = row.get(0);
+                let name: String = row.get(1);
+                GetSchemaResponse {
+                    success: true,
+                    message: format!("Schema '{}' found", name),
+                    metadata: Some(
+                        crate::services::metastore_service::metastore_service::SchemaMetadata {
+                            uuid: id.to_string(),
+                            schema_name,
+                            location: String::new(),
+                            container: String::new(),
+                            database_name,
+                        },
+                    ),
+                }
+            }
+            Ok(None) => GetSchemaResponse {
+                success: false,
+                message: "schema not found".to_string(),
+                metadata: None,
+            },
+            Err(e) => GetSchemaResponse {
+                success: false,
+                message: format!("Failed to get schema: {}", e),
+                metadata: None,
+            },
         }
     }
 

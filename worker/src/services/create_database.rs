@@ -112,10 +112,11 @@ pub(crate) async fn execute_create_database_task(
             }
             Ok(None) => {}
             Err(e) => {
-                return Err(format!(
-                    "failed to check existing database marker '{}': {}",
-                    marker_key, e
-                ));
+                log::warn!(
+                    "create_database marker pre-check failed for '{}': {}; proceeding with create",
+                    marker_key,
+                    e
+                );
             }
         }
 

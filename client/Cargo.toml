@@ -26,6 +26,7 @@ jsonwebtoken = "8.1"
 arrow = "57.2.0"
 parquet = "57.2.0"
 uuid = "1.22.0"
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12.3"
