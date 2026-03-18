@@ -1,15 +1,17 @@
 pub(crate) mod create_database;
+pub(crate) mod create_schema;
 pub(crate) mod helpers;
 pub mod use_warehouse;
 
-use crate::core::DomainService;
 use crate::services::metastore_client::MetastoreClient;
 use crate::services::metastore_client::metastore_service as ms;
-use crate::transactions::Maestro;
-use crate::transactions::Participant;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
 use std::collections::HashMap;
+
+use crate::core::domain_service::DomainService;
+use crate::transactions::Participant;
+use crate::transactions::Maestro;
 
 fn canonicalize_insert_table_name(raw_table_name: &str, default_schema: &str) -> String {
     let cleaned = raw_table_name.trim().trim_matches('"').trim_matches('`');
@@ -148,66 +150,27 @@ pub async fn handle_statement(
                 Err(e) => format!("Failed to dispatch insert: {}", e),
             }
         }
-        Statement::CreateSchema { schema_name, .. } => {
-            // Build domain object from AST and validate
-            let owner = {
-                let state = shared_data.lock().await;
-                match state
-                    .session_manager
-                    .get_session(session_id.to_string())
-                    .await
-                {
-                    Some(s) => s.get_role(),
-                    None => "unknown".to_string(),
-                }
-            };
-            match DomainService::from_create_schema(schema_name, &owner) {
-                Ok(_catalog) => {
-                    // Transactional create: coordinate with Maestro
-                    match helpers::resolve_session_and_key(shared_data, session_id).await {
-                        Ok((_session, key)) => {
-                            let participant = Participant {
-                                id: key.clone(),
-                                target: key.clone(),
-                                staging_prefix: format!("schema-{}", schema_name.to_string()),
-                                tasks: Vec::new(),
-                            };
-                            let maestro = Maestro::new(shared_data.clone());
-                            match maestro.execute_transaction(vec![participant], 3, 120).await {
-                                Ok(tx) => {
-                                    // Persist schema metadata
-                                    let mreq = ms::MetastoreRequest {
-                                        action: Some(ms::metastore_request::Action::CreateSchema(
-                                            ms::CreateSchemaRequest {
-                                                schema_name: schema_name.to_string(),
-                                            },
-                                        )),
-                                    };
-                                    match MetastoreClient::connect_with_shared(shared_data).await {
-                                        Ok(mut client) => match client.execute(mreq).await {
-                                            Ok(_) => format!(
-                                                "Schema created successfully (tx={}): {}",
-                                                tx, schema_name
-                                            ),
-                                            Err(e) => format!(
-                                                "Schema created but failed to persist in metastore: {}",
-                                                e
-                                            ),
-                                        },
-                                        Err(e) => format!(
-                                            "Schema created but failed to connect to metastore: {}",
-                                            e
-                                        ),
-                                    }
-                                }
-                                Err(e) => format!("Failed to create schema transactionally: {}", e),
-                            }
-                        }
-                        Err(e) => format!("Failed to resolve worker for schema create: {}", e),
-                    }
-                }
-                Err(e) => format!("Domain validation failed: {}", e),
-            }
+        Statement::CreateSchema {
+            schema_name,
+            if_not_exists,
+            with,
+            options,
+            default_collate_spec,
+            clone,
+        } => {
+            create_schema::handle_create_schema(
+                shared_data,
+                session_id,
+                create_schema::CreateSchemaAst {
+                    schema_name,
+                    if_not_exists: *if_not_exists,
+                    with: with.as_ref(),
+                    options: options.as_ref(),
+                    default_collate_spec: default_collate_spec.as_ref(),
+                    clone: clone.as_ref(),
+                },
+            )
+            .await
         }
         Statement::CreateTable(create_table) => {
             // `CreateTable` is a tuple variant carrying a `CreateTable` struct; extract its `name`.

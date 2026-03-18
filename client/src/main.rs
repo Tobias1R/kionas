@@ -36,6 +36,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ca_cert = fs::read_to_string("/workspace/certs/Kionas-RootCA/Kionas-RootCA.crt")?;
     let ca_certificate = Certificate::from_pem(ca_cert);
 
+    // generate a random database name for testing
+    let random_db_name = format!("testdb_{}", 1 // rand::random::<u16>()
+);
+    // generate a random schema name for testing
+    let random_schema_name = format!("testschema_{}", 1 // rand::random::<u16>()
+);
+    // random table name
+    let random_table_name = format!("testtable_{}", 1 //rand::random::<u16>()
+    );
+
     // Configure TLS settings with the CA certificate
     let tls_config = ClientTlsConfig::new().ca_certificate(ca_certificate);
 
@@ -103,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server response: {:?}", response);
 
     // create database
-    let querydb = "create database deltalake;";
+    let querydb = format!("create database {};", random_db_name);
 
     let reqdb = warehouse_service::QueryRequest {
         query: querydb.to_string(),
@@ -121,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
     println!("Server response: {:?}", response);
 
-    let query = "create schema deltalake.my_schema;";
+    let query = format!("create schema {}.{};", random_db_name, random_schema_name);
 
     let _schema_name = query
         .strip_prefix("create schema ")
@@ -145,7 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server response: {:?}", response);
 
     // create table
-    let query = "create table deltalake.my_schema.test_table (id int, name string);";
+    let query = format!(
+        "create table {}.{}.{} (id int, name string);",
+        random_db_name, random_schema_name, random_table_name
+    );
 
     let _table_name = query
         .strip_prefix("create table ")
@@ -169,7 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server response: {:?}", response);
 
     // the so long waited: INSERT command
-    let query_insert = "insert into deltalake.my_schema.test_table values (1, 'Alice');";
+    let query_insert = format!(
+        "insert into {}.{}.{} values (1, 'Alice');",
+        random_db_name, random_schema_name, random_table_name
+    );
     let req_insert = warehouse_service::QueryRequest {
         query: query_insert.to_string(),
     };

@@ -92,6 +92,8 @@ message GetTableResponse {
 // Schema/Catalogue related messages
 message CreateSchemaRequest {
   string schema_name = 1;
+  string database_name = 2;
+  string ast_payload_json = 3;
 }
 
 message DropSchemaRequest {
@@ -100,6 +102,7 @@ message DropSchemaRequest {
 
 message GetSchemaRequest {
   string schema_name = 1;
+  string database_name = 2;
 }
 
 message CreateSchemaResponse {
@@ -169,6 +172,7 @@ message SchemaMetadata {
   string schema_name = 2;
   string location = 3;
   string container = 4;
+  string database_name = 5;
 }
 
 // Transaction messages
