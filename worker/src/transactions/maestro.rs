@@ -530,7 +530,7 @@ pub async fn abort_tx(shared: SharedData, tx_id: &str, staging_prefix: &str) -> 
     }
 }
 
-pub fn handle_execute_task(
+pub async fn handle_execute_task(
     shared: SharedData,
     req: crate::services::worker_service_server::worker_service::TaskRequest,
 ) -> crate::services::worker_service_server::worker_service::TaskResponse {
@@ -547,6 +547,37 @@ pub fn handle_execute_task(
         .as_ref()
         .map(|t| t.task_id.clone())
         .unwrap_or_default();
+
+    if operation == "create_database" {
+        let task = match first_task.as_ref() {
+            Some(t) => t,
+            None => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: "create_database task payload is missing".to_string(),
+                    result_location: String::new(),
+                };
+            }
+        };
+
+        match crate::services::create_database::execute_create_database_task(&shared, task).await {
+            Ok(location) => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "ok".to_string(),
+                    error: String::new(),
+                    result_location: location,
+                };
+            }
+            Err(e) => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: e,
+                    result_location: String::new(),
+                };
+            }
+        }
+    }
+
     let explicit_delta_table_uri = first_task.as_ref().and_then(|task| {
         task.params
             .get("table_uri")

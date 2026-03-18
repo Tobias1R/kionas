@@ -6,10 +6,10 @@ target
 certs
 certs/*
 
-configs/*
+
 logs/*
-configs
 logs
+*.log
 
 
 data
@@ -28,3 +28,5 @@ cargotree.log
 
 memories
 memories/*
+
+grpc.reflection.v1alpha

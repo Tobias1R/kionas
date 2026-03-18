@@ -15,6 +15,54 @@ use warehouse_service::{QueryRequest, QueryResponse, QueryStatusRequest, QuerySt
 
 use crate::services::request_context::RequestContext;
 
+/// What: Map statement handler output into the public QueryResponse contract.
+///
+/// Inputs:
+/// - `result`: Raw handler output string.
+/// - `resp`: Mutable query response to update.
+///
+/// Output:
+/// - Updates `resp.message`, `resp.status`, and `resp.error_code` in-place.
+///
+/// Details:
+/// - Structured outputs use `RESULT|<category>|<code>|<message>`.
+/// - Legacy plain-text outputs still map to generic infra failures when applicable.
+fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
+    let mut parts = result.splitn(4, '|');
+    let prefix = parts.next().unwrap_or_default();
+    if prefix != "RESULT" {
+        if result.starts_with("Failed")
+            || result.starts_with("Domain validation failed")
+            || result.starts_with("Unsupported")
+        {
+            resp.status = "ERROR".to_string();
+            resp.error_code = "INFRA_GENERIC".to_string();
+        }
+        resp.message = result.to_string();
+        return;
+    }
+
+    let category = parts.next().unwrap_or("INFRA");
+    let code = parts.next().unwrap_or("UNKNOWN");
+    let message = parts.next().unwrap_or("unknown error");
+
+    resp.message = message.to_string();
+    match category {
+        "SUCCESS" => {
+            resp.status = "OK".to_string();
+            resp.error_code = "0".to_string();
+        }
+        "VALIDATION" => {
+            resp.status = "ERROR".to_string();
+            resp.error_code = format!("BUSINESS_{}", code);
+        }
+        _ => {
+            resp.status = "ERROR".to_string();
+            resp.error_code = format!("INFRA_{}", code);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WarehouseService {
     pub shared_data: SharedData,
@@ -108,15 +156,7 @@ impl WarehouseServiceTrait for WarehouseService {
                     // Execute handler synchronously (existing logic performs dispatch to worker)
                     let result = handle_statement(stmt, &session_id, &shared_data).await;
                     println!("Execution result: {}", result);
-                    resp.message = result.clone();
-
-                    if result.starts_with("Failed")
-                        || result.starts_with("Domain validation failed")
-                        || result.starts_with("Unsupported")
-                    {
-                        resp.status = "ERROR".to_string();
-                        resp.error_code = "1".to_string();
-                    }
+                    apply_statement_outcome(&result, &mut resp);
 
                     // statement_handler now performs any metastore actions after dispatch.
                 }

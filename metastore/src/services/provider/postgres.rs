@@ -1,6 +1,7 @@
 use crate::services::metastore_service::metastore_service::{
-    CreateSchemaRequest, CreateSchemaResponse, CreateTableRequest, CreateTableResponse,
-    DropSchemaRequest, DropSchemaResponse, DropTableRequest, DropTableResponse, GetSchemaRequest,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateSchemaRequest, CreateSchemaResponse,
+    CreateTableRequest, CreateTableResponse, DropSchemaRequest, DropSchemaResponse,
+    DropTableRequest, DropTableResponse, GetDatabaseRequest, GetDatabaseResponse, GetSchemaRequest,
     GetSchemaResponse, GetTableRequest, GetTableResponse, GetTableStatisticsRequest,
     GetTableStatisticsResponse, UpdateTableStatisticsRequest, UpdateTableStatisticsResponse,
 };
@@ -24,6 +25,8 @@ pub trait MetastoreProvider: Send + Sync {
     async fn create_schema(&self, req: CreateSchemaRequest) -> CreateSchemaResponse;
     async fn drop_schema(&self, req: DropSchemaRequest) -> DropSchemaResponse;
     async fn get_schema(&self, req: GetSchemaRequest) -> GetSchemaResponse;
+    async fn create_database(&self, req: CreateDatabaseRequest) -> CreateDatabaseResponse;
+    async fn get_database(&self, req: GetDatabaseRequest) -> GetDatabaseResponse;
     async fn update_table_statistics(
         &self,
         req: UpdateTableStatisticsRequest,
@@ -128,6 +131,75 @@ impl MetastoreProvider for PostgresProvider {
             metadata: None,
         }
     }
+
+    async fn create_database(&self, req: CreateDatabaseRequest) -> CreateDatabaseResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return CreateDatabaseResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let stmt = "INSERT INTO catalogs (name, owner) VALUES ($1, $2) RETURNING id";
+        let owner = "kionas";
+        match client.query_one(stmt, &[&req.database_name, &owner]).await {
+            Ok(_row) => CreateDatabaseResponse {
+                success: true,
+                message: format!("Database '{}' created", req.database_name),
+            },
+            Err(e) => CreateDatabaseResponse {
+                success: false,
+                message: format!("Failed to create database: {}", e),
+            },
+        }
+    }
+
+    async fn get_database(&self, req: GetDatabaseRequest) -> GetDatabaseResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return GetDatabaseResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                    metadata: None,
+                };
+            }
+        };
+
+        let stmt = "SELECT id, name FROM catalogs WHERE name = $1 LIMIT 1";
+        match client.query_opt(stmt, &[&req.database_name]).await {
+            Ok(Some(row)) => {
+                let id: i64 = row.get(0);
+                let name: String = row.get(1);
+                GetDatabaseResponse {
+                    success: true,
+                    message: format!("Database '{}' found", name),
+                    metadata: Some(
+                        crate::services::metastore_service::metastore_service::DatabaseMetadata {
+                            uuid: id.to_string(),
+                            database_name: name,
+                            location: String::new(),
+                            container: String::new(),
+                        },
+                    ),
+                }
+            }
+            Ok(None) => GetDatabaseResponse {
+                success: false,
+                message: "database not found".to_string(),
+                metadata: None,
+            },
+            Err(e) => GetDatabaseResponse {
+                success: false,
+                message: format!("Failed to get database: {}", e),
+                metadata: None,
+            },
+        }
+    }
+
     async fn update_table_statistics(
         &self,
         _req: UpdateTableStatisticsRequest,
