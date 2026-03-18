@@ -6,10 +6,10 @@ target
 certs
 certs/*
 
-configs/*
+
 logs/*
-configs
 logs
+*.log
 
 
 data
