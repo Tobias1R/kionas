@@ -14,14 +14,14 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /workspace
 
 # Copy only Cargo.toml files first for caching
-COPY ../kionas-lib/Cargo.toml ./kionas-lib/Cargo.toml
+COPY ../kionas/Cargo.toml ./kionas/Cargo.toml
 COPY ../server/Cargo.toml ./server/Cargo.toml
 COPY ../worker/Cargo.toml ./worker/Cargo.toml
 COPY ../client/Cargo.toml ./client/Cargo.toml
 COPY ../Cargo.toml ./Cargo.toml
 
 # Create source directories for build context
-RUN mkdir -p kionas-lib/src server/src worker/src client/src
+RUN mkdir -p kionas/src server/src worker/src client/src
 
 # Pre-build dependencies
 RUN cargo fetch

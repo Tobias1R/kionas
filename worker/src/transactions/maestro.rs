@@ -1,5 +1,9 @@
 use crate::state::SharedData;
+use arrow::array::{StringArray, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Ensure or lazily initialize the interops pool and return a cloned Arc to it.
 async fn ensure_pool(
@@ -168,26 +172,97 @@ pub fn handle_execute_task(
     shared: SharedData,
     req: crate::services::worker_service_server::worker_service::TaskRequest,
 ) -> crate::services::worker_service_server::worker_service::TaskResponse {
-    let task_id = req
-        .tasks
-        .get(0)
+    let first_task = req.tasks.first().cloned();
+    let task_id = first_task
+        .as_ref()
         .map(|t| t.task_id.clone())
-        .unwrap_or_else(|| "".to_string());
-    let result_location = "arrow-flight-endpoint".to_string();
+        .unwrap_or_default();
+    let delta_table_uri = first_task.as_ref().and_then(|task| {
+        task.params
+            .get("table_uri")
+            .filter(|uri| !uri.trim().is_empty())
+            .cloned()
+            .or_else(|| {
+                if task.output.trim().is_empty() {
+                    None
+                } else {
+                    Some(task.output.clone())
+                }
+            })
+    });
+    let result_location = delta_table_uri
+        .clone()
+        .unwrap_or_else(|| "arrow-flight-endpoint".to_string());
     let result_location_for_spawn = result_location.clone();
+    let session_id = req.session_id.clone();
     let shared_clone = shared.clone();
     tokio::spawn(async move {
-        // simulate work
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let mut status = "succeeded".to_string();
+        let mut error_message = String::new();
+
+        // Exercise Delta write path when a table URI is provided by task params/output.
+        if let Some(table_uri) = delta_table_uri {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("session_id", DataType::Utf8, false),
+                Field::new("task_id", DataType::Utf8, false),
+                Field::new("result_location", DataType::Utf8, false),
+                Field::new(
+                    "committed_at_ms",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    false,
+                ),
+            ]));
+
+            let committed_at = chrono::Utc::now().timestamp_millis();
+            let batch_res = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec![session_id.clone()])),
+                    Arc::new(StringArray::from(vec![task_id.clone()])),
+                    Arc::new(StringArray::from(vec![result_location_for_spawn.clone()])),
+                    Arc::new(TimestampMillisecondArray::from(vec![committed_at])),
+                ],
+            );
+
+            match batch_res {
+                Ok(batch) => {
+                    if let Err(e) = crate::storage::deltalake::write_parquet_and_commit(
+                        shared_clone.clone(),
+                        &table_uri,
+                        vec![batch],
+                    )
+                    .await
+                    {
+                        status = "failed".to_string();
+                        error_message = format!("delta write/commit failed: {}", e);
+                        log::error!(
+                            "Failed delta write for task {} table {}: {}",
+                            task_id,
+                            table_uri,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    status = "failed".to_string();
+                    error_message = format!("failed to build record batch: {}", e);
+                    log::error!("Failed to build Arrow record batch for task {}: {}", task_id, e);
+                }
+            }
+        } else {
+            // Keep previous behavior when no Delta destination was provided.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
         // ensure pool and send update
         if let Some(pool_arc) = ensure_pool(shared_clone.clone()).await {
             match pool_arc.get().await {
                 Ok(mut pooled_client) => {
                     let update = crate::interops_service::TaskUpdateRequest {
                         task_id: task_id.clone(),
-                        status: "succeeded".to_string(),
+                        status,
                         result_location: result_location_for_spawn.clone(),
-                        error: String::new(),
+                        error: error_message,
                     };
                     if let Err(e) = pooled_client.task_update(tonic::Request::new(update)).await {
                         log::error!(

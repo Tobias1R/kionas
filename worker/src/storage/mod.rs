@@ -7,6 +7,9 @@ use std::sync::Arc;
 pub mod minio;
 
 pub mod staging;
+pub mod object_store_adapter;
+pub mod object_store_pool;
+pub mod deltalake;
 
 #[async_trait]
 pub trait StorageProvider: Send + Sync {

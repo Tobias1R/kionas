@@ -4,6 +4,7 @@
 - Always check cyclomatic complexity < 25
 - Always check data flow complexity < 25
 - Always add rust docs to classes/methods/functions (What, Inputs, Output, Details)
+- Always ask for input on dualities. Never assume!
 
 ## When Fixing Bugs/Issues
 - Check deeply what the issue is

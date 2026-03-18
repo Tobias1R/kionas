@@ -25,3 +25,6 @@ worker_storage/*
 
 cargotree.log
 *.log
+
+memories
+memories/*

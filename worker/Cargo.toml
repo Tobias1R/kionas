@@ -26,6 +26,8 @@ arrow = "57.2.0"
 parquet = "57.2.0"
 uuid = "1.22.0"
 chrono.workspace = true
+bytes = "1"
+futures = "0.3"
 aws-config = { version = "1.8.15", default-features = false, features = ["rustls", "rt-tokio"], optional = true }
 aws-sdk-s3 = { version = "1.8.15", default-features = false, features = ["rustls", "rt-tokio"], optional = true }
 aws-smithy-http = "0.60"
@@ -34,6 +36,12 @@ async-trait.workspace = true
 http = "0.2"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 # use the workspace rustls to control provider features
+
+# Delta Lake and object-store integration
+deltalake = "0.31.1"
+object_store = { version = "0.13.1", features = ["aws"] }
+url = "2"
+
 
 [build-dependencies]
 tonic-build = "0.12.3"
