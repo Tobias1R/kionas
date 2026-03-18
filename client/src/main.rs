@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // generate a random database name for testing
     let random_db_name = format!(
         "testdb_{}",
-        5 // rand::random::<u16>()
+        6 // rand::random::<u16>()
     );
     // generate a random schema name for testing
     let random_schema_name = format!(
@@ -189,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // the so long waited: INSERT command
     let query_insert = format!(
-        "insert into {}.{}.{} values (1, 'Alice');",
+        "insert into {}.{}.{} values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'David');",
         random_db_name, random_schema_name, random_table_name
     );
     let req_insert = warehouse_service::QueryRequest {
