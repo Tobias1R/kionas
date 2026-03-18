@@ -1,9 +1,327 @@
 use crate::state::SharedData;
-use arrow::array::{StringArray, TimestampMillisecondArray};
+use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use serde_json::Value;
+use kionas::parser::datafusion_sql::sqlparser::ast::{
+    ColumnOption, Expr, SetExpr, Statement, Value as SqlValue,
+};
+use kionas::parser::sql::parse_query;
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+enum InsertScalar {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Null,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedInsertPayload {
+    table_name: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<InsertScalar>>,
+}
+
+#[derive(Clone, Debug)]
+struct CreateTableColumn {
+    name: String,
+    data_type: String,
+    nullable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedCreateTablePayload {
+    table_name: String,
+    columns: Vec<CreateTableColumn>,
+}
+
+/// What: Build a Delta table URI from storage config and a SQL table name.
+///
+/// Inputs:
+/// - `storage`: Cluster storage JSON config
+/// - `table_name`: SQL table identifier
+///
+/// Output:
+/// - Optional `s3://` URI that points to the table root
+///
+/// Details:
+/// - Uses configured bucket and maps `schema.table` to `schema/table`.
+fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Option<String> {
+    let bucket = storage.get("bucket").and_then(|v| v.as_str())?.trim();
+    if bucket.is_empty() {
+        return None;
+    }
+    let clean_table = table_name
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .replace('.', "/");
+    if clean_table.is_empty() {
+        return None;
+    }
+    Some(format!("s3://{}/{}", bucket, clean_table))
+}
+
+/// What: Parse an INSERT SQL payload into table metadata and row values.
+///
+/// Inputs:
+/// - `sql`: Raw SQL payload from task input
+///
+/// Output:
+/// - Parsed table name, optional column list and VALUES rows
+///
+/// Details:
+/// - Supports INSERT statements where source is a VALUES clause.
+fn parse_insert_payload(sql: &str) -> Result<ParsedInsertPayload, String> {
+    let statements = parse_query(sql).map_err(|e| format!("insert parse error: {}", e))?;
+    let stmt = statements
+        .first()
+        .ok_or_else(|| "insert parse error: empty statement list".to_string())?;
+
+    let insert = match stmt {
+        Statement::Insert(insert_stmt) => insert_stmt,
+        _ => return Err("task payload is not an INSERT statement".to_string()),
+    };
+
+    let source = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| "INSERT source is missing".to_string())?;
+
+    let values = match source.body.as_ref() {
+        SetExpr::Values(values) => values,
+        _ => {
+            return Err(
+                "INSERT source is not VALUES; only VALUES inserts are supported in worker"
+                    .to_string(),
+            );
+        }
+    };
+
+    if values.rows.is_empty() {
+        return Err("INSERT VALUES has no rows".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let mut parsed_row = Vec::with_capacity(row.len());
+        for expr in row {
+            let scalar = match expr {
+                Expr::Value(vws) => match &vws.value {
+                    SqlValue::Number(n, _) => n
+                        .parse::<i64>()
+                        .map(InsertScalar::Int)
+                        .unwrap_or_else(|_| InsertScalar::Str(n.clone())),
+                    SqlValue::Boolean(b) => InsertScalar::Bool(*b),
+                    SqlValue::Null => InsertScalar::Null,
+                    other => InsertScalar::Str(other.to_string()),
+                },
+                other => InsertScalar::Str(other.to_string()),
+            };
+            parsed_row.push(scalar);
+        }
+        rows.push(parsed_row);
+    }
+
+    let column_count = rows.first().map(|r| r.len()).unwrap_or(0);
+    if column_count == 0 {
+        return Err("INSERT VALUES produced zero columns".to_string());
+    }
+    if rows.iter().any(|r| r.len() != column_count) {
+        return Err("INSERT VALUES row width mismatch".to_string());
+    }
+
+    let columns = if insert.columns.is_empty() {
+        (1..=column_count).map(|i| format!("c{}", i)).collect()
+    } else {
+        insert.columns.iter().map(ToString::to_string).collect()
+    };
+
+    Ok(ParsedInsertPayload {
+        table_name: insert.table.to_string(),
+        columns,
+        rows,
+    })
+}
+
+/// What: Parse a CREATE TABLE SQL payload into table name and columns.
+///
+/// Inputs:
+/// - `sql`: Raw SQL payload from task input
+///
+/// Output:
+/// - Parsed table name and column descriptors
+///
+/// Details:
+/// - Column nullability defaults to true unless `NOT NULL` is explicitly present.
+fn parse_create_table_payload(sql: &str) -> Result<ParsedCreateTablePayload, String> {
+    let statements = parse_query(sql).map_err(|e| format!("create parse error: {}", e))?;
+    let stmt = statements
+        .first()
+        .ok_or_else(|| "create parse error: empty statement list".to_string())?;
+
+    let create = match stmt {
+        Statement::CreateTable(create_stmt) => create_stmt,
+        _ => return Err("task payload is not a CREATE TABLE statement".to_string()),
+    };
+
+    if create.columns.is_empty() {
+        return Err("CREATE TABLE has no columns".to_string());
+    }
+
+    let columns = create
+        .columns
+        .iter()
+        .map(|col| {
+            let not_null = col
+                .options
+                .iter()
+                .any(|opt| matches!(opt.option, ColumnOption::NotNull));
+            CreateTableColumn {
+                name: col.name.to_string(),
+                data_type: col.data_type.to_string(),
+                nullable: !not_null,
+            }
+        })
+        .collect();
+
+    Ok(ParsedCreateTablePayload {
+        table_name: create.name.to_string(),
+        columns,
+    })
+}
+
+/// What: Build an Arrow schema from parsed CREATE TABLE columns.
+///
+/// Inputs:
+/// - `parsed`: Parsed create-table payload
+///
+/// Output:
+/// - Arrow schema compatible with Delta table initialization
+///
+/// Details:
+/// - Uses a conservative SQL-to-Arrow type mapping and falls back to Utf8.
+fn build_schema_from_create_table(parsed: &ParsedCreateTablePayload) -> Result<Schema, String> {
+    if parsed.columns.is_empty() {
+        return Err("create table payload has no columns".to_string());
+    }
+
+    let fields = parsed
+        .columns
+        .iter()
+        .map(|col| {
+            let dt = col.data_type.to_ascii_lowercase();
+            let arrow_type = if dt.contains("bigint") || dt == "int8" || dt == "long" {
+                DataType::Int64
+            } else if dt.contains("smallint") || dt == "int2" {
+                DataType::Int16
+            } else if dt.contains("int") || dt == "integer" || dt == "int4" {
+                DataType::Int32
+            } else if dt.contains("boolean") || dt == "bool" {
+                DataType::Boolean
+            } else if dt.contains("float") || dt.contains("real") {
+                DataType::Float32
+            } else if dt.contains("double") {
+                DataType::Float64
+            } else if dt.contains("timestamp") {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            } else if dt == "date" {
+                DataType::Date32
+            } else if dt.contains("binary") {
+                DataType::Binary
+            } else {
+                DataType::Utf8
+            };
+            Field::new(col.name.clone(), arrow_type, col.nullable)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Schema::new(fields))
+}
+
+/// What: Convert parsed INSERT values to an Arrow RecordBatch.
+///
+/// Inputs:
+/// - `parsed`: Parsed insert payload
+///
+/// Output:
+/// - One RecordBatch that can be written to Delta
+///
+/// Details:
+/// - Type inference is per-column: int, bool, otherwise utf8.
+fn build_record_batch_from_insert(parsed: &ParsedInsertPayload) -> Result<RecordBatch, String> {
+    let row_count = parsed.rows.len();
+    let col_count = parsed.columns.len();
+    if row_count == 0 || col_count == 0 {
+        return Err("insert payload has no rows or columns".to_string());
+    }
+
+    let mut fields = Vec::with_capacity(col_count);
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count);
+
+    for col_idx in 0..col_count {
+        let mut only_int = true;
+        let mut only_bool = true;
+
+        for row in &parsed.rows {
+            match &row[col_idx] {
+                InsertScalar::Int(_) | InsertScalar::Null => {}
+                _ => only_int = false,
+            }
+            match &row[col_idx] {
+                InsertScalar::Bool(_) | InsertScalar::Null => {}
+                _ => only_bool = false,
+            }
+        }
+
+        if only_int {
+            let mut values: Vec<Option<i64>> = Vec::with_capacity(row_count);
+            for row in &parsed.rows {
+                match &row[col_idx] {
+                    InsertScalar::Int(v) => values.push(Some(*v)),
+                    InsertScalar::Null => values.push(None),
+                    _ => values.push(None),
+                }
+            }
+            fields.push(Field::new(&parsed.columns[col_idx], DataType::Int64, true));
+            arrays.push(Arc::new(Int64Array::from(values)) as ArrayRef);
+        } else if only_bool {
+            let mut values: Vec<Option<bool>> = Vec::with_capacity(row_count);
+            for row in &parsed.rows {
+                match &row[col_idx] {
+                    InsertScalar::Bool(v) => values.push(Some(*v)),
+                    InsertScalar::Null => values.push(None),
+                    _ => values.push(None),
+                }
+            }
+            fields.push(Field::new(
+                &parsed.columns[col_idx],
+                DataType::Boolean,
+                true,
+            ));
+            arrays.push(Arc::new(BooleanArray::from(values)) as ArrayRef);
+        } else {
+            let mut values: Vec<Option<String>> = Vec::with_capacity(row_count);
+            for row in &parsed.rows {
+                match &row[col_idx] {
+                    InsertScalar::Str(v) => values.push(Some(v.clone())),
+                    InsertScalar::Int(v) => values.push(Some(v.to_string())),
+                    InsertScalar::Bool(v) => values.push(Some(v.to_string())),
+                    InsertScalar::Null => values.push(None),
+                }
+            }
+            let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+            fields.push(Field::new(&parsed.columns[col_idx], DataType::Utf8, true));
+            arrays.push(Arc::new(StringArray::from(refs)) as ArrayRef);
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays)
+        .map_err(|e| format!("failed to build insert record batch: {}", e))
+}
 
 /// Ensure or lazily initialize the interops pool and return a cloned Arc to it.
 async fn ensure_pool(
@@ -48,8 +366,52 @@ pub async fn prepare_tx(
     shared: SharedData,
     tx_id: &str,
     staging_prefix: &str,
-    tasks: &[Value],
+    tasks: &[JsonValue],
 ) -> Result<(), String> {
+    for task in tasks {
+        let operation = task
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if operation != "create_table" {
+            continue;
+        }
+
+        let input = task
+            .get("input")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let parsed = parse_create_table_payload(input)?;
+
+        let explicit_uri = task
+            .get("params")
+            .and_then(|v| v.get("table_uri"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        let table_uri = explicit_uri
+            .or_else(|| {
+                derive_table_uri_from_storage(&shared.cluster_info.storage, &parsed.table_name)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "failed to derive table uri for CREATE TABLE {}",
+                    parsed.table_name
+                )
+            })?;
+
+        let schema = build_schema_from_create_table(&parsed)?;
+        if let Err(e) =
+            crate::storage::deltalake::create_table(shared.clone(), &table_uri, &schema).await
+        {
+            return Err(format!(
+                "failed to initialize delta table {} at {}: {}",
+                parsed.table_name, table_uri, e
+            ));
+        }
+    }
+
     if let Some(provider) = shared.storage_provider.clone() {
         // stage_tx returns a Vec<String> of staged keys; ignore result and map errors
         match crate::storage::staging::stage_tx(provider, tx_id, staging_prefix, tasks).await {
@@ -173,11 +535,19 @@ pub fn handle_execute_task(
     req: crate::services::worker_service_server::worker_service::TaskRequest,
 ) -> crate::services::worker_service_server::worker_service::TaskResponse {
     let first_task = req.tasks.first().cloned();
+    let operation = first_task
+        .as_ref()
+        .map(|t| t.operation.to_lowercase())
+        .unwrap_or_default();
+    let task_input = first_task
+        .as_ref()
+        .map(|t| t.input.clone())
+        .unwrap_or_default();
     let task_id = first_task
         .as_ref()
         .map(|t| t.task_id.clone())
         .unwrap_or_default();
-    let delta_table_uri = first_task.as_ref().and_then(|task| {
+    let explicit_delta_table_uri = first_task.as_ref().and_then(|task| {
         task.params
             .get("table_uri")
             .filter(|uri| !uri.trim().is_empty())
@@ -190,6 +560,25 @@ pub fn handle_execute_task(
                 }
             })
     });
+    let parsed_insert = if operation == "insert" && !task_input.trim().is_empty() {
+        parse_insert_payload(&task_input).ok()
+    } else {
+        None
+    };
+    let table_name_override = first_task
+        .as_ref()
+        .and_then(|task| task.params.get("table_name").cloned())
+        .filter(|s| !s.trim().is_empty());
+    let derived_insert_uri = if explicit_delta_table_uri.is_none() {
+        let table_name =
+            table_name_override.or_else(|| parsed_insert.as_ref().map(|p| p.table_name.clone()));
+        table_name
+            .as_deref()
+            .and_then(|name| derive_table_uri_from_storage(&shared.cluster_info.storage, name))
+    } else {
+        None
+    };
+    let delta_table_uri = explicit_delta_table_uri.or(derived_insert_uri);
     let result_location = delta_table_uri
         .clone()
         .unwrap_or_else(|| "arrow-flight-endpoint".to_string());
@@ -200,29 +589,38 @@ pub fn handle_execute_task(
         let mut status = "succeeded".to_string();
         let mut error_message = String::new();
 
-        // Exercise Delta write path when a table URI is provided by task params/output.
+        // Exercise Delta write path when a table URI is provided or derived.
         if let Some(table_uri) = delta_table_uri {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("session_id", DataType::Utf8, false),
-                Field::new("task_id", DataType::Utf8, false),
-                Field::new("result_location", DataType::Utf8, false),
-                Field::new(
-                    "committed_at_ms",
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    false,
-                ),
-            ]));
+            let batch_res = if operation == "insert" {
+                if let Some(parsed) = parsed_insert.as_ref() {
+                    build_record_batch_from_insert(parsed)
+                } else {
+                    Err("failed to parse INSERT payload".to_string())
+                }
+            } else {
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("session_id", DataType::Utf8, false),
+                    Field::new("task_id", DataType::Utf8, false),
+                    Field::new("result_location", DataType::Utf8, false),
+                    Field::new(
+                        "committed_at_ms",
+                        DataType::Timestamp(TimeUnit::Millisecond, None),
+                        false,
+                    ),
+                ]));
 
-            let committed_at = chrono::Utc::now().timestamp_millis();
-            let batch_res = RecordBatch::try_new(
-                schema,
-                vec![
-                    Arc::new(StringArray::from(vec![session_id.clone()])),
-                    Arc::new(StringArray::from(vec![task_id.clone()])),
-                    Arc::new(StringArray::from(vec![result_location_for_spawn.clone()])),
-                    Arc::new(TimestampMillisecondArray::from(vec![committed_at])),
-                ],
-            );
+                let committed_at = chrono::Utc::now().timestamp_millis();
+                RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec![session_id.clone()])),
+                        Arc::new(StringArray::from(vec![task_id.clone()])),
+                        Arc::new(StringArray::from(vec![result_location_for_spawn.clone()])),
+                        Arc::new(TimestampMillisecondArray::from(vec![committed_at])),
+                    ],
+                )
+                .map_err(|e| format!("failed to build record batch: {}", e))
+            };
 
             match batch_res {
                 Ok(batch) => {
@@ -246,7 +644,11 @@ pub fn handle_execute_task(
                 Err(e) => {
                     status = "failed".to_string();
                     error_message = format!("failed to build record batch: {}", e);
-                    log::error!("Failed to build Arrow record batch for task {}: {}", task_id, e);
+                    log::error!(
+                        "Failed to build Arrow record batch for task {}: {}",
+                        task_id,
+                        e
+                    );
                 }
             }
         } else {

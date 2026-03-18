@@ -1,6 +1,6 @@
+use object_store::aws::AmazonS3Builder;
 use serde_json::Value;
 use std::sync::Arc;
-use object_store::aws::AmazonS3Builder;
 // use object_store::ObjectStore; // unused import kept for future use
 
 /// Build an `object_store::ObjectStore` from a storage config block.

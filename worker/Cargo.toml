@@ -38,7 +38,7 @@ rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 # use the workspace rustls to control provider features
 
 # Delta Lake and object-store integration
-deltalake = "0.31.1"
+deltalake = { version = "0.31.1", features = ["s3"] }
 object_store = { version = "0.13.1", features = ["aws"] }
 url = "2"
 

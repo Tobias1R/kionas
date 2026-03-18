@@ -6,10 +6,10 @@ use std::sync::Arc;
 #[cfg(feature = "storage-minio")]
 pub mod minio;
 
-pub mod staging;
+pub mod deltalake;
 pub mod object_store_adapter;
 pub mod object_store_pool;
-pub mod deltalake;
+pub mod staging;
 
 #[async_trait]
 pub trait StorageProvider: Send + Sync {

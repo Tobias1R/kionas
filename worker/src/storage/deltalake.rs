@@ -1,26 +1,72 @@
 use crate::state::SharedData;
 use crate::storage::object_store_pool::ObjectStoreManager;
+use arrow::datatypes::DataType as ArrowDataType;
 use bytes::Bytes;
-use deltalake::{open_table as dl_open_table, DeltaTable};
+use chrono::Utc;
 use deltalake::kernel::transaction::CommitBuilder;
-use deltalake::kernel::{Action, Add};
+use deltalake::kernel::{Action, Add, DataType as DeltaDataType, PrimitiveType, StructField};
 use deltalake::protocol::{DeltaOperation, SaveMode};
-use object_store::path::Path as ObjPath;
+use deltalake::{DeltaTable, open_table_with_storage_options};
 use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use std::io::Cursor;
-use url::Url;
-use uuid::Uuid;
-use chrono::Utc;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use url::Url;
+use uuid::Uuid;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 static OBJECT_STORE_POOL_INIT_COUNT: AtomicU64 = AtomicU64::new(0);
 static OBJECT_STORE_POOL_CHECKOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn storage_options_from_cluster(storage: &serde_json::Value) -> HashMap<String, String> {
+    let mut options = HashMap::new();
+
+    let endpoint = storage
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let region = storage
+        .get("region")
+        .and_then(|v| v.as_str())
+        .unwrap_or("us-east-1")
+        .trim();
+    let access_key = storage
+        .get("access_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let secret_key = storage
+        .get("secret_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+
+    if !region.is_empty() {
+        options.insert("aws_region".to_string(), region.to_string());
+    }
+    if !access_key.is_empty() {
+        options.insert("aws_access_key_id".to_string(), access_key.to_string());
+    }
+    if !secret_key.is_empty() {
+        options.insert("aws_secret_access_key".to_string(), secret_key.to_string());
+    }
+    if !endpoint.is_empty() {
+        options.insert("aws_endpoint".to_string(), endpoint.to_string());
+        options.insert("aws_endpoint_url".to_string(), endpoint.to_string());
+        if endpoint.starts_with("http://") {
+            options.insert("aws_allow_http".to_string(), "true".to_string());
+            options.insert("allow_http".to_string(), "true".to_string());
+        }
+    }
+
+    options
+}
 
 async fn ensure_object_store_pool(
     shared: &SharedData,
@@ -51,28 +97,74 @@ async fn ensure_object_store_pool(
 }
 
 /// Open a Delta table by URI. Returns an error if the table cannot be opened.
-pub async fn open_table(
-    _shared: SharedData,
-    table_uri: &str,
-) -> Result<DeltaTable, DynError> {
-    // Use the simple deltalake open_table helper. Advanced usage with a
-    // custom object_store will be added later.
+pub async fn open_table(shared: SharedData, table_uri: &str) -> Result<DeltaTable, DynError> {
     let url = Url::parse(table_uri)?;
-    let tbl = dl_open_table(url).await?;
+    let storage_options = storage_options_from_cluster(&shared.cluster_info.storage);
+    let tbl = open_table_with_storage_options(url, storage_options).await?;
     Ok(tbl)
 }
 
 /// Create a new Delta table at `table_uri`.
 pub async fn create_table(
-    _shared: SharedData,
+    shared: SharedData,
     table_uri: &str,
-    _schema: &arrow::datatypes::Schema,
+    schema: &arrow::datatypes::Schema,
 ) -> Result<DeltaTable, DynError> {
-    // Placeholder implementation: attempt to open, and if not found, return error.
-    // Proper create path will use DeltaTableBuilder or API to initialize a new table.
     let url = Url::parse(table_uri)?;
-    let tbl = dl_open_table(url).await?;
-    Ok(tbl)
+    let storage_options = storage_options_from_cluster(&shared.cluster_info.storage);
+
+    // Idempotent behavior: if a table already exists, reuse it.
+    if let Ok(existing) =
+        open_table_with_storage_options(url.clone(), storage_options.clone()).await
+    {
+        return Ok(existing);
+    }
+
+    let columns: Vec<StructField> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let dtype = match field.data_type() {
+                ArrowDataType::Boolean => DeltaDataType::BOOLEAN,
+                ArrowDataType::Int8 => DeltaDataType::BYTE,
+                ArrowDataType::Int16 => DeltaDataType::SHORT,
+                ArrowDataType::Int32 => DeltaDataType::INTEGER,
+                ArrowDataType::Int64 => DeltaDataType::LONG,
+                ArrowDataType::Float32 => DeltaDataType::FLOAT,
+                ArrowDataType::Float64 => DeltaDataType::DOUBLE,
+                ArrowDataType::Date32 | ArrowDataType::Date64 => DeltaDataType::DATE,
+                ArrowDataType::Timestamp(_, _) => DeltaDataType::TIMESTAMP,
+                ArrowDataType::Decimal128(precision, scale)
+                | ArrowDataType::Decimal256(precision, scale) => {
+                    PrimitiveType::decimal(*precision as u8, *scale as u8)
+                        .map(DeltaDataType::from)
+                        .unwrap_or(DeltaDataType::STRING)
+                }
+                ArrowDataType::Binary | ArrowDataType::LargeBinary => DeltaDataType::BINARY,
+                _ => DeltaDataType::STRING,
+            };
+            StructField::new(field.name(), dtype, field.is_nullable())
+        })
+        .collect();
+
+    if columns.is_empty() {
+        return Err("cannot create Delta table with empty schema".into());
+    }
+
+    let table = DeltaTable::try_from_url_with_storage_options(url, storage_options.clone()).await?;
+    let table_name = table_uri
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("table");
+    let created = table
+        .create()
+        .with_table_name(table_name)
+        .with_storage_options(storage_options)
+        .with_columns(columns)
+        .with_save_mode(SaveMode::ErrorIfExists)
+        .await?;
+    Ok(created)
 }
 
 /// Write given record batches as Parquet files and commit to the Delta log.
@@ -150,7 +242,8 @@ pub async fn write_parquet_and_commit(
 
     // Commit through deltalake_core transaction API. DeltaTable itself does not
     // expose a direct `commit` method in this version.
-    let mut tbl = dl_open_table(url).await?;
+    let storage_options = storage_options_from_cluster(&shared.cluster_info.storage);
+    let mut tbl = open_table_with_storage_options(url, storage_options).await?;
     let table_state = tbl.snapshot()?;
     let operation = DeltaOperation::Write {
         mode: SaveMode::Append,

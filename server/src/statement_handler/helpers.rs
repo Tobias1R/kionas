@@ -52,6 +52,7 @@ pub async fn build_task_and_schedule(
     session_id: &str,
     operation: &str,
     payload: String,
+    params: std::collections::HashMap<String, String>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let task_manager = {
         let state = shared_data.lock().await;
@@ -63,6 +64,7 @@ pub async fn build_task_and_schedule(
             session_id.to_string(),
             operation.to_string(),
             payload,
+            params,
         )
         .await;
     task_manager
@@ -132,13 +134,40 @@ pub async fn run_task_for_input(
     payload: String,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    run_task_for_input_with_params(
+        shared_data,
+        session_id,
+        operation,
+        payload,
+        std::collections::HashMap::new(),
+        timeout_secs,
+    )
+    .await
+}
+
+/// Same as `run_task_for_input`, but allows passing operation-specific task params.
+pub async fn run_task_for_input_with_params(
+    shared_data: &SharedData,
+    session_id: &str,
+    operation: &str,
+    payload: String,
+    params: std::collections::HashMap<String, String>,
+    timeout_secs: u64,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     // Resolve session and worker key
     let (session, key) = resolve_session_and_key(shared_data, session_id).await?;
 
     // Create a query id and schedule task
     let query_id = Uuid::new_v4().to_string();
-    let task_id =
-        build_task_and_schedule(shared_data, query_id, session_id, operation, payload).await?;
+    let task_id = build_task_and_schedule(
+        shared_data,
+        query_id,
+        session_id,
+        operation,
+        payload,
+        params,
+    )
+    .await?;
 
     // Acquire pooled connection (validates via heartbeat)
     let conn =

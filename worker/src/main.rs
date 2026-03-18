@@ -102,11 +102,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         worker_id: worker_id.to_string(),
         host: interops.host.clone(),
         port: interops.port as u32,
-        server_url: interops.host.clone(),
+        // Use cluster master endpoint for interops callbacks (TaskUpdate),
+        // not this worker's bind host/port.
+        server_url: cluster_info.master.clone(),
         tls_cert_path: interops.tls_cert.clone(),
         tls_key_path: interops.tls_key.clone(),
         ca_cert_path: interops.ca_cert.clone(),
     };
+    println!(
+        "Configured interops callback target (master): {}",
+        worker_info.server_url
+    );
     let mut shared_data = crate::state::SharedData::new(worker_info, cluster_info);
 
     // Build storage provider from cluster info and attach to shared state (best-effort)

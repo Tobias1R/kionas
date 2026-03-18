@@ -19,6 +19,10 @@
 - cargo check
 - cargo test -- --test-threads=1
 
+## Cargo Check runs
+- if on windows run through docker
+- docker run --rm -v "${PWD}:/workspace" -w /workspace docker-devcontainer cargo check -p server
+
 ## Cargo Clippy Configuration
 Check with cargo clippy after adding a new feature and fix clippy errors with the following settings:
 ```toml

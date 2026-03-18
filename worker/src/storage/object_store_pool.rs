@@ -41,9 +41,7 @@ impl Manager for ObjectStoreManager {
     type Type = Arc<dyn object_store::ObjectStore>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    fn create(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Self::Type, Self::Error>> + Send {
+    fn create(&self) -> impl std::future::Future<Output = Result<Self::Type, Self::Error>> + Send {
         let storage = self.storage.clone();
         async move { object_store_from_config(&storage).await }
     }
@@ -52,9 +50,8 @@ impl Manager for ObjectStoreManager {
         &self,
         _obj: &mut Self::Type,
         _metrics: &Metrics,
-    ) -> impl std::future::Future<
-        Output = Result<(), deadpool::managed::RecycleError<Self::Error>>,
-    > + Send {
+    ) -> impl std::future::Future<Output = Result<(), deadpool::managed::RecycleError<Self::Error>>> + Send
+    {
         // ObjectStore clients are stateless handles around pooled HTTP clients.
         async move { Ok(()) }
     }

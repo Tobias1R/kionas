@@ -8,6 +8,19 @@ use crate::transactions::Maestro;
 use crate::transactions::Participant;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
+use std::collections::HashMap;
+
+fn canonicalize_insert_table_name(raw_table_name: &str, default_schema: &str) -> String {
+    let cleaned = raw_table_name.trim().trim_matches('"').trim_matches('`');
+    if cleaned.is_empty() {
+        return cleaned.to_string();
+    }
+    if cleaned.contains('.') {
+        cleaned.to_string()
+    } else {
+        format!("deltalake.{}.{}", default_schema, cleaned)
+    }
+}
 
 /// Discover worker address tied to session
 pub async fn get_worker_addr_for_session(
@@ -98,6 +111,42 @@ pub async fn handle_statement(
     shared_data: &SharedData,
 ) -> String {
     match stmt {
+        Statement::Insert(insert_stmt) => {
+            // Server phase for INSERT: accept statement and dispatch a worker task.
+            // We send the normalized SQL text as payload and keep operation explicit.
+            let payload = stmt.to_string();
+            let default_schema = {
+                let state = shared_data.lock().await;
+                match state
+                    .session_manager
+                    .get_session(session_id.to_string())
+                    .await
+                {
+                    Some(s) => s.get_use_database(),
+                    None => "default".to_string(),
+                }
+            };
+            let mut params = HashMap::new();
+            let table_name =
+                canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
+            params.insert("table_name".to_string(), table_name);
+
+            match helpers::run_task_for_input_with_params(
+                shared_data,
+                session_id,
+                "insert",
+                payload,
+                params,
+                30,
+            )
+            .await
+            {
+                Ok(result_location) => {
+                    format!("Insert dispatched successfully: {}", result_location)
+                }
+                Err(e) => format!("Failed to dispatch insert: {}", e),
+            }
+        }
         Statement::CreateSchema { schema_name, .. } => {
             // Build domain object from AST and validate
             let owner = {
@@ -120,6 +169,7 @@ pub async fn handle_statement(
                                 id: key.clone(),
                                 target: key.clone(),
                                 staging_prefix: format!("schema-{}", schema_name.to_string()),
+                                tasks: Vec::new(),
                             };
                             let maestro = Maestro::new(shared_data.clone());
                             match maestro.execute_transaction(vec![participant], 3, 120).await {
@@ -179,10 +229,22 @@ pub async fn handle_statement(
                     match helpers::resolve_session_and_key(shared_data, session_id).await {
                         Ok((_session, key)) => {
                             let table_name = table.name.to_string();
+                            // Worker prepare path derives table URI from its own cluster storage
+                            // config when `table_uri` is not explicitly provided.
+                            let params: HashMap<String, String> = HashMap::new();
+                            let create_task =
+                                crate::services::worker_service_client::worker_service::Task {
+                                    task_id: uuid::Uuid::new_v4().to_string(),
+                                    operation: "create_table".to_string(),
+                                    input: stmt.to_string(),
+                                    output: String::new(),
+                                    params,
+                                };
                             let participant = Participant {
                                 id: key.clone(),
                                 target: key.clone(),
                                 staging_prefix: format!("table-{}", table_name),
+                                tasks: vec![create_task],
                             };
                             let maestro = Maestro::new(shared_data.clone());
                             match maestro.execute_transaction(vec![participant], 3, 180).await {
@@ -268,6 +330,7 @@ pub async fn handle_statement(
                             id: key.clone(),
                             target: key.clone(),
                             staging_prefix: format!("database-{}", db_name.to_string()),
+                            tasks: Vec::new(),
                         };
                         let maestro = Maestro::new(shared_data.clone());
                         match maestro.execute_transaction(vec![participant], 3, 180).await {

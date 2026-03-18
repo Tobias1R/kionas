@@ -1,6 +1,6 @@
 use crate::interops::manager::InteropsManager;
-use crate::storage::object_store_pool::ObjectStoreManager;
 use crate::storage::StorageProvider;
+use crate::storage::object_store_pool::ObjectStoreManager;
 use deadpool::managed::Pool;
 use kionas::consul::ClusterInfo;
 use serde::{Deserialize, Serialize};
@@ -64,5 +64,4 @@ impl SharedData {
             *guard = Some(pool_clone);
         });
     }
-
 }
