@@ -1,17 +1,12 @@
 pub(crate) mod create_database;
 pub(crate) mod create_schema;
+pub(crate) mod create_table;
 pub(crate) mod helpers;
 pub mod use_warehouse;
 
-use crate::services::metastore_client::MetastoreClient;
-use crate::services::metastore_client::metastore_service as ms;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
 use std::collections::HashMap;
-
-use crate::core::domain_service::DomainService;
-use crate::transactions::Participant;
-use crate::transactions::Maestro;
 
 fn canonicalize_insert_table_name(raw_table_name: &str, default_schema: &str) -> String {
     let cleaned = raw_table_name.trim().trim_matches('"').trim_matches('`');
@@ -173,83 +168,12 @@ pub async fn handle_statement(
             .await
         }
         Statement::CreateTable(create_table) => {
-            // `CreateTable` is a tuple variant carrying a `CreateTable` struct; extract its `name`.
-            let _name = &create_table.name;
-            // Build domain object from AST
-            let default_schema = {
-                let state = shared_data.lock().await;
-                match state
-                    .session_manager
-                    .get_session(session_id.to_string())
-                    .await
-                {
-                    Some(s) => s.get_use_database(),
-                    None => "default".to_string(),
-                }
-            };
-            match DomainService::from_create_table(create_table, &default_schema) {
-                Ok(table) => {
-                    // Resolve participant (single-worker for now)
-                    match helpers::resolve_session_and_key(shared_data, session_id).await {
-                        Ok((_session, key)) => {
-                            let table_name = table.name.to_string();
-                            // Worker prepare path derives table URI from its own cluster storage
-                            // config when `table_uri` is not explicitly provided.
-                            let params: HashMap<String, String> = HashMap::new();
-                            let create_task =
-                                crate::services::worker_service_client::worker_service::Task {
-                                    task_id: uuid::Uuid::new_v4().to_string(),
-                                    operation: "create_table".to_string(),
-                                    input: stmt.to_string(),
-                                    output: String::new(),
-                                    params,
-                                };
-                            let participant = Participant {
-                                id: key.clone(),
-                                target: key.clone(),
-                                staging_prefix: format!("table-{}", table_name),
-                                tasks: vec![create_task],
-                            };
-                            let maestro = Maestro::new(shared_data.clone());
-                            match maestro.execute_transaction(vec![participant], 3, 180).await {
-                                Ok(tx) => {
-                                    // Persist table metadata to metastore
-                                    let creq = ms::CreateTableRequest {
-                                        schema_name: default_schema.clone(),
-                                        table_name: table_name.clone(),
-                                        engine: String::new(),
-                                        columns: Vec::new(),
-                                    };
-                                    let mreq = ms::MetastoreRequest {
-                                        action: Some(ms::metastore_request::Action::CreateTable(
-                                            creq,
-                                        )),
-                                    };
-                                    match MetastoreClient::connect_with_shared(shared_data).await {
-                                        Ok(mut client) => match client.execute(mreq).await {
-                                            Ok(_) => format!(
-                                                "Table created successfully (tx={}): {}",
-                                                tx, table_name
-                                            ),
-                                            Err(e) => format!(
-                                                "Table committed but failed to persist in metastore: {}",
-                                                e
-                                            ),
-                                        },
-                                        Err(e) => format!(
-                                            "Table committed but failed to connect to metastore: {}",
-                                            e
-                                        ),
-                                    }
-                                }
-                                Err(e) => format!("Failed to create table transactionally: {}", e),
-                            }
-                        }
-                        Err(e) => format!("Failed to resolve worker for table create: {}", e),
-                    }
-                }
-                Err(e) => format!("Domain validation failed: {}", e),
-            }
+            create_table::handle_create_table(
+                shared_data,
+                session_id,
+                create_table::CreateTableAst { create_table },
+            )
+            .await
         }
 
         Statement::CreateDatabase {
