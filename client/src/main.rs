@@ -102,7 +102,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
     println!("Server response: {:?}", response);
 
-    let query = "create schema test_schema;";
+    // create database
+    let querydb = "create database deltalake;";
+
+    let reqdb = warehouse_service::QueryRequest {
+        query: querydb.to_string(),
+    };
+    let mut grpc_request = Request::new(reqdb);
+    grpc_request
+        .metadata_mut()
+        .insert("session_id", MetadataValue::from_str(&session_id).unwrap());
+    grpc_request.metadata_mut().insert(
+        "authorization",
+        MetadataValue::from_str(&format!("Bearer {}", token)).unwrap(),
+    );
+    let mut warehouse_client =
+        warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response: {:?}", response);
+
+    let query = "create schema deltalake.my_schema;";
 
     let _schema_name = query
         .strip_prefix("create schema ")
@@ -126,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Server response: {:?}", response);
 
     // create table
-    let query = "create table test_table (id int, name string);";
+    let query = "create table deltalake.my_schema.test_table (id int, name string);";
 
     let _table_name = query
         .strip_prefix("create table ")
@@ -149,13 +168,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
     println!("Server response: {:?}", response);
 
-    // create database
-    let querydb = "create database test_database;";
-
-    let reqdb = warehouse_service::QueryRequest {
-        query: querydb.to_string(),
+    // the so long waited: INSERT command
+    let query_insert = "insert into deltalake.my_schema.test_table values (1, 'Alice');";
+    let req_insert = warehouse_service::QueryRequest {
+        query: query_insert.to_string(),
     };
-    let mut grpc_request = Request::new(reqdb);
+    let mut grpc_request = Request::new(req_insert);
     grpc_request
         .metadata_mut()
         .insert("session_id", MetadataValue::from_str(&session_id).unwrap());

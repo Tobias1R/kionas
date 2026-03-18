@@ -1,5 +1,6 @@
 use crate::interops::manager::InteropsManager;
 use crate::storage::StorageProvider;
+use crate::storage::object_store_pool::ObjectStoreManager;
 use deadpool::managed::Pool;
 use kionas::consul::ClusterInfo;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub struct SharedData {
     pub storage_provider: Option<Arc<dyn StorageProvider + Send + Sync>>,
     #[serde(skip)]
     pub master_pool: Arc<tokio::sync::Mutex<Option<Arc<Pool<InteropsManager>>>>>,
+    #[serde(skip)]
+    pub object_store_pool: Arc<tokio::sync::Mutex<Option<Arc<Pool<ObjectStoreManager>>>>>,
 }
 
 impl fmt::Debug for SharedData {
@@ -43,6 +46,7 @@ impl SharedData {
             cluster_info,
             storage_provider: None,
             master_pool: Arc::new(tokio::sync::Mutex::new(None)),
+            object_store_pool: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 

@@ -6,6 +6,9 @@ use std::sync::Arc;
 #[cfg(feature = "storage-minio")]
 pub mod minio;
 
+pub mod deltalake;
+pub mod object_store_adapter;
+pub mod object_store_pool;
 pub mod staging;
 
 #[async_trait]

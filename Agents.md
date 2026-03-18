@@ -4,6 +4,7 @@
 - Always check cyclomatic complexity < 25
 - Always check data flow complexity < 25
 - Always add rust docs to classes/methods/functions (What, Inputs, Output, Details)
+- Always ask for input on dualities. Never assume!
 
 ## When Fixing Bugs/Issues
 - Check deeply what the issue is
@@ -17,6 +18,10 @@
 - cargo clippy --all-targets --all-features -- -D warnings
 - cargo check
 - cargo test -- --test-threads=1
+
+## Cargo Check runs
+- if on windows run through docker
+- docker run --rm -v "${PWD}:/workspace" -w /workspace docker-devcontainer cargo check -p server
 
 ## Cargo Clippy Configuration
 Check with cargo clippy after adding a new feature and fix clippy errors with the following settings:

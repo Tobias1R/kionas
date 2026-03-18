@@ -26,6 +26,8 @@ pub struct Participant {
     pub target: String,
     /// Staging prefix where the participant should write staged objects
     pub staging_prefix: String,
+    /// Tasks that should be executed as part of prepare for this participant.
+    pub tasks: Vec<crate::services::worker_service_client::worker_service::Task>,
 }
 
 /// Lightweight transaction descriptor
@@ -226,7 +228,7 @@ impl Maestro {
                 tx_id: tx_id.to_string(),
                 session_id: String::new(),
                 staging_prefix: p.staging_prefix.clone(),
-                tasks: Vec::new(),
+                tasks: p.tasks.clone(),
             };
 
             // Call prepare with timeout

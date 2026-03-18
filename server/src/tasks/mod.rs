@@ -21,6 +21,7 @@ pub struct Task {
     pub session_id: String,
     pub operation: String,
     pub payload: String,
+    pub params: HashMap<String, String>,
     pub state: TaskState,
     pub attempts: u32,
     pub max_retries: u32,
@@ -32,13 +33,20 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(query_id: String, session_id: String, operation: String, payload: String) -> Self {
+    pub fn new(
+        query_id: String,
+        session_id: String,
+        operation: String,
+        payload: String,
+        params: HashMap<String, String>,
+    ) -> Self {
         Task {
             id: Uuid::new_v4().to_string(),
             query_id,
             session_id,
             operation,
             payload,
+            params,
             state: TaskState::Pending,
             attempts: 0,
             max_retries: 3,
@@ -74,8 +82,9 @@ impl TaskManager {
         session_id: String,
         operation: String,
         payload: String,
+        params: HashMap<String, String>,
     ) -> String {
-        let t = Task::new(query_id, session_id, operation, payload);
+        let t = Task::new(query_id, session_id, operation, payload, params);
         let id = t.id.clone();
         let at = Arc::new(Mutex::new(t));
         let mut map = self.tasks.write().await;
@@ -231,7 +240,6 @@ pub fn sample_task_request_from_task(
 pub fn task_to_request(
     task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
-    let params = std::collections::HashMap::new();
     crate::services::worker_service_client::worker_service::TaskRequest {
         session_id: task.session_id.clone(),
         tasks: vec![
@@ -240,7 +248,7 @@ pub fn task_to_request(
                 input: task.payload.clone(),
                 operation: task.operation.clone(),
                 output: String::new(),
-                params,
+                params: task.params.clone(),
             },
         ],
     }

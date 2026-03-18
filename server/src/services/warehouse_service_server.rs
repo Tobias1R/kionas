@@ -108,12 +108,24 @@ impl WarehouseServiceTrait for WarehouseService {
                     // Execute handler synchronously (existing logic performs dispatch to worker)
                     let result = handle_statement(stmt, &session_id, &shared_data).await;
                     println!("Execution result: {}", result);
+                    resp.message = result.clone();
+
+                    if result.starts_with("Failed")
+                        || result.starts_with("Domain validation failed")
+                        || result.starts_with("Unsupported")
+                    {
+                        resp.status = "ERROR".to_string();
+                        resp.error_code = "1".to_string();
+                    }
 
                     // statement_handler now performs any metastore actions after dispatch.
                 }
             }
             Err(e) => {
                 println!("Failed to parse query: {}", e);
+                resp.status = "ERROR".to_string();
+                resp.error_code = "1".to_string();
+                resp.message = e;
             }
         }
 
