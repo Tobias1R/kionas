@@ -23,8 +23,9 @@ toml = "0.8"
 deadpool = "0.12.1"
 webpki = "0.21.0"
 jsonwebtoken = "8.1"
-arrow = "57.2.0"
-parquet = "57.2.0"
+arrow.workspace = true
+parquet.workspace = true
+arrow-flight.workspace = true
 uuid = "1.22.0"
 rand = "0.8"
 

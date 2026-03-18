@@ -1,3 +1,4 @@
+mod flight;
 mod init;
 mod interops;
 mod services;
@@ -37,6 +38,14 @@ fn try_install_rustls_crypto_provider() {
         Ok(_) => log::debug!("rustls CryptoProvider installed default successfully"),
         Err(_) => log::debug!("rustls CryptoProvider.install_default() panicked or unavailable"),
     }
+}
+
+fn resolve_worker_flight_port(default_worker_port: u16) -> u16 {
+    std::env::var("WORKER_FLIGHT_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(default_worker_port.saturating_add(1))
 }
 
 #[tokio::main]
@@ -136,6 +145,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Interops pool will be lazily initialized by transactions::maestro when required");
 
     // Start interops_server
+
+    let flight_port = resolve_worker_flight_port(interops.port);
+    let flight_addr = resolve_hostname(&interops.host, flight_port).await?;
+    let flight_shared = shared_data.clone();
+    tokio::spawn(async move {
+        log::info!("Starting internal Flight server on {}", flight_addr);
+        if let Err(e) = crate::flight::server::serve_flight(flight_shared, flight_addr).await {
+            log::error!("Internal Flight server stopped with error: {}", e);
+        }
+    });
 
     let svc = services::worker_service_server::WorkerService { shared_data };
     println!("Starting interops_server on {}", addr);

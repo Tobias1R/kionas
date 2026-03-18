@@ -87,7 +87,7 @@ async fn ensure_object_store_pool(
         .map_err(|e| format!("failed to build object-store pool: {}", e))?;
     let pool = Arc::new(pool);
     let init_count = OBJECT_STORE_POOL_INIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    log::info!(
+    log::debug!(
         "Initialized object-store pool for delta writes with max_size={} init_count={}",
         pool_size,
         init_count
@@ -200,7 +200,7 @@ pub async fn write_parquet_and_commit(
         .await
         .map_err(|e| format!("failed to acquire object-store client from pool: {}", e))?;
     let checkout_count = OBJECT_STORE_POOL_CHECKOUT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    log::info!(
+    log::debug!(
         "Checked out object-store client from delta pool checkout_count={}",
         checkout_count
     );

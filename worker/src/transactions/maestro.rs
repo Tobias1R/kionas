@@ -446,6 +446,7 @@ pub async fn handle_execute_task(
         .as_ref()
         .map(|t| t.task_id.clone())
         .unwrap_or_default();
+    let session_id = req.session_id.clone();
 
     if operation == "create_database" {
         let task = match first_task.as_ref() {
@@ -461,6 +462,9 @@ pub async fn handle_execute_task(
 
         match crate::services::create_database::execute_create_database_task(&shared, task).await {
             Ok(location) => {
+                shared
+                    .set_task_result_location(&session_id, &task.task_id, &location)
+                    .await;
                 return crate::services::worker_service_server::worker_service::TaskResponse {
                     status: "ok".to_string(),
                     error: String::new(),
@@ -491,6 +495,9 @@ pub async fn handle_execute_task(
 
         match crate::services::create_schema::execute_create_schema_task(&shared, task).await {
             Ok(location) => {
+                shared
+                    .set_task_result_location(&session_id, &task.task_id, &location)
+                    .await;
                 return crate::services::worker_service_server::worker_service::TaskResponse {
                     status: "ok".to_string(),
                     error: String::new(),
@@ -521,6 +528,9 @@ pub async fn handle_execute_task(
 
         match crate::services::create_table::execute_create_table_task(&shared, task).await {
             Ok(location) => {
+                shared
+                    .set_task_result_location(&session_id, &task.task_id, &location)
+                    .await;
                 return crate::services::worker_service_server::worker_service::TaskResponse {
                     status: "ok".to_string(),
                     error: String::new(),
@@ -572,8 +582,10 @@ pub async fn handle_execute_task(
     let result_location = delta_table_uri
         .clone()
         .unwrap_or_else(|| "arrow-flight-endpoint".to_string());
+    shared
+        .set_task_result_location(&session_id, &task_id, &result_location)
+        .await;
     let result_location_for_spawn = result_location.clone();
-    let session_id = req.session_id.clone();
     let shared_clone = shared.clone();
     tokio::spawn(async move {
         let mut status = "succeeded".to_string();
