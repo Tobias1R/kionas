@@ -7,6 +7,8 @@ use std::sync::Arc;
 pub mod minio;
 
 pub mod deltalake;
+pub mod exchange;
+pub mod mock;
 pub mod object_store_adapter;
 pub mod object_store_pool;
 pub mod staging;

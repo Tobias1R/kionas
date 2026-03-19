@@ -7,36 +7,46 @@ Build from the current working query-dispatch foundation into a full distributed
 1.1 Keep the current minimal SELECT intake and canonical payload contract stable while we expand internals.
 1.2 Preserve the current server outcome contract RESULT|category|code|message to avoid breaking clients during roadmap execution.
 1.3 Lock in regression checks for create/insert/query dispatch paths before major planner work begins.
+[X] DONE
 
 2. Phase 1: Query Semantics Contract (AST -> Logical Plan)
 2.1 Introduce an explicit logical plan model as the first-class internal representation for SELECT (scan/project/filter initially).
 2.2 Replace flat canonical payload content with a versioned logical-plan payload envelope while maintaining backward compatibility for version 1 payloads.
 2.3 Add deterministic logical-plan validation and normalization rules (identifier casing, namespace resolution, projection/selection canonicalization).
 2.4 Add explainability hooks (logical plan text/JSON in debug paths) for onboarding and troubleshooting.
+[X] DONE
 
 3. Phase 2: Physical Planning (Logical -> Physical)
 3.1 Define a physical operator model for local execution (table scan, predicate filter, projection, materialize).
 3.2 Implement logical-to-physical translation with clear operator boundaries and future distribution metadata placeholders.
 3.3 Add a capability matrix so unsupported operators fail fast with validation-grade responses instead of infra-style errors.
 3.4 Add planner benchmarks and complexity guardrails to keep functions under repository complexity thresholds.
+[X] DONE
 
 4. Phase 3: Local Query Execution on Worker
 4.1 Evolve query stub into local execution for single-table SELECT by reading Delta data, applying filter/project, and producing Arrow batches.
 4.2 Persist deterministic query artifacts per task for retrieval and replay safety.
 4.3 Populate result metadata (row count, schema summary, result location) in a stable shape for server and proxy consumption.
 4.4 Keep insert/create paths untouched except where shared execution utilities are intentionally reused.
+[X] DONE
 
 5. Phase 4: Flight Data Plane and Proxy
 5.1 Implement flight_proxy service endpoints beyond bootstrap so clients can resolve and retrieve task results through a stable gateway.
 5.2 Complete worker Flight service surface needed by proxy and clients (GetFlightInfo/GetSchema/ListFlights priority after DoGet).
 5.3 Standardize ticket format and lifecycle (session/task/worker scoping, expiration, validation, replay constraints).
 5.4 Add end-to-end integration tests: server query -> worker execution -> proxy retrieval -> client decode.
+[X] DONE
+
+[INTERMISSION]
+Build a decent client to read inputs and display data;
+[X] DONE
 
 6. Phase 5: Distributed Physical Plan and Task Graph
 6.1 Introduce distributed physical plan primitives (stage graph, exchange/shuffle boundaries, partition specs).
 6.2 Compile distributed physical plan into task DAGs routed through existing TaskManager and worker pools.
 6.3 Add worker coordination protocol for stage dependencies, completion signaling, and retry-safe progress updates.
 6.4 Implement first distributed use-case slice (parallel scan + merge) before joins/aggregations.
+[X] DONE
 
 7. Phase 6: Authentication and Authorization Revamp
 7.1 Propagate auth context explicitly through query execution artifacts where needed (server dispatch, worker execution, Flight retrieval).
@@ -54,6 +64,10 @@ Build from the current working query-dispatch foundation into a full distributed
 9.1 Add joins, aggregates, ordering, and group-by in logical/physical planning after distributed foundation is stable.
 9.2 Add cost-based or heuristic optimization passes only after plan correctness and observability are proven.
 9.3 Expand query federation and advanced semantics iteratively with feature flags.
+
+10. Phase 9: Server session expansion
+
+
 
 **Parallelism and Dependencies**
 1. Phase 1 blocks Phases 2 and 3 because logical plan contract must stabilize first.

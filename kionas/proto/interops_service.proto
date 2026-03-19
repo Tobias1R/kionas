@@ -2,6 +2,7 @@ syntax = "proto3";
 
 package interops_service;
 
+// What: Control-plane RPC service for worker registration, heartbeats, and task progress updates.
 service InteropsService {
     // Register new warehouse worker
     rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
@@ -38,6 +39,10 @@ message TaskUpdateRequest {
     string status = 2; // e.g., running, succeeded, failed
     string result_location = 3;
     string error = 4;
+    optional string stage_id = 5;
+    optional uint32 partition_count = 6;
+    optional uint32 partition_completed = 7;
+    map<string, string> metadata = 8;
 }
 
 message TaskUpdateResponse {

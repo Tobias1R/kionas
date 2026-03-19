@@ -131,15 +131,18 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
     ) -> Result<Response<interops_service::TaskUpdateResponse>, Status> {
         let upd = request.into_inner();
         log::info!(
-            "Task update received: {} status={}",
+            "Task update received: {} status={} stage_id={:?} partition_completed={:?}/{:?}",
             upd.task_id,
-            upd.status
+            upd.status,
+            upd.stage_id,
+            upd.partition_completed,
+            upd.partition_count
         );
 
         let shared = self.shared_data.lock().await;
         let tm = shared.task_manager.clone();
 
-        if let Some(_task_arc) = tm.get_task(&upd.task_id).await {
+        if tm.get_task(&upd.task_id).await.is_some() {
             let s = upd.status.to_lowercase();
             let (state, result_loc, err) = match s.as_str() {
                 "running" => (crate::tasks::TaskState::Running, None, None),
@@ -166,9 +169,28 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
                     Some(format!("unknown status from worker: {}", upd.status)),
                 ),
             };
-            // Update via TaskManager helper so waiters are notified
-            tm.update_from_worker(&upd.task_id, state, result_loc, err)
+
+            let applied = tm
+                .update_from_worker_with_stage_progress(
+                    &upd.task_id,
+                    state,
+                    result_loc,
+                    err,
+                    upd.stage_id.clone(),
+                    upd.partition_count,
+                    upd.partition_completed,
+                    upd.metadata.clone(),
+                )
                 .await;
+
+            if !applied {
+                log::info!(
+                    "Ignored idempotent/rejected task update for task_id={} status={} stage_id={:?}",
+                    upd.task_id,
+                    upd.status,
+                    upd.stage_id
+                );
+            }
         } else {
             log::warn!("Task update for unknown task id: {}", upd.task_id);
             // Proceed, but indicate not-found; still return ok to avoid worker retries

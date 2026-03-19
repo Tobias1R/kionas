@@ -9,6 +9,11 @@
 pub enum PlannerError {
     EmptyProjection,
     EmptyRelation,
+    EmptyPhysicalPlan,
+    InvalidPhysicalPipeline(String),
+    InvalidDistributedPlan(String),
+    UnsupportedPhysicalOperator(String),
+    UnsupportedPredicate(String),
 }
 
 impl std::fmt::Display for PlannerError {
@@ -16,6 +21,25 @@ impl std::fmt::Display for PlannerError {
         match self {
             PlannerError::EmptyProjection => write!(f, "logical plan projection cannot be empty"),
             PlannerError::EmptyRelation => write!(f, "logical plan relation cannot be empty"),
+            PlannerError::EmptyPhysicalPlan => {
+                write!(f, "physical plan operator list cannot be empty")
+            }
+            PlannerError::InvalidPhysicalPipeline(message) => {
+                write!(f, "invalid physical pipeline: {}", message)
+            }
+            PlannerError::InvalidDistributedPlan(message) => {
+                write!(f, "invalid distributed plan: {}", message)
+            }
+            PlannerError::UnsupportedPhysicalOperator(name) => {
+                write!(
+                    f,
+                    "physical operator '{}' is not supported in this phase",
+                    name
+                )
+            }
+            PlannerError::UnsupportedPredicate(message) => {
+                write!(f, "predicate is not supported in this phase: {}", message)
+            }
         }
     }
 }

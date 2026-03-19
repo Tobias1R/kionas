@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 tokio.workspace = true
 tonic.workspace = true
+tonic14 = { package = "tonic", version = "0.14.5", features = ["transport"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,7 +24,9 @@ toml = "0.8"
 deadpool = "0.12.1"
 webpki = "0.21.0"
 jsonwebtoken = "8.1"
+futures.workspace = true
 arrow.workspace = true
+arrow-cast = { version = "58.0.0", features = ["prettyprint"] }
 parquet.workspace = true
 arrow-flight.workspace = true
 uuid = "1.22.0"
