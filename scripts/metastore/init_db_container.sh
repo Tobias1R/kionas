@@ -96,4 +96,18 @@ if $DO_BUILD; then
   fi
 fi
 
+# Check for RBAC tables. If missing execute scripts/metastore/rbac.sql
+RBAC_EXISTS=$(run_psql "$DB_NAME" "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users_rbac');" || echo "f")
+RBAC_EXISTS=$(echo "$RBAC_EXISTS" | tr -d '[:space:]')
+if [[ "$RBAC_EXISTS" != "t" && "$RBAC_EXISTS" != "true" ]]; then
+  echo "RBAC tables not found — applying RBAC SQL..."
+  RBAC_SCRIPT_PATH=${RBAC_SQL_PATH:-./scripts/metastore/rbac.sql}
+  if [[ -n "$DB_PASS" ]]; then
+    PGPASSWORD="$DB_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$DB_USER" -d "$DB_NAME" -f "$RBAC_SCRIPT_PATH"
+  else
+    psql -h "$PGHOST" -p "$PGPORT" -U "$DB_USER" -d "$DB_NAME" -f "$RBAC_SCRIPT_PATH"
+  fi
+  echo "RBAC SQL applied."
+fi
+
 echo "Done."

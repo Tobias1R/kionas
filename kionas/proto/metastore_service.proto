@@ -7,10 +7,40 @@ metastoreService
 Describes the protocol between client and the data-metastore service
 */
 
+// What: Metadata control-plane service for catalog, schema, table, transaction, and RBAC operations.
+//
+// Inputs:
+// - Requests are routed through `Execute` oneof actions and dedicated statistics endpoints.
+//
+// Output:
+// - Returns operation-specific response payloads.
 service MetastoreService {
-    rpc Execute(MetastoreRequest) returns (MetastoreResponse);
-    rpc UpdateTableStatistics(UpdateTableStatisticsRequest) returns (UpdateTableStatisticsResponse);
-    rpc GetTableStatistics(GetTableStatisticsRequest) returns (GetTableStatisticsResponse);
+  // What: Execute one metastore action request.
+  //
+  // Inputs:
+  // - `MetastoreRequest` carrying one action in its oneof payload.
+  //
+  // Output:
+  // - `MetastoreResponse` carrying one result in its oneof payload.
+  rpc Execute(MetastoreRequest) returns (MetastoreResponse);
+
+  // What: Persist table-level statistics payload for a table UUID.
+  //
+  // Inputs:
+  // - `UpdateTableStatisticsRequest` with `table_uuid` and statistics payload.
+  //
+  // Output:
+  // - Success/failure response.
+  rpc UpdateTableStatistics(UpdateTableStatisticsRequest) returns (UpdateTableStatisticsResponse);
+
+  // What: Read table-level statistics payload for a table UUID.
+  //
+  // Inputs:
+  // - `GetTableStatisticsRequest` with `table_uuid`.
+  //
+  // Output:
+  // - Statistics response when available.
+  rpc GetTableStatistics(GetTableStatisticsRequest) returns (GetTableStatisticsResponse);
 }
 
 message MetastoreRequest {
@@ -29,6 +59,14 @@ message MetastoreRequest {
     CreateTransactionRequest create_transaction = 20;
     UpdateTransactionStateRequest update_transaction_state = 21;
     GetTransactionRequest get_transaction = 22;
+    // RBAC related requests
+    CreateUserRequest create_user = 30;
+    DeleteUserRequest delete_user = 31;
+    CreateGroupRequest create_group = 32;
+    DeleteGroupRequest delete_group = 33;
+    CreateRoleRequest create_role = 34;
+    DropRoleRequest drop_role = 35;
+    GrantRoleRequest grant_role = 36;
     // Additional requests can be added here
   }
 }
@@ -49,8 +87,84 @@ message MetastoreResponse {
     CreateTransactionResponse create_transaction_response = 20;
     UpdateTransactionStateResponse update_transaction_state_response = 21;
     GetTransactionResponse get_transaction_response = 22;
+    // RBAC related responses
+    CreateUserResponse create_user_response = 30;
+    DeleteUserResponse delete_user_response = 31;
+    CreateGroupResponse create_group_response = 32;
+    DeleteGroupResponse delete_group_response = 33;
+    CreateRoleResponse create_role_response = 34;
+    DropRoleResponse drop_role_response = 35;
+    GrantRoleResponse grant_role_response = 36;
     // Additional responses can be added here
   }
+}
+
+// RBAC messages
+message CreateUserRequest {
+  string username = 1;
+}
+
+message CreateUserResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteUserRequest {
+  string username = 1;
+}
+
+message DeleteUserResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CreateGroupRequest {
+  string group_name = 1;
+}
+
+message CreateGroupResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DeleteGroupRequest {
+  string group_name = 1;
+}
+
+message DeleteGroupResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message CreateRoleRequest {
+  string role_name = 1;
+  string description = 2;
+}
+
+message CreateRoleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message DropRoleRequest {
+  string role_name = 1;
+}
+
+message DropRoleResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GrantRoleRequest {
+  string role_name = 1;
+  string principal_type = 2; // user | group
+  string principal_name = 3;
+  string granted_by = 4;
+}
+
+message GrantRoleResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 // Table related messages

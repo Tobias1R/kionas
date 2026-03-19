@@ -22,15 +22,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
-            cmake \
             pkg-config \
-            libcurl4-openssl-dev \
-            libsasl2-dev \
             libssl-dev \
-            libzstd-dev \
-            zlib1g-dev \
-            librdkafka-dev \ 
-            protobuf-compiler
+            librdkafka-dev \
+            protobuf-compiler \
+            git \
+            cmake
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

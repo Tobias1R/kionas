@@ -65,6 +65,27 @@ impl metastore_service::metastore_service_server::MetastoreService for Metastore
             Some(metastore_service::metastore_request::Action::GetTransaction(get)) => {
                 response.result = Some(actions::get_transaction::handle(&self.provider, get).await);
             }
+            Some(metastore_service::metastore_request::Action::CreateUser(create)) => {
+                response.result = Some(actions::create_user::handle(&self.provider, create).await);
+            }
+            Some(metastore_service::metastore_request::Action::DeleteUser(delete)) => {
+                response.result = Some(actions::delete_user::handle(&self.provider, delete).await);
+            }
+            Some(metastore_service::metastore_request::Action::CreateGroup(create)) => {
+                response.result = Some(actions::create_group::handle(&self.provider, create).await);
+            }
+            Some(metastore_service::metastore_request::Action::DeleteGroup(delete)) => {
+                response.result = Some(actions::delete_group::handle(&self.provider, delete).await);
+            }
+            Some(metastore_service::metastore_request::Action::CreateRole(create)) => {
+                response.result = Some(actions::create_role::handle(&self.provider, create).await);
+            }
+            Some(metastore_service::metastore_request::Action::DropRole(drop)) => {
+                response.result = Some(actions::drop_role::handle(&self.provider, drop).await);
+            }
+            Some(metastore_service::metastore_request::Action::GrantRole(grant)) => {
+                response.result = Some(actions::grant_role::handle(&self.provider, grant).await);
+            }
             None => {
                 return Err(Status::invalid_argument("No action provided"));
             }
