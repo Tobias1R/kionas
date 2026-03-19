@@ -18,6 +18,23 @@ use warehouse_auth_service::warehouse_auth_service_client::WarehouseAuthServiceC
 use warehouse_auth_service::{AuthResponse, UserPassAuthRequest};
 use warehouse_service::QueryResponse;
 
+/// What: Decode a query handle from structured response bytes.
+///
+/// Inputs:
+/// - `response`: QueryResponse from warehouse service.
+///
+/// Output:
+/// - Optional UTF-8 query handle when `response.data` is present and non-empty.
+fn query_handle_from_response(response: &QueryResponse) -> Option<String> {
+    if response.data.is_empty() {
+        return None;
+    }
+    String::from_utf8(response.data.clone())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -207,6 +224,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
     let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
     println!("Server response: {:?}", response);
+
+    // query the inserted data
+    let query_select = format!(
+        "select * from {}.{}.{};",
+        random_db_name, random_schema_name, random_table_name
+    );
+    let req_select = warehouse_service::QueryRequest {
+        query: query_select.to_string(),
+    };
+    let mut grpc_request = Request::new(req_select);
+    grpc_request
+        .metadata_mut()
+        .insert("session_id", MetadataValue::from_str(&session_id).unwrap());
+    grpc_request.metadata_mut().insert(
+        "authorization",
+        MetadataValue::from_str(&format!("Bearer {}", token)).unwrap(),
+    );
+    let mut warehouse_client =
+        warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response: {:?}", response);
+    if let Some(handle) = query_handle_from_response(&response) {
+        println!("Structured query handle: {}", handle);
+    }
 
     Ok(())
 }

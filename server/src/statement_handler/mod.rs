@@ -2,6 +2,7 @@ pub(crate) mod create_database;
 pub(crate) mod create_schema;
 pub(crate) mod create_table;
 pub(crate) mod helpers;
+pub(crate) mod query_select;
 pub mod use_warehouse;
 
 use crate::warehouse::state::SharedData;
@@ -144,6 +145,15 @@ pub async fn handle_statement(
                 }
                 Err(e) => format!("Failed to dispatch insert: {}", e),
             }
+        }
+        Statement::Query(_) => {
+            let ast = match query_select::select_ast_from_statement(stmt) {
+                Ok(parsed_ast) => parsed_ast,
+                Err(e) => {
+                    return format!("RESULT|VALIDATION|INVALID_QUERY_STATEMENT|{}", e);
+                }
+            };
+            query_select::handle_select_query(shared_data, session_id, ast).await
         }
         Statement::CreateSchema {
             schema_name,
