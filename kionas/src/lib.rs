@@ -3,7 +3,9 @@ pub mod constants;
 pub mod consul;
 pub mod logging;
 pub mod parser;
+pub mod planner;
 pub mod session;
+pub mod sql;
 pub mod utils;
 
 use chrono::Utc;
@@ -19,9 +21,6 @@ use uuid::Uuid;
 use regex::Regex;
 use std::env;
 
-#[cfg(not(feature = "std"))]
-extern crate alloc;
-
 #[derive(Debug, Clone)]
 pub enum RedisDatabases {
     Session = 0,
@@ -33,14 +32,6 @@ impl RedisDatabases {
     pub const SESSION: u8 = 0;
     pub const CONFIG: u8 = 1;
     pub const STATUS: u8 = 2;
-
-    fn index(&self) -> u8 {
-        match self {
-            RedisDatabases::Session => RedisDatabases::SESSION,
-            RedisDatabases::Config => RedisDatabases::CONFIG,
-            RedisDatabases::Status => RedisDatabases::STATUS,
-        }
-    }
 }
 
 pub fn get_redis_url(database_index: u8) -> String {

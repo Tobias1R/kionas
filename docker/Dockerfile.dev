@@ -2,6 +2,7 @@ FROM rust:latest
 
 # Install required build tools and libraries
 RUN apt-get update && apt-get install -y \
+    build-essential \
     pkg-config \
     libssl-dev \
     librdkafka-dev \
@@ -10,24 +11,51 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust components required by project quality gates.
+RUN rustup component add rustfmt clippy
+
 # Create app directory
 WORKDIR /workspace
 
-# Copy only Cargo.toml files first for caching
-COPY ../kionas/Cargo.toml ./kionas/Cargo.toml
-COPY ../server/Cargo.toml ./server/Cargo.toml
-COPY ../worker/Cargo.toml ./worker/Cargo.toml
-COPY ../client/Cargo.toml ./client/Cargo.toml
-COPY ../Cargo.toml ./Cargo.toml
-
 # Create source directories for build context
-RUN mkdir -p kionas/src server/src worker/src client/src
+RUN mkdir -p kionas/src server/src worker/src client/src tool/src metastore/src flight_proxy/src
+
+# Copy only Cargo.toml files first for caching
+COPY kionas/Cargo.toml ./kionas/Cargo.toml
+COPY server/Cargo.toml ./server/Cargo.toml
+COPY worker/Cargo.toml ./worker/Cargo.toml
+COPY client/Cargo.toml ./client/Cargo.toml
+COPY tool/Cargo.toml ./tool/Cargo.toml
+COPY metastore/Cargo.toml ./metastore/Cargo.toml
+COPY flight_proxy/Cargo.toml ./flight_proxy/Cargo.toml
+COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
+COPY clippy.toml ./clippy.toml
+
+# Add minimal placeholder targets so workspace members are valid during cargo fetch.
+RUN touch kionas/src/lib.rs \
+    && touch server/src/main.rs \
+    && touch worker/src/main.rs \
+    && touch client/src/main.rs \
+    && touch tool/src/main.rs \
+    && touch metastore/src/main.rs \
+    && touch flight_proxy/src/main.rs
+
+
 
 # Pre-build dependencies
 RUN cargo fetch
 
-# Copy the rest of the source code
-COPY .. .
+# Copy only workspace members and required files for development and testing.
+COPY kionas ./kionas
+COPY server ./server
+COPY worker ./worker
+COPY client ./client
+COPY tool ./tool
+COPY metastore ./metastore
+COPY flight_proxy ./flight_proxy
+COPY configs ./configs
+
 
 # Default command
 CMD ["bash"]

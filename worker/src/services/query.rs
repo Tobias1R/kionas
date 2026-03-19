@@ -72,9 +72,10 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
 ///
 /// Details:
 /// - Enforces payload invariants needed by this phase:
-///   - `version` must be `1`.
+///   - `version` must be `2`.
 ///   - `statement` must be `Select`.
 ///   - `namespace.database/schema/table` must exist and be valid.
+///   - `logical_plan` must be present as an object.
 fn resolve_query_namespace(task: &worker_service::Task) -> Result<QueryNamespace, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
@@ -83,7 +84,7 @@ fn resolve_query_namespace(task: &worker_service::Task) -> Result<QueryNamespace
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "query payload missing version".to_string())?;
-    if version != 1 {
+    if version != 2 {
         return Err(format!("unsupported query payload version: {}", version));
     }
 
@@ -101,6 +102,13 @@ fn resolve_query_namespace(task: &worker_service::Task) -> Result<QueryNamespace
     let namespace = parsed
         .get("namespace")
         .ok_or_else(|| "query payload missing namespace".to_string())?;
+
+    if !parsed
+        .get("logical_plan")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        return Err("query payload missing logical_plan object".to_string());
+    }
 
     let read_part = |key: &str| {
         namespace
@@ -194,13 +202,14 @@ mod tests {
             task_id: "t1".to_string(),
             operation: "query".to_string(),
             input: serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "statement": "Insert",
                 "namespace": {
                     "database": "db1",
                     "schema": "s1",
                     "table": "t1"
-                }
+                },
+                "logical_plan": {}
             })
             .to_string(),
             output: String::new(),
@@ -217,13 +226,14 @@ mod tests {
             task_id: "t1".to_string(),
             operation: "query".to_string(),
             input: serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "statement": "Select",
                 "namespace": {
                     "database": "DB1",
                     "schema": "Public",
                     "table": "Users"
-                }
+                },
+                "logical_plan": {}
             })
             .to_string(),
             output: String::new(),
@@ -234,5 +244,29 @@ mod tests {
         assert_eq!(namespace.database, "db1");
         assert_eq!(namespace.schema, "public");
         assert_eq!(namespace.table, "users");
+    }
+
+    #[test]
+    fn rejects_missing_logical_plan_for_v2() {
+        let task = crate::services::worker_service_server::worker_service::Task {
+            task_id: "t1".to_string(),
+            operation: "query".to_string(),
+            input: serde_json::json!({
+                "version": 2,
+                "statement": "Select",
+                "namespace": {
+                    "database": "db1",
+                    "schema": "s1",
+                    "table": "t1"
+                }
+            })
+            .to_string(),
+            output: String::new(),
+            params: std::collections::HashMap::new(),
+        };
+
+        let err =
+            resolve_query_namespace(&task).expect_err("must reject missing logical_plan object");
+        assert!(err.contains("missing logical_plan"));
     }
 }

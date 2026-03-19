@@ -1,9 +1,7 @@
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::{
-    Query as SqlQuery, Select, SetExpr, Statement, TableFactor,
-};
-use serde_json::json;
+use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
+use kionas::sql::query_model::build_select_query_dispatch_envelope;
 use std::collections::HashMap;
 
 const OUTCOME_PREFIX: &str = "RESULT";
@@ -20,23 +18,6 @@ const OUTCOME_PREFIX: &str = "RESULT";
 /// - This phase only supports a minimal single-table SELECT subset.
 pub(crate) struct SelectQueryAst<'a> {
     pub(crate) query: &'a SqlQuery,
-}
-
-/// What: Canonical query payload and namespace metadata used for worker dispatch.
-///
-/// Inputs:
-/// - `payload`: Serialized canonical query payload JSON.
-/// - `database`: Canonical database identifier.
-/// - `schema`: Canonical schema identifier.
-/// - `table`: Canonical table identifier.
-///
-/// Output:
-/// - Typed query payload bundle used by the handler dispatch path.
-struct CanonicalQueryPayload {
-    payload: String,
-    database: String,
-    schema: String,
-    table: String,
 }
 
 /// What: Encode a structured statement outcome for API response mapping.
@@ -56,164 +37,6 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
         code,
         message.into()
     )
-}
-
-/// What: Normalize identifier text for deterministic comparisons and payload content.
-///
-/// Inputs:
-/// - `raw`: Identifier text, possibly quoted.
-///
-/// Output:
-/// - Canonical lowercase identifier.
-fn normalize_identifier(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase()
-}
-
-/// What: Parse a fully qualified object name into normalized segments.
-///
-/// Inputs:
-/// - `raw`: Stringified object name.
-///
-/// Output:
-/// - Non-empty normalized path segments.
-fn parse_object_parts(raw: &str) -> Vec<String> {
-    raw.split('.')
-        .map(normalize_identifier)
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-}
-
-/// What: Resolve canonical namespace `(database, schema, table)` for the single table source.
-///
-/// Inputs:
-/// - `raw_table_name`: SQL string form of the source table.
-/// - `default_database`: Session default database fallback.
-/// - `default_schema`: Session default schema fallback.
-///
-/// Output:
-/// - Canonical namespace tuple.
-///
-/// Details:
-/// - Accepts 1-part, 2-part, or 3-part table references and fills missing parts from defaults.
-fn canonicalize_table_namespace(
-    raw_table_name: &str,
-    default_database: &str,
-    default_schema: &str,
-) -> (String, String, String) {
-    let parts = parse_object_parts(raw_table_name);
-    match parts.as_slice() {
-        [table] => (
-            normalize_identifier(default_database),
-            normalize_identifier(default_schema),
-            table.clone(),
-        ),
-        [schema, table] => (
-            normalize_identifier(default_database),
-            schema.clone(),
-            table.clone(),
-        ),
-        [database, schema, table] => (database.clone(), schema.clone(), table.clone()),
-        _ => (
-            normalize_identifier(default_database),
-            normalize_identifier(default_schema),
-            normalize_identifier(raw_table_name),
-        ),
-    }
-}
-
-/// What: Validate and extract the minimal SELECT shape required for phase-1 query support.
-///
-/// Inputs:
-/// - `query`: Parsed SQL query AST.
-///
-/// Output:
-/// - Borrowed `Select` AST on success.
-///
-/// Details:
-/// - Only accepts a plain `SELECT ... FROM <single-table> [WHERE ...]` shape.
-fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, String> {
-    let select = match query.body.as_ref() {
-        SetExpr::Select(select) => select.as_ref(),
-        _ => return Err(
-            "only SELECT queries are supported in this phase (set operations are not supported)"
-                .to_string(),
-        ),
-    };
-
-    if select.from.len() != 1 {
-        return Err("query must reference exactly one table in FROM".to_string());
-    }
-
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return Err("JOIN is not supported in this phase".to_string());
-    }
-
-    Ok(select)
-}
-
-/// What: Build a canonical JSON payload for worker query execution.
-///
-/// Inputs:
-/// - `query`: Parsed SQL query AST.
-/// - `session_id`: Session identifier for traceability.
-/// - `default_database`: Session default database.
-/// - `default_schema`: Session default schema.
-///
-/// Output:
-/// - Typed canonical payload bundle with payload + namespace fields.
-///
-/// Details:
-/// - Payload is versioned to allow non-breaking expansion in future planning phases.
-fn build_canonical_query_payload(
-    query: &SqlQuery,
-    session_id: &str,
-    default_database: &str,
-    default_schema: &str,
-) -> Result<CanonicalQueryPayload, String> {
-    let select = extract_minimal_select(query)?;
-
-    let from = &select.from[0];
-    let table_name = match &from.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
-        _ => return Err("only direct table references are supported in this phase".to_string()),
-    };
-
-    let (database, schema, table) =
-        canonicalize_table_namespace(&table_name, default_database, default_schema);
-
-    let projection = select
-        .projection
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>();
-
-    let payload = json!({
-        "version": 1,
-        "statement": "Select",
-        "session_id": session_id,
-        "namespace": {
-            "database": database,
-            "schema": schema,
-            "table": table,
-            "raw": table_name,
-        },
-        "projection": projection,
-        "selection": select.selection.as_ref().map(std::string::ToString::to_string),
-        "sql": query.to_string(),
-    });
-
-    Ok(CanonicalQueryPayload {
-        payload: payload.to_string(),
-        database,
-        schema,
-        table,
-    })
 }
 
 /// What: Handle SELECT query statements for server-side AST preparation.
@@ -256,7 +79,12 @@ pub(crate) async fn handle_select_query(
         }
     };
 
-    match build_canonical_query_payload(ast.query, session_id, &default_database, &default_schema) {
+    match build_select_query_dispatch_envelope(
+        ast.query,
+        session_id,
+        &default_database,
+        &default_schema,
+    ) {
         Ok(canonical_query) => {
             let payload = canonical_query.payload;
             let database = canonical_query.database;
@@ -306,7 +134,7 @@ pub(crate) async fn handle_select_query(
                 ),
             )
         }
-        Err(e) => format_outcome("VALIDATION", "UNSUPPORTED_QUERY_SHAPE", e),
+        Err(e) => format_outcome("VALIDATION", "UNSUPPORTED_QUERY_SHAPE", e.to_string()),
     }
 }
 
@@ -329,8 +157,8 @@ pub(crate) fn select_ast_from_statement(stmt: &Statement) -> Result<SelectQueryA
 
 #[cfg(test)]
 mod tests {
-    use super::{build_canonical_query_payload, extract_minimal_select};
     use kionas::parser::sql::parse_query;
+    use kionas::sql::query_model::build_select_query_dispatch_envelope;
 
     #[test]
     fn minimal_select_payload_builds() {
@@ -342,7 +170,7 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let canonical = build_canonical_query_payload(query, "s1", "sales", "public")
+        let canonical = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
             .expect("payload should build");
         let payload = canonical.payload;
         assert!(payload.contains("\"statement\":\"Select\""));
@@ -359,8 +187,9 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let err = extract_minimal_select(query).expect_err("should reject multi-table select");
-        assert!(err.contains("exactly one table"));
+        let err = build_select_query_dispatch_envelope(query, "s1", "default", "public")
+            .expect_err("should reject multi-table select");
+        assert!(err.to_string().contains("exactly one table"));
     }
 
     #[test]
@@ -373,7 +202,7 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let canonical = build_canonical_query_payload(query, "s1", "sales", "public")
+        let canonical = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
             .expect("payload should build");
         let database = canonical.database;
         let schema = canonical.schema;
