@@ -1,5 +1,6 @@
 services:
   broker:
+    # Theres nothing going on on kafka at this stage, but left it here for future use and testing 
     image: apache/kafka:latest
     hostname: kionas-broker
     container_name: kionas-broker
@@ -53,10 +54,10 @@ services:
     ports:
       - 6379:6379
     environment:
-      REDIS_PASSWORD: password
+      REDIS_PASSWORD: password # You can change this, but remember to update the worker's REDIS_URL accordingly!
       REDIS_PORT: 6379
       REDIS_HOST: kionas-redis
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://kionas-redis:6379
       REDIS_DB: 0
       REDIS_CLUSTER_ENABLED: "false"
   minio:
@@ -70,7 +71,7 @@ services:
       - 9001:9001
     environment:
       MINIO_ROOT_USER: root
-      MINIO_ROOT_PASSWORD: rootpassword # Who cares?
+      MINIO_ROOT_PASSWORD: rootpassword # You can change this, but remember to update the worker's AWS_SECRET_ACCESS_KEY accordingly!
       MINIO_REGION: us-east-1
       MINIO_BROWSER: "on"      
     volumes:
@@ -161,7 +162,7 @@ services:
       REDIS_URL: redis://kionas-redis:6379
       # storage endpoint and credentials for worker to access MinIO
       AWS_ACCESS_KEY_ID: root
-      AWS_SECRET_ACCESS_KEY: rootpassword # I KNNNNNNNNOOOOOOOWWWW!
+      AWS_SECRET_ACCESS_KEY: rootpassword # You can change this, but remember to update the MinIO container's MINIO_ROOT_PASSWORD accordingly!
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://kionas-minio:9000
     volumes:
