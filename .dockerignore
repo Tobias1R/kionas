@@ -1,0 +1,25 @@
+# Build artifacts
+**/target/
+target/
+
+# VCS and editor
+.git/
+.vscode/
+.idea/
+
+# Local/generated caches
+memories/
+**/*.log
+
+# Large or non-build assets
+data/
+certs/
+docs/
+ai/
+roadmaps/
+
+# Misc repo files not needed in dev image build context
+README.md
+CONTRIBUTING.md
+LICENSE
+logo.png

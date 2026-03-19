@@ -50,15 +50,16 @@ impl SessionProvider {
 }
 
 pub struct SyncSessionProvider {
-    client: redis::Client,
     con: redis::Connection,
 }
 
 impl SyncSessionProvider {
     pub fn new(url: &str) -> SyncSessionProvider {
-        let client = redis::Client::open(url).expect("Redis client creation error");
-        let con = client.get_connection().unwrap();
-        SyncSessionProvider { client, con }
+        let con = redis::Client::open(url)
+            .expect("Redis client creation error")
+            .get_connection()
+            .unwrap();
+        SyncSessionProvider { con }
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> redis::RedisResult<()> {

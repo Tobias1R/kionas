@@ -7,12 +7,11 @@ use std::io::Write;
 pub fn init_logging(
     level: &str,
     output: &str,
-    format: &str,
+    _format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Extract logging settings
     let level = level;
     let output = output;
-    let format = format;
 
     // Map level string to LevelFilter
     let log_level = match level.to_string().as_str() {

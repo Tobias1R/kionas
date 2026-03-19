@@ -249,5 +249,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Structured query handle: {}", handle);
     }
 
+    // an invalid query to test error handling using join(not accepted by the server) to trigger an error response
+    let query_invalid = format!(
+        "select * from {}.{}.{} t1 join {}.{}.{} t2 on t1.id = t2.id;",
+        random_db_name, random_schema_name, random_table_name, random_db_name, random_schema_name, random_table_name
+    );  
+    let req_invalid = warehouse_service::QueryRequest {
+        query: query_invalid.to_string(),
+    };
+    let mut grpc_request = Request::new(req_invalid);
+    grpc_request
+        .metadata_mut()
+        .insert("session_id", MetadataValue::from_str(&session_id).unwrap());   
+    grpc_request.metadata_mut().insert(
+        "authorization",
+        MetadataValue::from_str(&format!("Bearer {}", token)).unwrap(),
+    );
+    let mut warehouse_client =
+        warehouse_service::warehouse_service_client::WarehouseServiceClient::new(channel.clone());
+    let response: QueryResponse = warehouse_client.query(grpc_request).await?.into_inner();
+    println!("Server response for invalid query: {:?}", response);
+
     Ok(())
 }
