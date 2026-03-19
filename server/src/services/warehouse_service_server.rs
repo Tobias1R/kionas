@@ -29,6 +29,10 @@ use crate::services::request_context::RequestContext;
 /// - Legacy plain-text outputs still map to generic infra failures when applicable.
 /// - For `QUERY_DISPATCHED`, response data carries the query handle bytes.
 fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
+    // Ensure each statement outcome writes its own data contract and does not
+    // leak bytes from previous statements in multi-statement requests.
+    resp.data.clear();
+
     let mut parts = result.splitn(4, '|');
     let prefix = parts.next().unwrap_or_default();
     if prefix != "RESULT" {
@@ -237,5 +241,28 @@ mod tests {
             decoded,
             "flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1"
         );
+    }
+
+    #[test]
+    fn clears_stale_query_handle_for_non_query_outcome() {
+        let mut resp = QueryResponse {
+            message: String::new(),
+            status: "OK".to_string(),
+            error_code: "0".to_string(),
+            execution_time: "0".to_string(),
+            data: Vec::new(),
+        };
+
+        apply_statement_outcome(
+            "RESULT|SUCCESS|QUERY_DISPATCHED|query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)",
+            &mut resp,
+        );
+        assert!(!resp.data.is_empty());
+
+        apply_statement_outcome(
+            "RESULT|SUCCESS|TABLE_CREATED|table created successfully",
+            &mut resp,
+        );
+        assert!(resp.data.is_empty());
     }
 }

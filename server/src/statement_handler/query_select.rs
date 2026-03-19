@@ -22,6 +22,23 @@ pub(crate) struct SelectQueryAst<'a> {
     pub(crate) query: &'a SqlQuery,
 }
 
+/// What: Canonical query payload and namespace metadata used for worker dispatch.
+///
+/// Inputs:
+/// - `payload`: Serialized canonical query payload JSON.
+/// - `database`: Canonical database identifier.
+/// - `schema`: Canonical schema identifier.
+/// - `table`: Canonical table identifier.
+///
+/// Output:
+/// - Typed query payload bundle used by the handler dispatch path.
+struct CanonicalQueryPayload {
+    payload: String,
+    database: String,
+    schema: String,
+    table: String,
+}
+
 /// What: Encode a structured statement outcome for API response mapping.
 ///
 /// Inputs:
@@ -149,7 +166,7 @@ fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, String> {
 /// - `default_schema`: Session default schema.
 ///
 /// Output:
-/// - Serialized canonical query payload as JSON string.
+/// - Typed canonical payload bundle with payload + namespace fields.
 ///
 /// Details:
 /// - Payload is versioned to allow non-breaking expansion in future planning phases.
@@ -158,7 +175,7 @@ fn build_canonical_query_payload(
     session_id: &str,
     default_database: &str,
     default_schema: &str,
-) -> Result<String, String> {
+) -> Result<CanonicalQueryPayload, String> {
     let select = extract_minimal_select(query)?;
 
     let from = &select.from[0];
@@ -191,39 +208,12 @@ fn build_canonical_query_payload(
         "sql": query.to_string(),
     });
 
-    Ok(payload.to_string())
-}
-
-/// What: Extract canonical namespace from a canonical query payload.
-///
-/// Inputs:
-/// - `payload`: Serialized canonical query payload JSON.
-///
-/// Output:
-/// - Canonical `(database, schema, table)` tuple.
-///
-/// Details:
-/// - Returns an error when required namespace fields are missing or non-string.
-fn extract_namespace_from_payload(payload: &str) -> Result<(String, String, String), String> {
-    let parsed: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|e| format!("failed to parse canonical query payload: {}", e))?;
-    let namespace = parsed
-        .get("namespace")
-        .ok_or_else(|| "canonical query payload is missing namespace".to_string())?;
-
-    let read_string = |key: &str| {
-        namespace
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(std::string::ToString::to_string)
-            .filter(|v| !v.trim().is_empty())
-            .ok_or_else(|| format!("canonical query payload missing namespace field '{}'", key))
-    };
-
-    let database = read_string("database")?;
-    let schema = read_string("schema")?;
-    let table = read_string("table")?;
-    Ok((database, schema, table))
+    Ok(CanonicalQueryPayload {
+        payload: payload.to_string(),
+        database,
+        schema,
+        table,
+    })
 }
 
 /// What: Handle SELECT query statements for server-side AST preparation.
@@ -267,13 +257,11 @@ pub(crate) async fn handle_select_query(
     };
 
     match build_canonical_query_payload(ast.query, session_id, &default_database, &default_schema) {
-        Ok(payload) => {
-            let (database, schema, table) = match extract_namespace_from_payload(&payload) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    return format_outcome("INFRA", "QUERY_PAYLOAD_NAMESPACE_MISSING", e);
-                }
-            };
+        Ok(canonical_query) => {
+            let payload = canonical_query.payload;
+            let database = canonical_query.database;
+            let schema = canonical_query.schema;
+            let table = canonical_query.table;
 
             let mut params = HashMap::new();
             params.insert("database_name".to_string(), database.clone());
@@ -285,7 +273,7 @@ pub(crate) async fn handle_select_query(
                 shared_data,
                 session_id,
                 "query",
-                payload.clone(),
+                payload,
                 params,
                 120,
             )
@@ -341,9 +329,7 @@ pub(crate) fn select_ast_from_statement(stmt: &Statement) -> Result<SelectQueryA
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_canonical_query_payload, extract_minimal_select, extract_namespace_from_payload,
-    };
+    use super::{build_canonical_query_payload, extract_minimal_select};
     use kionas::parser::sql::parse_query;
 
     #[test]
@@ -356,8 +342,9 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let payload = build_canonical_query_payload(query, "s1", "sales", "public")
+        let canonical = build_canonical_query_payload(query, "s1", "sales", "public")
             .expect("payload should build");
+        let payload = canonical.payload;
         assert!(payload.contains("\"statement\":\"Select\""));
         assert!(payload.contains("\"database\":\"sales\""));
         assert!(payload.contains("\"table\":\"users\""));
@@ -386,10 +373,11 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let payload = build_canonical_query_payload(query, "s1", "sales", "public")
+        let canonical = build_canonical_query_payload(query, "s1", "sales", "public")
             .expect("payload should build");
-        let (database, schema, table) =
-            extract_namespace_from_payload(&payload).expect("namespace should be present");
+        let database = canonical.database;
+        let schema = canonical.schema;
+        let table = canonical.table;
 
         assert_eq!(database, "sales");
         assert_eq!(schema, "public");
