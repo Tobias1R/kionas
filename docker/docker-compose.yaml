@@ -145,6 +145,27 @@ services:
       - ..:/workspace:cached
     depends_on:
       - metastore
+      - minio
+      - redis
+    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+
+  # flight proxy container
+  flight-proxy:
+    image: docker-devcontainer
+    hostname: kionas-flight-proxy
+    container_name: kionas-flight-proxy
+    networks:
+      - warehouse_network
+    environment:
+      RUST_LOG: debug
+      RUST_BACKTRACE: full
+      KIONAS_HOME: /workspace
+      FLIGHT_PROXY_PORT: 443
+      WORKER_FLIGHT_PORT: 50052
+    volumes:
+      - ..:/workspace:cached
+    depends_on:
+      - warehouse
     command: ["bash", "-c", "while true; do sleep 1000; done" ]
 
   # worker container
@@ -165,11 +186,16 @@ services:
       AWS_SECRET_ACCESS_KEY: rootpassword # You can change this, but remember to update the MinIO container's MINIO_ROOT_PASSWORD accordingly!
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://kionas-minio:9000
+      FLIGHT_PROXY_HOST: kionas-flight-proxy
+      FLIGHT_PROXY_PORT: 443
     volumes:
       - ..:/workspace:cached
     depends_on:
-      - metastore
+      - warehouse
+      
     command: ["bash", "-c", "while true; do sleep 1000; done" ]
+
+  
 
 networks:
   warehouse_network:

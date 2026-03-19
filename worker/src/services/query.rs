@@ -218,6 +218,61 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
         .unwrap_or(default_worker_port.saturating_add(1))
 }
 
+/// What: Resolve query-handle endpoint host and port with optional proxy overrides.
+///
+/// Inputs:
+/// - `proxy_host`: Optional proxy host override.
+/// - `proxy_port`: Optional proxy port override.
+/// - `default_host`: Worker host used when proxy host is absent.
+/// - `default_worker_port`: Worker interops port used to derive worker Flight default.
+///
+/// Output:
+/// - `(host, port)` endpoint tuple for query-handle generation.
+fn resolve_query_result_endpoint_with_overrides(
+    proxy_host: Option<&str>,
+    proxy_port: Option<u32>,
+    default_host: &str,
+    default_worker_port: u32,
+) -> (String, u32) {
+    let host = proxy_host
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(default_host)
+        .to_string();
+
+    let port = proxy_port
+        .filter(|p| *p > 0)
+        .unwrap_or_else(|| resolve_worker_flight_port(default_worker_port));
+
+    (host, port)
+}
+
+/// What: Resolve query-handle endpoint host and port from environment.
+///
+/// Inputs:
+/// - `default_host`: Worker host fallback.
+/// - `default_worker_port`: Worker interops port fallback.
+///
+/// Output:
+/// - `(host, port)` endpoint tuple.
+///
+/// Details:
+/// - `FLIGHT_PROXY_HOST` and `FLIGHT_PROXY_PORT` allow routing retrieval through proxy.
+/// - Falls back to worker Flight endpoint when overrides are not set.
+fn resolve_query_result_endpoint(default_host: &str, default_worker_port: u32) -> (String, u32) {
+    let proxy_host = std::env::var("FLIGHT_PROXY_HOST").ok();
+    let proxy_port = std::env::var("FLIGHT_PROXY_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+
+    resolve_query_result_endpoint_with_overrides(
+        proxy_host.as_deref(),
+        proxy_port,
+        default_host,
+        default_worker_port,
+    )
+}
+
 /// What: Parse and validate canonical SELECT query payload.
 ///
 /// Inputs:
@@ -326,11 +381,13 @@ fn build_result_location(
     session_id: &str,
     namespace: &QueryNamespace,
 ) -> String {
-    let flight_port = resolve_worker_flight_port(shared.worker_info.port);
+    let (endpoint_host, endpoint_port) =
+        resolve_query_result_endpoint(&shared.worker_info.host, shared.worker_info.port);
+
     format!(
         "flight://{}:{}/query/{}/{}/{}/{}?session_id={}&task_id={}",
-        shared.worker_info.host,
-        flight_port,
+        endpoint_host,
+        endpoint_port,
         namespace.database,
         namespace.schema,
         namespace.table,
@@ -376,7 +433,7 @@ pub(crate) async fn execute_query_task_stub(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_query_namespace;
+    use super::{resolve_query_namespace, resolve_query_result_endpoint_with_overrides};
 
     #[test]
     fn accepts_unit_variant_string_operator_shape() {
@@ -407,6 +464,26 @@ mod tests {
 
         let namespace = resolve_query_namespace(&task).expect("must accept unit variant shape");
         assert_eq!(namespace.database, "db1");
+    }
+
+    #[test]
+    fn endpoint_resolution_uses_worker_defaults_when_proxy_absent() {
+        let (host, port) =
+            resolve_query_result_endpoint_with_overrides(None, None, "worker1", 32000);
+        assert_eq!(host, "worker1");
+        assert_eq!(port, 32001);
+    }
+
+    #[test]
+    fn endpoint_resolution_prefers_proxy_overrides_when_present() {
+        let (host, port) = resolve_query_result_endpoint_with_overrides(
+            Some("flight-proxy"),
+            Some(33000),
+            "worker1",
+            32000,
+        );
+        assert_eq!(host, "flight-proxy");
+        assert_eq!(port, 33000);
     }
 
     #[test]
