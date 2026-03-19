@@ -265,4 +265,111 @@ mod tests {
         );
         assert!(resp.data.is_empty());
     }
+
+    #[test]
+    fn maps_unsupported_operator_as_business_error() {
+        let mut resp = QueryResponse {
+            message: String::new(),
+            status: "OK".to_string(),
+            error_code: "0".to_string(),
+            execution_time: "0".to_string(),
+            data: Vec::new(),
+        };
+
+        apply_statement_outcome(
+            "RESULT|VALIDATION|UNSUPPORTED_OPERATOR|physical operator 'HashJoin' is not supported in this phase",
+            &mut resp,
+        );
+
+        assert_eq!(resp.status, "ERROR");
+        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_OPERATOR");
+        assert_eq!(
+            resp.message,
+            "physical operator 'HashJoin' is not supported in this phase"
+        );
+    }
+
+    #[test]
+    fn maps_unsupported_predicate_as_business_error() {
+        let mut resp = QueryResponse {
+            message: String::new(),
+            status: "OK".to_string(),
+            error_code: "0".to_string(),
+            execution_time: "0".to_string(),
+            data: Vec::new(),
+        };
+
+        apply_statement_outcome(
+            "RESULT|VALIDATION|UNSUPPORTED_PREDICATE|predicate is not supported in this phase: LIKE",
+            &mut resp,
+        );
+
+        assert_eq!(resp.status, "ERROR");
+        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PREDICATE");
+        assert_eq!(
+            resp.message,
+            "predicate is not supported in this phase: LIKE"
+        );
+    }
+
+    #[test]
+    fn maps_unsupported_pipeline_as_business_error() {
+        let mut resp = QueryResponse {
+            message: String::new(),
+            status: "OK".to_string(),
+            error_code: "0".to_string(),
+            execution_time: "0".to_string(),
+            data: Vec::new(),
+        };
+
+        apply_statement_outcome(
+            "RESULT|VALIDATION|UNSUPPORTED_PIPELINE|invalid physical pipeline: pipeline must end with materialize",
+            &mut resp,
+        );
+
+        assert_eq!(resp.status, "ERROR");
+        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PIPELINE");
+        assert_eq!(
+            resp.message,
+            "invalid physical pipeline: pipeline must end with materialize"
+        );
+    }
+
+    #[test]
+    fn maps_select_validation_codes_to_business_error_family() {
+        let cases = vec![
+            (
+                "UNSUPPORTED_QUERY_SHAPE",
+                "BUSINESS_UNSUPPORTED_QUERY_SHAPE",
+            ),
+            ("UNSUPPORTED_OPERATOR", "BUSINESS_UNSUPPORTED_OPERATOR"),
+            ("UNSUPPORTED_PREDICATE", "BUSINESS_UNSUPPORTED_PREDICATE"),
+            ("UNSUPPORTED_PIPELINE", "BUSINESS_UNSUPPORTED_PIPELINE"),
+        ];
+
+        for (validation_code, expected_error_code) in cases {
+            let mut resp = QueryResponse {
+                message: String::new(),
+                status: "OK".to_string(),
+                error_code: "0".to_string(),
+                execution_time: "0".to_string(),
+                data: Vec::new(),
+            };
+
+            apply_statement_outcome(
+                &format!(
+                    "RESULT|VALIDATION|{}|validation message for {}",
+                    validation_code, validation_code
+                ),
+                &mut resp,
+            );
+
+            assert_eq!(resp.status, "ERROR");
+            assert_eq!(resp.error_code, expected_error_code);
+            assert_eq!(
+                resp.message,
+                format!("validation message for {}", validation_code)
+            );
+        }
+    }
 }

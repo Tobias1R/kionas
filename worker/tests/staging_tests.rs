@@ -1,7 +1,6 @@
-use crate::storage::staging;
 use serde_json::json;
-use std::sync::Arc;
 use worker::storage::mock::MockProvider;
+use worker::storage::staging;
 
 #[tokio::test]
 async fn test_stage_promote_abort_roundtrip() {

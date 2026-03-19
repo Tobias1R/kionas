@@ -16,6 +16,15 @@ use serde_json::json;
 /// - This constant is centralized so server and planner migration can switch versions safely.
 pub const QUERY_PAYLOAD_VERSION: u8 = 2;
 
+/// What: Validation outcome code for unsupported query shape errors.
+pub const VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE: &str = "UNSUPPORTED_QUERY_SHAPE";
+/// What: Validation outcome code for invalid physical pipeline errors.
+pub const VALIDATION_CODE_UNSUPPORTED_PIPELINE: &str = "UNSUPPORTED_PIPELINE";
+/// What: Validation outcome code for unsupported physical operators.
+pub const VALIDATION_CODE_UNSUPPORTED_OPERATOR: &str = "UNSUPPORTED_OPERATOR";
+/// What: Validation outcome code for unsupported predicates.
+pub const VALIDATION_CODE_UNSUPPORTED_PREDICATE: &str = "UNSUPPORTED_PREDICATE";
+
 /// What: Canonical namespace fields used to identify query source table.
 ///
 /// Inputs:
@@ -90,6 +99,10 @@ pub enum QueryModelError {
     UnsupportedJoin,
     UnsupportedTableFactor,
     PlannerTranslationFailed(String),
+    PlannerPhysicalFailed(String),
+    InvalidPhysicalPipeline(String),
+    UnsupportedPhysicalOperator(String),
+    UnsupportedPredicate(String),
 }
 
 impl std::fmt::Display for QueryModelError {
@@ -112,11 +125,43 @@ impl std::fmt::Display for QueryModelError {
             QueryModelError::PlannerTranslationFailed(message) => {
                 write!(f, "failed to build logical plan: {}", message)
             }
+            QueryModelError::PlannerPhysicalFailed(message) => {
+                write!(f, "failed to build physical plan: {}", message)
+            }
+            QueryModelError::InvalidPhysicalPipeline(message) => {
+                write!(f, "invalid physical pipeline: {}", message)
+            }
+            QueryModelError::UnsupportedPhysicalOperator(name) => {
+                write!(
+                    f,
+                    "physical operator '{}' is not supported in this phase",
+                    name
+                )
+            }
+            QueryModelError::UnsupportedPredicate(name) => {
+                write!(f, "predicate is not supported in this phase: {}", name)
+            }
         }
     }
 }
 
 impl std::error::Error for QueryModelError {}
+
+/// What: Map query model errors to stable server validation outcome codes.
+///
+/// Inputs:
+/// - `err`: Query model error from translation or planning.
+///
+/// Output:
+/// - Canonical validation code consumed by server outcome formatting.
+pub fn validation_code_for_query_error(err: &QueryModelError) -> &'static str {
+    match err {
+        QueryModelError::InvalidPhysicalPipeline(_) => VALIDATION_CODE_UNSUPPORTED_PIPELINE,
+        QueryModelError::UnsupportedPhysicalOperator(_) => VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+        QueryModelError::UnsupportedPredicate(_) => VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+        _ => VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+    }
+}
 
 fn normalize_identifier(raw: &str) -> String {
     raw.trim()
@@ -233,6 +278,19 @@ pub fn build_select_query_dispatch_envelope(
 
     let logical_plan = crate::planner::build_logical_plan_from_select_model(&model)
         .map_err(|e| QueryModelError::PlannerTranslationFailed(e.to_string()))?;
+    let physical_plan = crate::planner::build_physical_plan_from_logical_plan(&logical_plan)
+        .map_err(|e| match e {
+            crate::planner::PlannerError::InvalidPhysicalPipeline(message) => {
+                QueryModelError::InvalidPhysicalPipeline(message)
+            }
+            crate::planner::PlannerError::UnsupportedPhysicalOperator(name) => {
+                QueryModelError::UnsupportedPhysicalOperator(name)
+            }
+            crate::planner::PlannerError::UnsupportedPredicate(name) => {
+                QueryModelError::UnsupportedPredicate(name)
+            }
+            _ => QueryModelError::PlannerPhysicalFailed(e.to_string()),
+        })?;
 
     let payload = json!({
         "version": model.version,
@@ -243,6 +301,7 @@ pub fn build_select_query_dispatch_envelope(
         "selection": model.selection,
         "sql": model.sql,
         "logical_plan": logical_plan,
+        "physical_plan": physical_plan,
     })
     .to_string();
 
@@ -256,7 +315,12 @@ pub fn build_select_query_dispatch_envelope(
 
 #[cfg(test)]
 mod tests {
-    use super::build_select_query_dispatch_envelope;
+    use super::{
+        QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+        VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+        VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE, build_select_query_dispatch_envelope,
+        validation_code_for_query_error,
+    };
     use crate::parser::sql::parse_query;
     use serde_json::Value;
 
@@ -276,6 +340,7 @@ mod tests {
         assert!(envelope.payload.contains("\"statement\":\"Select\""));
         assert!(envelope.payload.contains("\"database\":\"sales\""));
         assert!(envelope.payload.contains("\"logical_plan\""));
+        assert!(envelope.payload.contains("\"physical_plan\""));
         assert_eq!(envelope.table, "users");
     }
 
@@ -354,5 +419,105 @@ mod tests {
             .and_then(Value::as_array)
             .expect("logical_plan.projection.expressions should be an array");
         assert_eq!(projection_exprs.len(), 2);
+
+        let physical_plan = parsed
+            .get("physical_plan")
+            .expect("payload should include physical_plan");
+        let operators = physical_plan
+            .get("operators")
+            .and_then(Value::as_array)
+            .expect("physical_plan.operators should be an array");
+        assert!(operators.len() >= 3);
+    }
+
+    #[test]
+    fn rejects_deferred_predicate_shapes() {
+        let statements = parse_query("SELECT id FROM sales.public.users WHERE name LIKE 'a%'")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .expect_err("must reject deferred predicate");
+
+        match err {
+            QueryModelError::UnsupportedPredicate(name) => assert_eq!(name, "LIKE"),
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[test]
+    fn maps_validation_codes_from_query_model_errors() {
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::InvalidPhysicalPipeline(
+                "pipeline must end with materialize".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_PIPELINE
+        );
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::UnsupportedPhysicalOperator(
+                "HashJoin".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_OPERATOR
+        );
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::UnsupportedPredicate(
+                "LIKE".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_PREDICATE
+        );
+    }
+
+    #[test]
+    fn maps_all_query_model_error_variants_to_expected_codes() {
+        let cases = vec![
+            (
+                QueryModelError::UnsupportedSetOperation,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::UnsupportedMultiTableFrom,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::UnsupportedJoin,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::UnsupportedTableFactor,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::PlannerTranslationFailed("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::PlannerPhysicalFailed("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::InvalidPhysicalPipeline("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_PIPELINE,
+            ),
+            (
+                QueryModelError::UnsupportedPhysicalOperator("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+            ),
+            (
+                QueryModelError::UnsupportedPredicate("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+            ),
+        ];
+
+        for (err, expected_code) in cases {
+            assert_eq!(
+                validation_code_for_query_error(&err),
+                expected_code,
+                "unexpected validation code for error variant: {err:?}"
+            );
+        }
     }
 }

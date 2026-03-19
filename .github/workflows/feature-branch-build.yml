@@ -29,7 +29,8 @@ jobs:
             libssl-dev \
             libzstd-dev \
             zlib1g-dev \
-            librdkafka-dev
+            librdkafka-dev \ 
+            protobuf-compiler
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

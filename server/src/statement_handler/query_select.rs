@@ -1,7 +1,9 @@
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
-use kionas::sql::query_model::build_select_query_dispatch_envelope;
+use kionas::sql::query_model::{
+    QueryModelError, build_select_query_dispatch_envelope, validation_code_for_query_error,
+};
 use std::collections::HashMap;
 
 const OUTCOME_PREFIX: &str = "RESULT";
@@ -134,7 +136,11 @@ pub(crate) async fn handle_select_query(
                 ),
             )
         }
-        Err(e) => format_outcome("VALIDATION", "UNSUPPORTED_QUERY_SHAPE", e.to_string()),
+        Err(e) => format_outcome(
+            "VALIDATION",
+            validation_code_for_query_error(&e),
+            e.to_string(),
+        ),
     }
 }
 
@@ -158,7 +164,11 @@ pub(crate) fn select_ast_from_statement(stmt: &Statement) -> Result<SelectQueryA
 #[cfg(test)]
 mod tests {
     use kionas::parser::sql::parse_query;
-    use kionas::sql::query_model::build_select_query_dispatch_envelope;
+    use kionas::sql::query_model::{
+        QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+        VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+        build_select_query_dispatch_envelope, validation_code_for_query_error,
+    };
 
     #[test]
     fn minimal_select_payload_builds() {
@@ -211,5 +221,27 @@ mod tests {
         assert_eq!(database, "sales");
         assert_eq!(schema, "public");
         assert_eq!(table, "users");
+    }
+
+    #[test]
+    fn maps_capability_error_codes() {
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::InvalidPhysicalPipeline(
+                "pipeline must end with materialize".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_PIPELINE
+        );
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::UnsupportedPhysicalOperator(
+                "HashJoin".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_OPERATOR
+        );
+        assert_eq!(
+            validation_code_for_query_error(&QueryModelError::UnsupportedPredicate(
+                "LIKE".to_string(),
+            )),
+            VALIDATION_CODE_UNSUPPORTED_PREDICATE
+        );
     }
 }

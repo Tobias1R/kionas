@@ -12,6 +12,9 @@ env_logger.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
 tonic.workspace = true
+tonic14 = { package = "tonic", version = "0.14.5", features = ["transport"] }
 chrono.workspace = true
 jsonwebtoken = "8.1"
+base64 = "0.22"
+futures = "0.3"
 
