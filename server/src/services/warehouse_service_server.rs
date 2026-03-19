@@ -22,11 +22,12 @@ use crate::services::request_context::RequestContext;
 /// - `resp`: Mutable query response to update.
 ///
 /// Output:
-/// - Updates `resp.message`, `resp.status`, and `resp.error_code` in-place.
+/// - Updates `resp.message`, `resp.status`, `resp.error_code`, and optional `resp.data` in-place.
 ///
 /// Details:
 /// - Structured outputs use `RESULT|<category>|<code>|<message>`.
 /// - Legacy plain-text outputs still map to generic infra failures when applicable.
+/// - For `QUERY_DISPATCHED`, response data carries the query handle bytes.
 fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
     let mut parts = result.splitn(4, '|');
     let prefix = parts.next().unwrap_or_default();
@@ -47,6 +48,13 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
     let message = parts.next().unwrap_or("unknown error");
 
     resp.message = message.to_string();
+
+    if code == "QUERY_DISPATCHED" {
+        if let Some(handle) = extract_query_handle_from_message(message) {
+            resp.data = handle.into_bytes();
+        }
+    }
+
     match category {
         "SUCCESS" => {
             resp.status = "OK".to_string();
@@ -61,6 +69,25 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
             resp.error_code = format!("INFRA_{}", code);
         }
     }
+}
+
+/// What: Extract a query handle location from a query success message.
+///
+/// Inputs:
+/// - `message`: Query success message.
+///
+/// Output:
+/// - `Some(handle)` when a `(location: <handle>)` suffix exists.
+/// - `None` when message does not contain a handle suffix.
+fn extract_query_handle_from_message(message: &str) -> Option<String> {
+    let marker = "(location: ";
+    let start = message.rfind(marker)? + marker.len();
+    let end = message[start..].find(')')? + start;
+    let handle = message[start..end].trim();
+    if handle.is_empty() {
+        return None;
+    }
+    Some(handle.to_string())
 }
 
 #[derive(Clone)]
@@ -144,7 +171,7 @@ impl WarehouseServiceTrait for WarehouseService {
 
         match parse_query(&query_text) {
             Ok(statements) => {
-                println!("Parsed statements: {:?}", statements);
+                log::debug!("Parsed statements: {:?}", statements);
 
                 // Acquire TaskManager reference without holding shared_data lock across awaits
                 let _task_manager = {
@@ -155,14 +182,14 @@ impl WarehouseServiceTrait for WarehouseService {
                 for stmt in &statements {
                     // Execute handler synchronously (existing logic performs dispatch to worker)
                     let result = handle_statement(stmt, &session_id, &shared_data).await;
-                    println!("Execution result: {}", result);
+                    log::debug!("Execution result: {}", result);
                     apply_statement_outcome(&result, &mut resp);
 
                     // statement_handler now performs any metastore actions after dispatch.
                 }
             }
             Err(e) => {
-                println!("Failed to parse query: {}", e);
+                log::debug!("Failed to parse query: {}", e);
                 resp.status = "ERROR".to_string();
                 resp.error_code = "1".to_string();
                 resp.message = e;
@@ -170,5 +197,45 @@ impl WarehouseServiceTrait for WarehouseService {
         }
 
         Ok(Response::new(resp))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_statement_outcome, extract_query_handle_from_message};
+    use crate::services::warehouse_service_server::warehouse_service::QueryResponse;
+
+    #[test]
+    fn extracts_query_handle_from_message_suffix() {
+        let msg = "query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)";
+        let handle = extract_query_handle_from_message(msg).expect("handle must be parsed");
+        assert_eq!(
+            handle,
+            "flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1"
+        );
+    }
+
+    #[test]
+    fn maps_query_dispatched_handle_into_response_data() {
+        let mut resp = QueryResponse {
+            message: String::new(),
+            status: "OK".to_string(),
+            error_code: "0".to_string(),
+            execution_time: "0".to_string(),
+            data: Vec::new(),
+        };
+
+        apply_statement_outcome(
+            "RESULT|SUCCESS|QUERY_DISPATCHED|query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)",
+            &mut resp,
+        );
+
+        let decoded = String::from_utf8(resp.data.clone()).expect("response data must be utf8");
+        assert_eq!(resp.status, "OK");
+        assert_eq!(resp.error_code, "0");
+        assert_eq!(
+            decoded,
+            "flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1"
+        );
     }
 }

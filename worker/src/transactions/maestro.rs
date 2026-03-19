@@ -547,6 +547,39 @@ pub async fn handle_execute_task(
         }
     }
 
+    if operation == "query" {
+        let task = match first_task.as_ref() {
+            Some(t) => t,
+            None => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: "query task payload is missing".to_string(),
+                    result_location: String::new(),
+                };
+            }
+        };
+
+        match crate::services::query::execute_query_task_stub(&shared, task, &session_id).await {
+            Ok(location) => {
+                shared
+                    .set_task_result_location(&session_id, &task.task_id, &location)
+                    .await;
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "ok".to_string(),
+                    error: String::new(),
+                    result_location: location,
+                };
+            }
+            Err(e) => {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: e,
+                    result_location: String::new(),
+                };
+            }
+        }
+    }
+
     let explicit_delta_table_uri = first_task.as_ref().and_then(|task| {
         task.params
             .get("table_uri")
