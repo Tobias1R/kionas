@@ -615,11 +615,33 @@ pub async fn handle_execute_task(
     let result_location = delta_table_uri
         .clone()
         .unwrap_or_else(|| "arrow-flight-endpoint".to_string());
+
+    let stage_id = first_task
+        .as_ref()
+        .and_then(|task| task.params.get("stage_id").cloned())
+        .filter(|s| !s.trim().is_empty());
+    let partition_count = first_task
+        .as_ref()
+        .and_then(|task| task.params.get("partition_count"))
+        .and_then(|value| value.parse::<u32>().ok());
+    let upstream_stage_ids = first_task
+        .as_ref()
+        .and_then(|task| task.params.get("upstream_stage_ids").cloned())
+        .unwrap_or_else(|| "[]".to_string());
+    let partition_spec = first_task
+        .as_ref()
+        .and_then(|task| task.params.get("partition_spec").cloned())
+        .unwrap_or_else(|| "\"Single\"".to_string());
+
     shared
         .set_task_result_location(&session_id, &task_id, &result_location)
         .await;
     let result_location_for_spawn = result_location.clone();
     let shared_clone = shared.clone();
+    let stage_id_for_spawn = stage_id.clone();
+    let partition_count_for_spawn = partition_count;
+    let upstream_stage_ids_for_spawn = upstream_stage_ids.clone();
+    let partition_spec_for_spawn = partition_spec.clone();
     tokio::spawn(async move {
         let mut status = "succeeded".to_string();
         let mut error_message = String::new();
@@ -695,11 +717,28 @@ pub async fn handle_execute_task(
         if let Some(pool_arc) = ensure_pool(shared_clone.clone()).await {
             match pool_arc.get().await {
                 Ok(mut pooled_client) => {
+                    let mut metadata = std::collections::HashMap::new();
+                    metadata.insert(
+                        "upstream_stage_ids".to_string(),
+                        upstream_stage_ids_for_spawn.clone(),
+                    );
+                    metadata.insert(
+                        "partition_spec".to_string(),
+                        partition_spec_for_spawn.clone(),
+                    );
+
+                    let partition_completed = partition_count_for_spawn
+                        .map(|count| if status == "succeeded" { count } else { 0 });
+
                     let update = crate::interops_service::TaskUpdateRequest {
                         task_id: task_id.clone(),
                         status,
                         result_location: result_location_for_spawn.clone(),
                         error: error_message,
+                        stage_id: stage_id_for_spawn.clone(),
+                        partition_count: partition_count_for_spawn,
+                        partition_completed,
+                        metadata,
                     };
                     if let Err(e) = pooled_client.task_update(tonic::Request::new(update)).await {
                         log::error!(

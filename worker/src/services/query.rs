@@ -273,6 +273,64 @@ fn resolve_query_result_endpoint(default_host: &str, default_worker_port: u32) -
     )
 }
 
+/// What: Resolve canonical namespace from stage task params.
+///
+/// Inputs:
+/// - `task`: Query task carrying stage params.
+///
+/// Output:
+/// - Canonical namespace values used for deterministic result paths.
+fn resolve_query_namespace_from_params(
+    task: &worker_service::Task,
+) -> Result<QueryNamespace, String> {
+    let database = task
+        .params
+        .get("database_name")
+        .map(|value| normalize_identifier(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query stage task missing database_name param".to_string())?;
+    let schema = task
+        .params
+        .get("schema_name")
+        .map(|value| normalize_identifier(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query stage task missing schema_name param".to_string())?;
+    let table = task
+        .params
+        .get("table_name")
+        .map(|value| normalize_identifier(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query stage task missing table_name param".to_string())?;
+
+    for value in [&database, &schema, &table] {
+        if !is_valid_namespace_name(value) {
+            return Err(format!(
+                "invalid namespace value '{}': only [a-zA-Z0-9_-] are allowed",
+                value
+            ));
+        }
+    }
+
+    Ok(QueryNamespace {
+        database,
+        schema,
+        table,
+    })
+}
+
+/// What: Determine whether the task is dispatched as a distributed stage.
+///
+/// Inputs:
+/// - `task`: Query task metadata and params.
+///
+/// Output:
+/// - `true` when stage params are present.
+fn is_stage_query_task(task: &worker_service::Task) -> bool {
+    task.params
+        .get("stage_id")
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 /// What: Parse and validate canonical SELECT query payload.
 ///
 /// Inputs:
@@ -416,7 +474,11 @@ pub(crate) async fn execute_query_task_stub(
     task: &worker_service::Task,
     session_id: &str,
 ) -> Result<String, String> {
-    let namespace = resolve_query_namespace(task)?;
+    let namespace = if is_stage_query_task(task) {
+        resolve_query_namespace_from_params(task)?
+    } else {
+        resolve_query_namespace(task)?
+    };
     let result_location = build_result_location(shared, task, session_id, &namespace);
 
     crate::services::query_execution::execute_query_task(
@@ -433,7 +495,10 @@ pub(crate) async fn execute_query_task_stub(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_query_namespace, resolve_query_result_endpoint_with_overrides};
+    use super::{
+        is_stage_query_task, resolve_query_namespace, resolve_query_namespace_from_params,
+        resolve_query_result_endpoint_with_overrides,
+    };
 
     #[test]
     fn accepts_unit_variant_string_operator_shape() {
@@ -515,6 +580,30 @@ mod tests {
 
         let err = resolve_query_namespace(&task).expect_err("must reject non-select statement");
         assert!(err.contains("only Select"));
+    }
+
+    #[test]
+    fn resolves_namespace_from_stage_params() {
+        let mut params = std::collections::HashMap::new();
+        params.insert("stage_id".to_string(), "2".to_string());
+        params.insert("database_name".to_string(), "Sales".to_string());
+        params.insert("schema_name".to_string(), "Public".to_string());
+        params.insert("table_name".to_string(), "Users".to_string());
+
+        let task = crate::services::worker_service_server::worker_service::Task {
+            task_id: "t1".to_string(),
+            operation: "query".to_string(),
+            input: "[]".to_string(),
+            output: String::new(),
+            params,
+        };
+
+        assert!(is_stage_query_task(&task));
+        let namespace = resolve_query_namespace_from_params(&task)
+            .expect("stage task must resolve namespace from params");
+        assert_eq!(namespace.database, "sales");
+        assert_eq!(namespace.schema, "public");
+        assert_eq!(namespace.table, "users");
     }
 
     #[test]

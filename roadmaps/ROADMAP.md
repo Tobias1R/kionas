@@ -46,6 +46,7 @@ Build a decent client to read inputs and display data;
 6.2 Compile distributed physical plan into task DAGs routed through existing TaskManager and worker pools.
 6.3 Add worker coordination protocol for stage dependencies, completion signaling, and retry-safe progress updates.
 6.4 Implement first distributed use-case slice (parallel scan + merge) before joins/aggregations.
+[X] DONE
 
 7. Phase 6: Authentication and Authorization Revamp
 7.1 Propagate auth context explicitly through query execution artifacts where needed (server dispatch, worker execution, Flight retrieval).

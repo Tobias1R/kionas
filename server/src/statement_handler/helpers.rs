@@ -1,4 +1,5 @@
 use crate::warehouse::state::SharedData;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 use crate::workers::PooledConn;
@@ -211,4 +212,185 @@ pub async fn run_task_for_input_with_params(
             resp.error,
         )))
     }
+}
+
+/// What: Execute stage task groups in dependency order for distributed query scheduling.
+///
+/// Inputs:
+/// - `shared_data`: Shared server state used for session and worker resolution.
+/// - `session_id`: Active session id.
+/// - `stage_groups`: Compiled stage groups with dependency metadata.
+/// - `timeout_secs`: Per-stage dispatch timeout.
+///
+/// Output:
+/// - Final stage result location when stage execution succeeds.
+/// - Error when no schedulable stage remains or a stage dispatch fails.
+///
+/// Details:
+/// - This scheduler performs a deterministic topological walk over stage dependencies.
+/// - Current implementation dispatches all partitions of a ready stage in parallel and marks the stage complete only when every partition succeeds.
+pub async fn run_stage_groups_for_input(
+    shared_data: &SharedData,
+    session_id: &str,
+    stage_groups: &[crate::statement_handler::distributed_dag::StageTaskGroup],
+    timeout_secs: u64,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if stage_groups.is_empty() {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stage scheduler received no stage groups",
+        )));
+    }
+
+    let mut groups_by_stage =
+        HashMap::<u32, Vec<crate::statement_handler::distributed_dag::StageTaskGroup>>::new();
+    let mut deps_by_stage = HashMap::<u32, Vec<u32>>::new();
+    for group in stage_groups {
+        groups_by_stage
+            .entry(group.stage_id)
+            .or_default()
+            .push(group.clone());
+        deps_by_stage
+            .entry(group.stage_id)
+            .or_insert_with(|| group.upstream_stage_ids.clone());
+    }
+
+    for groups in groups_by_stage.values_mut() {
+        groups.sort_by_key(|group| group.partition_index);
+    }
+
+    let mut completed = HashSet::<u32>::new();
+    let mut result_by_stage = HashMap::<u32, String>::new();
+
+    while completed.len() < groups_by_stage.len() {
+        let next_stage_id = groups_by_stage
+            .keys()
+            .filter(|stage_id| !completed.contains(stage_id))
+            .filter(|stage_id| {
+                deps_by_stage
+                    .get(stage_id)
+                    .map(|deps| deps.iter().all(|upstream| completed.contains(upstream)))
+                    .unwrap_or(true)
+            })
+            .copied()
+            .min();
+
+        let stage_id = match next_stage_id {
+            Some(value) => value,
+            None => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no schedulable stage found; dependency graph may be cyclic",
+                )));
+            }
+        };
+
+        let stage_partitions = groups_by_stage.get(&stage_id).cloned().ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("missing stage partition groups for stage {}", stage_id),
+            )) as Box<dyn Error + Send + Sync>
+        })?;
+
+        let expected_partition_count = stage_partitions
+            .first()
+            .map(|group| group.partition_count)
+            .unwrap_or(0);
+        if expected_partition_count == 0
+            || stage_partitions.len() != expected_partition_count as usize
+        {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "stage {} partition fan-out mismatch: expected {} tasks, found {}",
+                    stage_id,
+                    expected_partition_count,
+                    stage_partitions.len()
+                ),
+            )));
+        }
+
+        log::info!(
+            "distributed scheduler dispatching stage_id={} partitions={} upstream={:?}",
+            stage_id,
+            expected_partition_count,
+            stage_partitions[0].upstream_stage_ids
+        );
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for group in stage_partitions {
+            let shared_clone = shared_data.clone();
+            let session_id_owned = session_id.to_string();
+            join_set.spawn(async move {
+                let partition_location = run_task_for_input_with_params(
+                    &shared_clone,
+                    &session_id_owned,
+                    &group.operation,
+                    group.payload.clone(),
+                    group.params.clone(),
+                    timeout_secs,
+                )
+                .await;
+
+                (group.partition_index, partition_location)
+            });
+        }
+
+        let mut stage_locations = Vec::<(u32, String)>::new();
+        while let Some(joined) = join_set.join_next().await {
+            let (partition_index, partition_result) = joined.map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("stage {} partition task panicked: {}", stage_id, e),
+                )) as Box<dyn Error + Send + Sync>
+            })?;
+
+            let location = partition_result.map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!(
+                        "stage {} partition {} dispatch failed: {}",
+                        stage_id, partition_index, e
+                    ),
+                )) as Box<dyn Error + Send + Sync>
+            })?;
+            stage_locations.push((partition_index, location));
+        }
+
+        stage_locations.sort_by_key(|(partition_index, _)| *partition_index);
+        let stage_result_location = stage_locations
+            .first()
+            .map(|(_, location)| location.clone())
+            .ok_or_else(|| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("stage {} completed without partition results", stage_id),
+                )) as Box<dyn Error + Send + Sync>
+            })?;
+
+        completed.insert(stage_id);
+        result_by_stage.insert(stage_id, stage_result_location);
+    }
+
+    let final_stage = stage_groups
+        .iter()
+        .max_by_key(|group| group.stage_id)
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "failed to determine final stage",
+            )) as Box<dyn Error + Send + Sync>
+        })?;
+
+    result_by_stage
+        .remove(&final_stage.stage_id)
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "final stage {} has no result location",
+                    final_stage.stage_id
+                ),
+            )) as Box<dyn Error + Send + Sync>
+        })
 }

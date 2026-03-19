@@ -1,10 +1,14 @@
+use crate::statement_handler::distributed_dag;
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
+use kionas::planner::PhysicalPlan;
+use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
-    QueryModelError, build_select_query_dispatch_envelope, validation_code_for_query_error,
+    build_select_query_dispatch_envelope, validation_code_for_query_error,
 };
-use std::collections::HashMap;
+use serde_json::Value;
+use uuid::Uuid;
 
 const OUTCOME_PREFIX: &str = "RESULT";
 
@@ -93,18 +97,82 @@ pub(crate) async fn handle_select_query(
             let schema = canonical_query.schema;
             let table = canonical_query.table;
 
-            let mut params = HashMap::new();
-            params.insert("database_name".to_string(), database.clone());
-            params.insert("schema_name".to_string(), schema.clone());
-            params.insert("table_name".to_string(), table.clone());
-            params.insert("query_kind".to_string(), "select".to_string());
+            let payload_value: Value = match serde_json::from_str(&payload) {
+                Ok(value) => value,
+                Err(e) => {
+                    return format_outcome(
+                        "INFRA",
+                        "WORKER_QUERY_FAILED",
+                        format!("failed to parse canonical query payload: {}", e),
+                    );
+                }
+            };
 
-            let worker_result_location = match helpers::run_task_for_input_with_params(
+            let physical_value = match payload_value.get("physical_plan") {
+                Some(value) => value.clone(),
+                None => {
+                    return format_outcome(
+                        "INFRA",
+                        "WORKER_QUERY_FAILED",
+                        "canonical query payload missing physical_plan",
+                    );
+                }
+            };
+
+            let physical_plan: PhysicalPlan = match serde_json::from_value(physical_value) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return format_outcome(
+                        "INFRA",
+                        "WORKER_QUERY_FAILED",
+                        format!("failed to decode physical_plan from payload: {}", e),
+                    );
+                }
+            };
+
+            let distributed_plan = distributed_from_physical_plan(&physical_plan);
+            if let Err(e) = validate_distributed_physical_plan(&distributed_plan) {
+                return format_outcome(
+                    "INFRA",
+                    "WORKER_QUERY_FAILED",
+                    format!("distributed plan validation failed: {}", e),
+                );
+            }
+
+            let mut stage_groups =
+                match distributed_dag::compile_stage_task_groups(&distributed_plan, "query") {
+                    Ok(groups) => groups,
+                    Err(e) => {
+                        return format_outcome(
+                            "INFRA",
+                            "WORKER_QUERY_FAILED",
+                            format!("failed to compile distributed stage groups: {}", e),
+                        );
+                    }
+                };
+
+            let query_run_id = Uuid::new_v4().to_string();
+
+            for group in &mut stage_groups {
+                group
+                    .params
+                    .insert("database_name".to_string(), database.clone());
+                group
+                    .params
+                    .insert("schema_name".to_string(), schema.clone());
+                group.params.insert("table_name".to_string(), table.clone());
+                group
+                    .params
+                    .insert("query_kind".to_string(), "select".to_string());
+                group
+                    .params
+                    .insert("query_run_id".to_string(), query_run_id.clone());
+            }
+
+            let worker_result_location = match helpers::run_stage_groups_for_input(
                 shared_data,
                 session_id,
-                "query",
-                payload,
-                params,
+                &stage_groups,
                 120,
             )
             .await

@@ -11,6 +11,7 @@ pub enum PlannerError {
     EmptyRelation,
     EmptyPhysicalPlan,
     InvalidPhysicalPipeline(String),
+    InvalidDistributedPlan(String),
     UnsupportedPhysicalOperator(String),
     UnsupportedPredicate(String),
 }
@@ -25,6 +26,9 @@ impl std::fmt::Display for PlannerError {
             }
             PlannerError::InvalidPhysicalPipeline(message) => {
                 write!(f, "invalid physical pipeline: {}", message)
+            }
+            PlannerError::InvalidDistributedPlan(message) => {
+                write!(f, "invalid distributed plan: {}", message)
             }
             PlannerError::UnsupportedPhysicalOperator(name) => {
                 write!(

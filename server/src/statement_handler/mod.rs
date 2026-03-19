@@ -1,6 +1,7 @@
 pub(crate) mod create_database;
 pub(crate) mod create_schema;
 pub(crate) mod create_table;
+pub(crate) mod distributed_dag;
 pub(crate) mod helpers;
 pub(crate) mod query_select;
 pub mod use_warehouse;

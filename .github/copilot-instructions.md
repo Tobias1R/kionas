@@ -162,5 +162,9 @@ Status values:
 2. Each `Done` item includes concrete evidence reference.
 3. `Deferred` items include rationale and are explicitly non-blocking.
 4. Final signoff decision is recorded in this file.
+
+## Environment and Parameters
+- Inform all environment variables required for the phase, if any. And where in the codebase they are expected to be used.
+- Inform any parameters that are expected to be used for the phase, if any. And where in the codebase they are expected to be used.
 ```
 
