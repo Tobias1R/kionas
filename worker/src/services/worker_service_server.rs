@@ -80,7 +80,9 @@ async fn load_result_metadata(
         .get_object(&metadata_key)
         .await
         .map_err(|e| tonic::Status::internal(format!("failed to read {}: {}", metadata_key, e)))?
-        .ok_or_else(|| tonic::Status::not_found(format!("metadata not found at {}", metadata_key)))?;
+        .ok_or_else(|| {
+            tonic::Status::not_found(format!("metadata not found at {}", metadata_key))
+        })?;
 
     serde_json::from_slice::<Value>(&bytes)
         .map_err(|e| tonic::Status::internal(format!("failed to parse metadata JSON: {}", e)))
@@ -271,7 +273,7 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
             .await
             .ok_or_else(|| {
                 tonic::Status::not_found(format!(
-                    "no result location found for task_id={}",
+                    "result location missing or expired for task_id={}",
                     req.task_id
                 ))
             })?;

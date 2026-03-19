@@ -138,6 +138,18 @@ fn parse_descriptor_worker_scope(descriptor: &FlightDescriptor) -> Result<String
     ))
 }
 
+/// What: Map an upstream Flight error into a proxy status while preserving status code.
+///
+/// Inputs:
+/// - `status`: Upstream tonic status.
+/// - `context`: Short operation context for diagnostics.
+///
+/// Output:
+/// - Proxy status with same code and contextualized message.
+fn map_upstream_status(status: Status, context: &str) -> Status {
+    Status::new(status.code(), format!("{}: {}", context, status.message()))
+}
+
 #[tonic14::async_trait]
 impl FlightService for ProxyFlightService {
     type HandshakeStream = FlightStream<HandshakeResponse>;
@@ -184,7 +196,10 @@ impl FlightService for ProxyFlightService {
             })?;
 
         let mut client = FlightServiceClient::new(channel);
-        client.get_flight_info(descriptor).await
+        client
+            .get_flight_info(descriptor)
+            .await
+            .map_err(|e| map_upstream_status(e, "worker GetFlightInfo failed"))
     }
 
     async fn poll_flight_info(
@@ -216,7 +231,10 @@ impl FlightService for ProxyFlightService {
             })?;
 
         let mut client = FlightServiceClient::new(channel);
-        client.get_schema(descriptor).await
+        client
+            .get_schema(descriptor)
+            .await
+            .map_err(|e| map_upstream_status(e, "worker GetSchema failed"))
     }
 
     async fn do_get(
@@ -242,7 +260,7 @@ impl FlightService for ProxyFlightService {
         let upstream = client
             .do_get(ticket)
             .await
-            .map_err(|e| Status::internal(format!("worker DoGet failed: {}", e)))?
+            .map_err(|e| map_upstream_status(e, "worker DoGet failed"))?
             .into_inner();
 
         let output = futures::stream::try_unfold(upstream, |mut stream| async move {

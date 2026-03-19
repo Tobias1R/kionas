@@ -4,9 +4,8 @@ use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
-    FlightInfo, Location,
-    HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, Location, PutResult, SchemaResult, Ticket,
 };
 use base64::Engine;
 use bytes::Bytes;
@@ -599,12 +598,14 @@ impl FlightService for WorkerFlightService {
             .get_task_result_location(&session_id, &task_id)
             .await
             .ok_or_else(|| {
-                Status::not_found(format!("no result location found for task_id={}", task_id))
+                Status::not_found(format!(
+                    "result location missing or expired for task_id={}",
+                    task_id
+                ))
             })?;
 
         let batches =
-            load_result_batches(&self.shared_data, &result_location, &session_id, &task_id)
-                .await?;
+            load_result_batches(&self.shared_data, &result_location, &session_id, &task_id).await?;
         let schema = batches
             .first()
             .map(RecordBatch::schema)
@@ -663,12 +664,14 @@ impl FlightService for WorkerFlightService {
             .get_task_result_location(&session_id, &task_id)
             .await
             .ok_or_else(|| {
-                Status::not_found(format!("no result location found for task_id={}", task_id))
+                Status::not_found(format!(
+                    "result location missing or expired for task_id={}",
+                    task_id
+                ))
             })?;
 
         let batches =
-            load_result_batches(&self.shared_data, &result_location, &session_id, &task_id)
-                .await?;
+            load_result_batches(&self.shared_data, &result_location, &session_id, &task_id).await?;
         let schema = batches
             .first()
             .map(RecordBatch::schema)
@@ -695,7 +698,10 @@ impl FlightService for WorkerFlightService {
             .get_task_result_location(&session_id, &task_id)
             .await
             .ok_or_else(|| {
-                Status::not_found(format!("no result location found for task_id={}", task_id))
+                Status::not_found(format!(
+                    "result location missing or expired for task_id={}",
+                    task_id
+                ))
             })?;
 
         let batches =

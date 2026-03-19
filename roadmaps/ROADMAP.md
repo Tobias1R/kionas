@@ -35,9 +35,11 @@ Build from the current working query-dispatch foundation into a full distributed
 5.2 Complete worker Flight service surface needed by proxy and clients (GetFlightInfo/GetSchema/ListFlights priority after DoGet).
 5.3 Standardize ticket format and lifecycle (session/task/worker scoping, expiration, validation, replay constraints).
 5.4 Add end-to-end integration tests: server query -> worker execution -> proxy retrieval -> client decode.
+[X] DONE
 
 [INTERMISSION]
 Build a decent client to read inputs and display data;
+[X] DONE
 
 6. Phase 5: Distributed Physical Plan and Task Graph
 6.1 Introduce distributed physical plan primitives (stage graph, exchange/shuffle boundaries, partition specs).
