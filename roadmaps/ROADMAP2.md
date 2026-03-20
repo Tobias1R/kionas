@@ -64,9 +64,21 @@ Roadmap 2 continues the validated loop client -> server -> worker -> flight -> c
 5.1 Introduce minimal JOIN semantics with explicit constraints (INNER equi-join first).
 5.2 Add planner/runtime contracts for multi-relation modeling and JOIN operator execution.
 5.3 Add explain and diagnostics visibility for JOIN strategy and predicates.
+[X] DONE
+
+[INTERMISSION CLEANUPS - WORKER]
+- Breakdown the modules worker\src\services\query_execution.rs worker\src\services\query_join.rs and worker\src\services\query.rs
+Lets discuss a new place for this code. They shouldnt be here in services
+[IN PROGRESS]
+
+### Intermission Cleanup Resolution (Worker)
+- Decision: move query runtime ownership from `services` to a new top-level `execution` module under worker.
+- Initial implementation started with execution scaffold and first module moves (query/join).
+- Technical deep dive: [roadmaps/dive-in/roadmap2_divein_intermission_worker_cleanup.md](roadmaps/dive-in/roadmap2_divein_intermission_worker_cleanup.md)
+- Closure matrix: [roadmaps/ROADMAP2_INTERMISSION_WORKER_CLEANUP_MATRIX.md](roadmaps/ROADMAP2_INTERMISSION_WORKER_CLEANUP_MATRIX.md)
 
 6. Phase 6: GROUP foundation
-6.1 Introduce minimal GROUP semantics with explicit constraints and deterministic aggregate behavior.
+6.1 Introduce GROUP semantics with explicit constraints and deterministic aggregate behavior.
 6.2 Add planner/runtime contracts for aggregate partial/final metadata.
 6.3 Add observability hooks for aggregation execution diagnostics.
 

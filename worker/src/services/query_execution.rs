@@ -1,10 +1,6 @@
-use crate::services::query::QueryNamespace;
-use crate::services::query_join::apply_hash_join_pipeline;
+use crate::execution::query::QueryNamespace;
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
-use crate::storage::exchange::{
-    list_stage_exchange_data_keys, stage_exchange_data_key, stage_exchange_metadata_key,
-};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray,
 };
@@ -13,46 +9,8 @@ use arrow::compute::kernels::cast::cast;
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use kionas::planner::{
-    PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
-    PhysicalSortExpr,
-};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use std::collections::{BTreeSet, HashMap};
-use std::io::Cursor;
+use kionas::planner::{PhysicalExpr, PhysicalLimitSpec, PhysicalSortExpr};
 use std::sync::Arc;
-use url::Url;
-
-/// What: Executable subset extracted from validated physical operators.
-///
-/// Inputs:
-/// - `filter_sql`: Optional raw SQL predicate for simple conjunction filtering.
-/// - `projection_exprs`: Ordered projection expressions from payload.
-///
-/// Output:
-/// - Runtime projection/filter directives for the local worker pipeline.
-#[derive(Debug, Clone)]
-struct RuntimePlan {
-    filter_sql: Option<String>,
-    join_spec: Option<PhysicalJoinSpec>,
-    projection_exprs: Vec<PhysicalExpr>,
-    sort_exprs: Vec<PhysicalSortExpr>,
-    limit_spec: Option<PhysicalLimitSpec>,
-    has_materialize: bool,
-}
-
-#[derive(Debug, Clone)]
-struct StageExecutionContext {
-    stage_id: u32,
-    upstream_stage_ids: Vec<u32>,
-    upstream_partition_counts: HashMap<u32, u32>,
-    partition_count: u32,
-    partition_index: u32,
-    query_run_id: String,
-}
 
 #[derive(Debug, Clone)]
 enum FilterValue {
@@ -78,13 +36,6 @@ struct FilterClause {
     value: FilterValue,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct QueryArtifactMetadata {
-    key: String,
-    size_bytes: u64,
-    checksum_fnv64: String,
-}
-
 /// What: Execute validated query payload on the worker and materialize deterministic artifacts.
 ///
 /// Inputs:
@@ -97,6 +48,7 @@ struct QueryArtifactMetadata {
 /// Output:
 /// - `Ok(())` when execution succeeds and parquet artifacts are persisted.
 /// - `Err(message)` when runtime execution or storage operations fail.
+#[allow(dead_code)]
 pub(crate) async fn execute_query_task(
     shared: &SharedData,
     task: &worker_service::Task,
@@ -104,643 +56,14 @@ pub(crate) async fn execute_query_task(
     namespace: &QueryNamespace,
     result_location: &str,
 ) -> Result<(), String> {
-    let auth_scope = task
-        .params
-        .get("__auth_scope")
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "query authorization scope metadata is missing".to_string())?;
-    let rbac_user = task
-        .params
-        .get("__rbac_user")
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "query rbac_user metadata is missing".to_string())?;
-    let rbac_role = task
-        .params
-        .get("__rbac_role")
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| "query rbac_role metadata is missing".to_string())?;
-
-    let expected_scope = format!(
-        "select:{}.{}.{}",
-        namespace.database, namespace.schema, namespace.table
-    );
-    if auth_scope != expected_scope && auth_scope != "select:*" && auth_scope != "select:*.*.*" {
-        return Err(format!(
-            "query authorization denied for principal {} with role {} on {}",
-            rbac_user, rbac_role, expected_scope
-        ));
-    }
-
-    let runtime_plan = extract_runtime_plan(task)?;
-    let stage_context = stage_execution_context(task);
-    let mut batches = load_input_batches(shared, session_id, namespace, &stage_context).await?;
-
-    if let Some(sql) = runtime_plan.filter_sql.as_deref() {
-        batches = apply_filter_pipeline(&batches, sql)?;
-    }
-
-    if let Some(join_spec) = runtime_plan.join_spec.as_ref() {
-        let right_namespace = QueryNamespace {
-            database: join_spec.right_relation.database.clone(),
-            schema: join_spec.right_relation.schema.clone(),
-            table: join_spec.right_relation.table.clone(),
-        };
-        let right_prefix = source_table_staging_prefix(&right_namespace);
-        let right_batches = load_scan_batches(shared, &right_prefix).await?;
-        batches = apply_hash_join_pipeline(&batches, &right_batches, join_spec)?;
-    }
-
-    if !runtime_plan.projection_exprs.is_empty() {
-        batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
-    }
-
-    if !runtime_plan.sort_exprs.is_empty() {
-        batches = apply_sort_pipeline(&batches, &runtime_plan.sort_exprs)?;
-    }
-
-    if let Some(limit_spec) = runtime_plan.limit_spec.as_ref() {
-        batches = apply_limit_pipeline(&batches, limit_spec)?;
-    }
-
-    if batches.is_empty() {
-        return Err("query execution produced no record batches".to_string());
-    }
-
-    persist_stage_exchange_artifacts(shared, session_id, &stage_context, &batches).await?;
-
-    if runtime_plan.has_materialize {
-        persist_query_artifacts(shared, result_location, session_id, &task.task_id, &batches).await
-    } else {
-        Ok(())
-    }
-}
-
-/// What: Parse and extract executable runtime operators from validated physical plan payload.
-///
-/// Inputs:
-/// - `task`: Query task containing canonical payload JSON.
-///
-/// Output:
-/// - Runtime plan that includes optional filter SQL and projection expressions.
-fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, String> {
-    let operators = extract_runtime_operators(task)?;
-
-    let mut filter_sql = None;
-    let mut join_spec = None;
-    let mut projection_exprs = Vec::new();
-    let mut sort_exprs = Vec::new();
-    let mut limit_spec = None;
-    let mut has_materialize = false;
-
-    for op in operators {
-        match op {
-            PhysicalOperator::TableScan { .. } => {}
-            PhysicalOperator::Filter { predicate } => {
-                let raw = match predicate {
-                    PhysicalExpr::Raw { sql } => sql,
-                    PhysicalExpr::ColumnRef { name } => name,
-                };
-                filter_sql = Some(raw);
-            }
-            PhysicalOperator::HashJoin { spec } => {
-                join_spec = Some(spec);
-            }
-            PhysicalOperator::Projection { expressions } => {
-                projection_exprs = expressions;
-            }
-            PhysicalOperator::Sort { keys } => {
-                sort_exprs = keys;
-            }
-            PhysicalOperator::Limit { spec } => {
-                limit_spec = Some(spec);
-            }
-            PhysicalOperator::Materialize => {
-                has_materialize = true;
-            }
-            other => {
-                return Err(format!(
-                    "physical operator '{}' is not executable in this phase",
-                    other.canonical_name()
-                ));
-            }
-        }
-    }
-
-    Ok(RuntimePlan {
-        filter_sql,
-        join_spec,
-        projection_exprs,
-        sort_exprs,
-        limit_spec,
-        has_materialize,
-    })
-}
-
-/// What: Decode executable operator pipeline from canonical or stage payload shape.
-///
-/// Inputs:
-/// - `task`: Query task carrying serialized payload.
-///
-/// Output:
-/// - Ordered executable physical operators.
-fn extract_runtime_operators(task: &worker_service::Task) -> Result<Vec<PhysicalOperator>, String> {
-    let payload: serde_json::Value =
-        serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
-
-    if let Some(operators) = payload.as_array() {
-        return serde_json::from_value(serde_json::Value::Array(operators.clone()))
-            .map_err(|e| format!("invalid stage operator payload: {}", e));
-    }
-
-    if let Some(operators) = payload
-        .get("operators")
-        .and_then(serde_json::Value::as_array)
-    {
-        return serde_json::from_value(serde_json::Value::Array(operators.clone()))
-            .map_err(|e| format!("invalid stage payload operators: {}", e));
-    }
-
-    let physical_plan = payload
-        .get("physical_plan")
-        .cloned()
-        .ok_or_else(|| "query payload missing physical_plan".to_string())?;
-    let physical_plan: PhysicalPlan = serde_json::from_value(physical_plan)
-        .map_err(|e| format!("invalid physical_plan payload: {}", e))?;
-
-    Ok(physical_plan.operators)
-}
-
-/// What: Build stage execution context from task params.
-///
-/// Inputs:
-/// - `task`: Query task metadata and params.
-///
-/// Output:
-/// - Stage execution context with deterministic defaults.
-fn stage_execution_context(task: &worker_service::Task) -> StageExecutionContext {
-    let stage_id = task
-        .params
-        .get("stage_id")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    let upstream_stage_ids = task
-        .params
-        .get("upstream_stage_ids")
-        .and_then(|value| serde_json::from_str::<Vec<u32>>(value).ok())
-        .unwrap_or_default();
-    let partition_count = task
-        .params
-        .get("partition_count")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    let upstream_partition_counts = task
-        .params
-        .get("upstream_partition_counts")
-        .and_then(|value| serde_json::from_str::<HashMap<u32, u32>>(value).ok())
-        .unwrap_or_default();
-    let partition_index = task
-        .params
-        .get("partition_index")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
-    let query_run_id = task
-        .params
-        .get("query_run_id")
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("legacy-task-{}", task.task_id));
-
-    StageExecutionContext {
-        stage_id,
-        upstream_stage_ids,
-        upstream_partition_counts,
-        partition_count,
-        partition_index,
-        query_run_id,
-    }
-}
-
-/// What: Parse exchange partition index from a stage artifact key.
-///
-/// Inputs:
-/// - `key`: Object-store key ending with `part-xxxxx.parquet`.
-///
-/// Output:
-/// - Partition index when the key matches expected naming.
-fn parse_partition_index_from_exchange_key(key: &str) -> Option<u32> {
-    let file_name = key.rsplit('/').next()?;
-    if !file_name.ends_with(".parquet") {
-        return None;
-    }
-    let stem = file_name.strip_suffix(".parquet")?;
-    let index_raw = stem.strip_prefix("part-")?;
-    index_raw.parse::<u32>().ok()
-}
-
-/// What: Validate that upstream exchange artifacts cover the expected partition set.
-///
-/// Inputs:
-/// - `upstream_stage_id`: Upstream stage identifier.
-/// - `keys`: Exchange parquet artifact keys found for the upstream stage.
-/// - `expected_partition_count`: Declared upstream partition count.
-///
-/// Output:
-/// - `Ok(())` when all partitions are present exactly once.
-/// - Error when partitions are missing, duplicated, or malformed.
-fn validate_upstream_exchange_partition_set(
-    upstream_stage_id: u32,
-    keys: &[String],
-    expected_partition_count: u32,
-) -> Result<(), String> {
-    if expected_partition_count == 0 {
-        return Err(format!(
-            "upstream stage {} has invalid expected partition count 0",
-            upstream_stage_id
-        ));
-    }
-
-    if keys.len() != expected_partition_count as usize {
-        return Err(format!(
-            "upstream stage {} exchange artifact count mismatch: expected {}, found {}",
-            upstream_stage_id,
-            expected_partition_count,
-            keys.len()
-        ));
-    }
-
-    let mut seen = BTreeSet::<u32>::new();
-    for key in keys {
-        let partition_index = parse_partition_index_from_exchange_key(key).ok_or_else(|| {
-            format!(
-                "upstream stage {} exchange artifact has invalid key format: {}",
-                upstream_stage_id, key
-            )
-        })?;
-
-        if partition_index >= expected_partition_count {
-            return Err(format!(
-                "upstream stage {} exchange artifact partition {} out of range [0, {})",
-                upstream_stage_id, partition_index, expected_partition_count
-            ));
-        }
-
-        if !seen.insert(partition_index) {
-            return Err(format!(
-                "upstream stage {} has duplicate exchange artifact for partition {}",
-                upstream_stage_id, partition_index
-            ));
-        }
-    }
-
-    if seen.len() != expected_partition_count as usize {
-        return Err(format!(
-            "upstream stage {} exchange partition coverage mismatch: expected {} unique partitions, found {}",
-            upstream_stage_id,
-            expected_partition_count,
-            seen.len()
-        ));
-    }
-
-    Ok(())
-}
-
-/// What: Load input batches from base table scan or upstream stage exchange artifacts.
-///
-/// Inputs:
-/// - `shared`: Worker state containing configured storage provider.
-/// - `task`: Query task metadata and params.
-/// - `session_id`: Session identifier used for exchange scoping.
-/// - `namespace`: Canonical query namespace for source scan fallback.
-/// - `stage_context`: Stage metadata resolved from task params.
-///
-/// Output:
-/// - Ordered input record batches for current stage execution.
-async fn load_input_batches(
-    shared: &SharedData,
-    session_id: &str,
-    namespace: &QueryNamespace,
-    stage_context: &StageExecutionContext,
-) -> Result<Vec<RecordBatch>, String> {
-    if stage_context.upstream_stage_ids.is_empty() {
-        let source_prefix = source_table_staging_prefix(namespace);
-        let source_batches = load_scan_batches(shared, &source_prefix).await?;
-        return partition_input_batches(
-            &source_batches,
-            stage_context.partition_count,
-            stage_context.partition_index,
-        );
-    }
-
-    load_upstream_exchange_batches(shared, session_id, stage_context).await
-}
-
-/// What: Load batches from upstream stage exchange artifacts.
-///
-/// Inputs:
-/// - `shared`: Worker state containing configured storage provider.
-/// - `task`: Query task metadata and params.
-/// - `session_id`: Session identifier used for exchange scoping.
-/// - `stage_context`: Stage metadata resolved from task params.
-///
-/// Output:
-/// - Decoded upstream stage batches in deterministic key order.
-async fn load_upstream_exchange_batches(
-    shared: &SharedData,
-    session_id: &str,
-    stage_context: &StageExecutionContext,
-) -> Result<Vec<RecordBatch>, String> {
-    let provider = shared
-        .storage_provider
-        .as_ref()
-        .ok_or_else(|| "storage provider is not configured for exchange reads".to_string())?;
-
-    let mut all_batches = Vec::new();
-    for upstream_stage_id in &stage_context.upstream_stage_ids {
-        let mut keys = list_stage_exchange_data_keys(
-            provider,
-            &stage_context.query_run_id,
-            session_id,
-            *upstream_stage_id,
-        )
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to list exchange artifacts for upstream stage {}: {}",
-                upstream_stage_id, e
-            )
-        })?;
-
-        if keys.is_empty() {
-            return Err(format!(
-                "no exchange artifacts available for upstream stage {}",
-                upstream_stage_id
-            ));
-        }
-
-        if stage_context.partition_count == 1 {
-            if let Some(expected_partition_count) = stage_context
-                .upstream_partition_counts
-                .get(upstream_stage_id)
-                .copied()
-            {
-                validate_upstream_exchange_partition_set(
-                    *upstream_stage_id,
-                    &keys,
-                    expected_partition_count,
-                )?;
-            }
-        }
-
-        if stage_context.partition_count > 1 {
-            let suffix = format!("part-{:05}.parquet", stage_context.partition_index);
-            keys.retain(|key| key.ends_with(&suffix));
-            if keys.is_empty() {
-                return Err(format!(
-                    "missing exchange artifact for upstream stage {} partition {}",
-                    upstream_stage_id, stage_context.partition_index
-                ));
-            }
-        }
-
-        for key in keys {
-            let bytes = provider
-                .get_object(&key)
-                .await
-                .map_err(|e| format!("failed to read exchange artifact {}: {}", key, e))?
-                .ok_or_else(|| format!("exchange artifact not found: {}", key))?;
-            let decoded = decode_parquet_batches(bytes)?;
-            all_batches.extend(decoded);
-        }
-    }
-
-    if all_batches.is_empty() {
-        return Err(format!(
-            "upstream exchange artifacts for stage {} contain no batches",
-            stage_context.stage_id
-        ));
-    }
-
-    log::info!(
-        "loaded exchange input for stage_id={} upstream={:?} batches={}",
-        stage_context.stage_id,
-        stage_context.upstream_stage_ids,
-        all_batches.len()
-    );
-
-    Ok(all_batches)
-}
-
-/// What: Slice input batches into deterministic partitions for fan-out execution.
-///
-/// Inputs:
-/// - `input`: Source record batches.
-/// - `partition_count`: Total number of partitions.
-/// - `partition_index`: Current partition index.
-///
-/// Output:
-/// - Record batches filtered to rows owned by the requested partition.
-fn partition_input_batches(
-    input: &[RecordBatch],
-    partition_count: u32,
-    partition_index: u32,
-) -> Result<Vec<RecordBatch>, String> {
-    if partition_count <= 1 {
-        return Ok(input.to_vec());
-    }
-    if partition_index >= partition_count {
-        return Err(format!(
-            "invalid partition index {} for partition count {}",
-            partition_index, partition_count
-        ));
-    }
-
-    let mut out = Vec::with_capacity(input.len());
-    let mut global_row_index: u64 = 0;
-    let partition_count_u64 = u64::from(partition_count);
-    let partition_index_u64 = u64::from(partition_index);
-
-    for batch in input {
-        let mut mask = Vec::with_capacity(batch.num_rows());
-        for _ in 0..batch.num_rows() {
-            mask.push(global_row_index % partition_count_u64 == partition_index_u64);
-            global_row_index += 1;
-        }
-
-        let filtered = filter_record_batch(batch, &BooleanArray::from(mask))
-            .map_err(|e| format!("failed to slice batch for partitioning: {}", e))?;
-        out.push(filtered);
-    }
-
-    Ok(out)
-}
-
-/// What: Persist stage output batches as deterministic storage-mediated exchange artifacts.
-///
-/// Inputs:
-/// - `shared`: Worker state with storage provider.
-/// - `session_id`: Session identifier used for exchange scoping.
-/// - `stage_context`: Stage metadata resolved from task params.
-/// - `batches`: Stage output batches.
-///
-/// Output:
-/// - `Ok(())` when parquet artifact and metadata sidecar are written.
-async fn persist_stage_exchange_artifacts(
-    shared: &SharedData,
-    session_id: &str,
-    stage_context: &StageExecutionContext,
-    batches: &[RecordBatch],
-) -> Result<(), String> {
-    let provider = shared.storage_provider.as_ref().ok_or_else(|| {
-        "storage provider is not configured for stage exchange persistence".to_string()
-    })?;
-
-    let normalized_batches = normalize_batches_for_sort(batches)?;
-
-    let data_key = stage_exchange_data_key(
-        &stage_context.query_run_id,
+    crate::execution::pipeline::execute_query_task(
+        shared,
+        task,
         session_id,
-        stage_context.stage_id,
-        stage_context.partition_index,
-    );
-    let metadata_key = stage_exchange_metadata_key(
-        &stage_context.query_run_id,
-        session_id,
-        stage_context.stage_id,
-        stage_context.partition_index,
-    );
-
-    let parquet_bytes = encode_batches_to_parquet(&normalized_batches)?;
-    let artifacts = vec![QueryArtifactMetadata {
-        key: data_key.clone(),
-        size_bytes: parquet_bytes.len() as u64,
-        checksum_fnv64: checksum_fnv64_hex(&parquet_bytes),
-    }];
-
-    let metadata_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-        "stage_id": stage_context.stage_id,
-        "partition_index": stage_context.partition_index,
-        "partition_count": stage_context.partition_count,
-        "upstream_stage_ids": stage_context.upstream_stage_ids,
-        "query_run_id": stage_context.query_run_id,
-        "row_count": normalized_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        "batch_count": normalized_batches.len(),
-        "artifacts": artifacts,
-    }))
-    .map_err(|e| format!("failed to encode stage exchange metadata json: {}", e))?;
-
-    provider
-        .put_object(&data_key, parquet_bytes)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to persist stage exchange artifact {}: {}",
-                data_key, e
-            )
-        })?;
-
-    provider
-        .put_object(&metadata_key, metadata_bytes)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to persist stage exchange metadata {}: {}",
-                metadata_key, e
-            )
-        })?;
-
-    Ok(())
-}
-
-/// What: Build the source Delta table staging object prefix from canonical namespace.
-///
-/// Inputs:
-/// - `namespace`: Canonical namespace for relation lookup.
-///
-/// Output:
-/// - Object-store prefix under which committed parquet files are listed.
-fn source_table_staging_prefix(namespace: &QueryNamespace) -> String {
-    format!(
-        "databases/{}/schemas/{}/tables/{}/staging/",
-        namespace.database, namespace.schema, namespace.table
+        namespace,
+        result_location,
     )
-}
-
-/// What: Load scan batches by decoding all parquet files under a source staging prefix.
-///
-/// Inputs:
-/// - `shared`: Worker state containing configured storage provider.
-/// - `source_prefix`: Source table staging prefix.
-///
-/// Output:
-/// - Ordered Arrow record batches read from all parquet objects under the prefix.
-async fn load_scan_batches(
-    shared: &SharedData,
-    source_prefix: &str,
-) -> Result<Vec<RecordBatch>, String> {
-    let provider = shared
-        .storage_provider
-        .as_ref()
-        .ok_or_else(|| "storage provider is not configured for query execution".to_string())?;
-
-    let mut keys = provider
-        .list_objects(source_prefix)
-        .await
-        .map_err(|e| format!("failed to list source objects for {}: {}", source_prefix, e))?;
-    keys.retain(|k| k.ends_with(".parquet"));
-    keys.sort();
-
-    if keys.is_empty() {
-        return Err(format!(
-            "no source parquet files found for query prefix {}",
-            source_prefix
-        ));
-    }
-
-    let mut all_batches = Vec::new();
-    for key in keys {
-        let bytes = provider
-            .get_object(&key)
-            .await
-            .map_err(|e| format!("failed to read source object {}: {}", key, e))?
-            .ok_or_else(|| format!("source object not found: {}", key))?;
-
-        let decoded = decode_parquet_batches(bytes)?;
-        all_batches.extend(decoded);
-    }
-
-    if all_batches.is_empty() {
-        return Err("source parquet files contain no record batches".to_string());
-    }
-
-    Ok(all_batches)
-}
-
-/// What: Decode parquet bytes into Arrow record batches.
-///
-/// Inputs:
-/// - `parquet_bytes`: Full parquet payload bytes.
-///
-/// Output:
-/// - Arrow record batches decoded from the input payload.
-fn decode_parquet_batches(parquet_bytes: Vec<u8>) -> Result<Vec<RecordBatch>, String> {
-    let reader_source = Bytes::from(parquet_bytes);
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(reader_source)
-        .map_err(|e| format!("failed to open parquet reader: {}", e))?
-        .with_batch_size(1024)
-        .build()
-        .map_err(|e| format!("failed to build parquet reader: {}", e))?;
-
-    let mut batches = Vec::new();
-    for maybe_batch in &mut reader {
-        let batch = maybe_batch.map_err(|e| format!("failed reading parquet batch: {}", e))?;
-        batches.push(batch);
-    }
-
-    Ok(batches)
+    .await
 }
 
 /// What: Apply a simple conjunction filter pipeline to all input batches.
@@ -751,7 +74,7 @@ fn decode_parquet_batches(parquet_bytes: Vec<u8>) -> Result<Vec<RecordBatch>, St
 ///
 /// Output:
 /// - Filtered batches preserving input order.
-fn apply_filter_pipeline(
+pub(crate) fn apply_filter_pipeline(
     input: &[RecordBatch],
     filter_sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
@@ -898,7 +221,7 @@ fn evaluate_clause_at_row(
 ///
 /// Output:
 /// - Projected batches preserving order and output column ordering.
-fn apply_projection_pipeline(
+pub(crate) fn apply_projection_pipeline(
     input: &[RecordBatch],
     projection_exprs: &[PhysicalExpr],
 ) -> Result<Vec<RecordBatch>, String> {
@@ -960,7 +283,7 @@ fn apply_projection_pipeline(
 ///
 /// Output:
 /// - Sorted batches with deterministic row order.
-fn apply_sort_pipeline(
+pub(crate) fn apply_sort_pipeline(
     input: &[RecordBatch],
     sort_exprs: &[PhysicalSortExpr],
 ) -> Result<Vec<RecordBatch>, String> {
@@ -1022,7 +345,7 @@ fn apply_sort_pipeline(
 ///
 /// Output:
 /// - Sliced batches that satisfy OFFSET then LIMIT semantics.
-fn apply_limit_pipeline(
+pub(crate) fn apply_limit_pipeline(
     input: &[RecordBatch],
     limit_spec: &PhysicalLimitSpec,
 ) -> Result<Vec<RecordBatch>, String> {
@@ -1077,7 +400,9 @@ fn apply_limit_pipeline(
 ///
 /// Output:
 /// - New batch list with per-column types aligned for concat and sort.
-fn normalize_batches_for_sort(input: &[RecordBatch]) -> Result<Vec<RecordBatch>, String> {
+pub(crate) fn normalize_batches_for_sort(
+    input: &[RecordBatch],
+) -> Result<Vec<RecordBatch>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -1160,164 +485,6 @@ fn is_int_type(data_type: &DataType) -> bool {
         data_type,
         DataType::Int16 | DataType::Int32 | DataType::Int64
     )
-}
-
-/// What: Persist result batches to deterministic task-scoped artifact location.
-///
-/// Inputs:
-/// - `shared`: Worker state with storage provider.
-/// - `result_location`: Flight URI used as retrieval root.
-/// - `session_id`: Session id component for task scoping.
-/// - `task_id`: Task id component for task scoping.
-/// - `batches`: Executed result batches.
-///
-/// Output:
-/// - `Ok(())` when result parquet file is stored.
-async fn persist_query_artifacts(
-    shared: &SharedData,
-    result_location: &str,
-    session_id: &str,
-    task_id: &str,
-    batches: &[RecordBatch],
-) -> Result<(), String> {
-    let provider = shared.storage_provider.as_ref().ok_or_else(|| {
-        "storage provider is not configured for query result persistence".to_string()
-    })?;
-
-    let normalized_batches = normalize_batches_for_sort(batches)?;
-
-    let path = Url::parse(result_location)
-        .map_err(|e| format!("result_location is not a valid URI: {}", e))?
-        .path()
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_string();
-
-    if path.is_empty() {
-        return Err("result_location path is empty".to_string());
-    }
-
-    let prefix = format!("{}/staging/{}/{}/", path, session_id, task_id);
-    let key = format!("{}part-00000.parquet", prefix);
-    let parquet_bytes = encode_batches_to_parquet(&normalized_batches)?;
-    let metadata_key = format!("{}result_metadata.json", prefix);
-    let artifacts = vec![QueryArtifactMetadata {
-        key: key.clone(),
-        size_bytes: parquet_bytes.len() as u64,
-        checksum_fnv64: checksum_fnv64_hex(&parquet_bytes),
-    }];
-    let metadata_bytes = encode_result_metadata(&normalized_batches, &artifacts)?;
-
-    provider
-        .put_object(&key, parquet_bytes)
-        .await
-        .map_err(|e| format!("failed to persist query artifact {}: {}", key, e))?;
-
-    provider
-        .put_object(&metadata_key, metadata_bytes)
-        .await
-        .map_err(|e| format!("failed to persist query metadata {}: {}", metadata_key, e))
-}
-
-/// What: Encode record batches into a single parquet payload.
-///
-/// Inputs:
-/// - `batches`: Ordered Arrow batches with compatible schema.
-///
-/// Output:
-/// - Encoded parquet bytes.
-fn encode_batches_to_parquet(batches: &[RecordBatch]) -> Result<Vec<u8>, String> {
-    let first = batches
-        .first()
-        .ok_or_else(|| "cannot encode empty batch list".to_string())?;
-
-    let schema_ref = first.schema();
-    let props = WriterProperties::builder().build();
-    let mut cursor = Cursor::new(Vec::<u8>::new());
-    let mut writer = ArrowWriter::try_new(&mut cursor, schema_ref, Some(props))
-        .map_err(|e| format!("failed to create parquet writer: {}", e))?;
-
-    for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|e| format!("failed writing parquet batch: {}", e))?;
-    }
-
-    writer
-        .close()
-        .map_err(|e| format!("failed closing parquet writer: {}", e))?;
-    Ok(cursor.into_inner())
-}
-
-/// What: Encode query result metadata sidecar for deterministic task artifacts.
-///
-/// Inputs:
-/// - `batches`: Executed result batches.
-/// - `artifacts`: Persisted query result artifact metadata.
-///
-/// Output:
-/// - JSON bytes containing row count and schema summary.
-fn encode_result_metadata(
-    batches: &[RecordBatch],
-    artifacts: &[QueryArtifactMetadata],
-) -> Result<Vec<u8>, String> {
-    let first = batches
-        .first()
-        .ok_or_else(|| "cannot encode metadata for empty batch list".to_string())?;
-
-    let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let fields = first
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "name": f.name(),
-                "data_type": format!("{:?}", f.data_type()),
-                "nullable": f.is_nullable(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let artifact_values = artifacts
-        .iter()
-        .map(|artifact| {
-            serde_json::json!({
-                "key": artifact.key,
-                "size_bytes": artifact.size_bytes,
-                "checksum_fnv64": artifact.checksum_fnv64,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    serde_json::to_vec_pretty(&serde_json::json!({
-        "row_count": row_count,
-        "source_batch_count": batches.len(),
-        "parquet_file_count": artifacts.len(),
-        "columns": fields,
-        "artifacts": artifact_values,
-    }))
-    .map_err(|e| format!("failed to encode query metadata json: {}", e))
-}
-
-/// What: Compute deterministic FNV-1a 64-bit checksum as lowercase hex.
-///
-/// Inputs:
-/// - `bytes`: Raw artifact bytes.
-///
-/// Output:
-/// - 16-char lowercase hex checksum.
-fn checksum_fnv64_hex(bytes: &[u8]) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-
-    let mut hash = OFFSET_BASIS;
-    for b in bytes {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(PRIME);
-    }
-
-    format!("{hash:016x}")
 }
 
 fn push_projected_column(
@@ -1600,12 +767,15 @@ fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryArtifactMetadata, apply_filter_pipeline, apply_limit_pipeline,
-        apply_projection_pipeline, decode_parquet_batches, encode_result_metadata,
-        extract_runtime_plan, parse_partition_index_from_exchange_key, parse_projection_identifier,
-        partition_input_batches, source_table_staging_prefix, split_case_insensitive,
-        validate_upstream_exchange_partition_set,
+        apply_filter_pipeline, apply_limit_pipeline, apply_projection_pipeline,
+        parse_projection_identifier, split_case_insensitive,
     };
+    use crate::execution::artifacts::{QueryArtifactMetadata, encode_result_metadata};
+    use crate::execution::pipeline::{
+        decode_parquet_batches, parse_partition_index_from_exchange_key, partition_input_batches,
+        source_table_staging_prefix, validate_upstream_exchange_partition_set,
+    };
+    use crate::execution::planner::extract_runtime_plan;
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -1668,7 +838,7 @@ mod tests {
 
     #[test]
     fn builds_bucket_relative_source_prefix() {
-        let ns = crate::services::query::QueryNamespace {
+        let ns = crate::execution::query::QueryNamespace {
             database: "db1".to_string(),
             schema: "s1".to_string(),
             table: "t1".to_string(),
