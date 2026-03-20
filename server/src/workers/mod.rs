@@ -49,15 +49,36 @@ pub async fn acquire_channel_with_heartbeat(
 pub async fn send_task_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::TaskRequest,
+    auth_ctx: Option<&crate::statement_handler::helpers::DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<
     crate::services::worker_service_client::worker_service::TaskResponse,
     Box<dyn Error + Send + Sync>,
 > {
     let mut client = crate::services::worker_service_client::worker_service::worker_service_client::WorkerServiceClient::new(conn.clone());
+    let mut request = tonic::Request::new(req);
+    if let Ok(value) =
+        tonic::metadata::MetadataValue::try_from(request.get_ref().session_id.as_str())
+    {
+        request.metadata_mut().insert("session_id", value);
+    }
+    if let Some(ctx) = auth_ctx {
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(ctx.rbac_user.as_str()) {
+            request.metadata_mut().insert("rbac_user", value);
+        }
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(ctx.rbac_role.as_str()) {
+            request.metadata_mut().insert("rbac_role", value);
+        }
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(ctx.scope.as_str()) {
+            request.metadata_mut().insert("auth_scope", value);
+        }
+        if let Ok(value) = tonic::metadata::MetadataValue::try_from(ctx.query_id.as_str()) {
+            request.metadata_mut().insert("query_id", value);
+        }
+    }
     match timeout(
         Duration::from_secs(timeout_secs),
-        client.execute_task(tonic::Request::new(req)),
+        client.execute_task(request),
     )
     .await
     {

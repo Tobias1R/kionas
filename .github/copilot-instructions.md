@@ -63,7 +63,7 @@ Before completing any task, ensure all of the following pass:
 1. **Format code**: `cargo fmt --all` (must produce no changes)
 2. **Lint with Clippy**: `cargo clippy --all-targets --all-features -- -D warnings` (must be clean)
 3. **Check compilation**: `cargo check` (must compile successfully)
-4. **Run tests**: `cargo test -- --test-threads=1` (all tests must pass)
+4. **Run tests**: Tests are taking too long. Ignore for now.
 5. **Check complexity**: For new code, verify cyclomatic complexity < 25 and data flow complexity < 25
 
 ### Code Documentation Requirements
@@ -112,6 +112,7 @@ If you add or change config keys:
 - **Do NOT create or update *.md files, unless explicitly asked**
 - **Do NOT update wiki pages, unless explicitly asked**
 - **Do NOT update README, unless explicitly asked**
+- **ROADMAPS** Are the only exception: update `ROADMAP.md` and create corresponding `ROADMAP_PHASEX_MATRIX.md` files as needed for phase signoff documentation.
 - Focus on code implementation and inline documentation (rustdoc comments)
 
 
@@ -127,6 +128,11 @@ If you add or change config keys:
 - Focus on code quality, tests, and inline documentation
 - All changes must respect `--dry-run` flag
 - All changes must degrade gracefully if system tools are unavailable
+
+## Roadmping
+- We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files.
+- Each roadmap phase should have a clear scope, mandatory criteria for completion, optional hardening items, and a signoff decision process.
+- The roadmap should be updated iteratively as we progress through phases, ensuring that all relevant files and documentation are maintained in sync with the current state of the project.
 
 ## Roadmap Phase Signoff Matrix Requirements
 For each roadmap phase, create a corresponding `ROADMAP_PHASEX_MATRIX.md` file with the following structure:

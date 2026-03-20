@@ -7,6 +7,7 @@ pub struct RequestContext {
     pub query_id: String,
     pub session_id_opt: Option<String>,
     pub session_id: String,
+    pub rbac_user: String,
     pub role: String,
     pub warehouse_name: String,
     pub worker_uuid: String,
@@ -22,6 +23,12 @@ impl RequestContext {
             .get("session_id")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let rbac_user = request
+            .metadata()
+            .get("rbac_user")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "anonymous".to_string());
 
         let session_id = session_id_opt.clone().unwrap_or_else(|| "".to_string());
         let mut role: String = "worker".to_string();
@@ -57,6 +64,7 @@ impl RequestContext {
             query_id,
             session_id_opt,
             session_id,
+            rbac_user,
             role,
             warehouse_name,
             worker_uuid,

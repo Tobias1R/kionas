@@ -185,7 +185,7 @@ impl WarehouseServiceTrait for WarehouseService {
 
                 for stmt in &statements {
                     // Execute handler synchronously (existing logic performs dispatch to worker)
-                    let result = handle_statement(stmt, &session_id, &shared_data).await;
+                    let result = handle_statement(stmt, &session_id, &ctx, &shared_data).await;
                     log::debug!("Execution result: {}", result);
                     apply_statement_outcome(&result, &mut resp);
 

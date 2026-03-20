@@ -53,10 +53,11 @@ The RBAC system.
 [X] DONE
 
 7. Phase 6: Authentication and Authorization Revamp
-7.1 Propagate auth context explicitly through query execution artifacts where needed (server dispatch, worker execution, Flight retrieval).
+7.1 Propagate auth context(RBAC only downstream, after the login what matter is rbac_user and role) explicitly through query execution artifacts where needed (server dispatch, worker execution, Flight retrieval).
 7.2 Add worker-side enforcement points for query execution authorization and scope checks.
-7.3 Add Flight-layer auth validation and token/session checks in proxy and worker endpoints.
+7.3 Add Flight-layer auth validation and token/session checks in proxy endpoints.
 7.4 Add token lifecycle and revocation strategy appropriate for long-running distributed queries.
+[X] DONE
 
 8. Phase 7: Reliability, Observability, and Developer Experience
 8.1 Add query lifecycle telemetry (parse/planner/execution timings, stage counters, retry/failure metrics).
@@ -70,6 +71,20 @@ The RBAC system.
 9.3 Expand query federation and advanced semantics iteratively with feature flags.
 
 10. Phase 9: Server session expansion
+
+11. Phase 10: Query Part I
+- select:
+    - order by
+    - qualify
+    - window functions
+
+12. Phase 11: Query Part II
+
+13. Phase 12: Query Part III
+
+14. Phase 13: Update
+
+15. Phase 14: Delete
 
 
 

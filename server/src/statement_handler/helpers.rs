@@ -5,6 +5,27 @@ use std::error::Error;
 use crate::workers::PooledConn;
 use uuid::Uuid;
 
+/// What: Auth metadata propagated from warehouse query dispatch to worker execution.
+///
+/// Inputs:
+/// - `rbac_user`: Authenticated RBAC principal.
+/// - `rbac_role`: Effective RBAC role.
+/// - `scope`: Server-computed trusted scope for worker authorization.
+/// - `query_id`: Correlation id for tracing.
+///
+/// Output:
+/// - Metadata carrier used by task dispatch helpers.
+///
+/// Details:
+/// - Scope is evaluated on the server and enforced on the worker.
+#[derive(Clone, Debug)]
+pub struct DispatchAuthContext {
+    pub rbac_user: String,
+    pub rbac_role: String,
+    pub scope: String,
+    pub query_id: String,
+}
+
 /// Resolve session and worker key for a session id
 pub async fn resolve_session_and_key(
     shared_data: &SharedData,
@@ -100,13 +121,14 @@ pub async fn dispatch_task_and_record(
     shared_data: &SharedData,
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::TaskRequest,
+    auth_ctx: Option<&DispatchAuthContext>,
     task_id: &str,
     timeout_secs: u64,
 ) -> Result<
     crate::services::worker_service_client::worker_service::TaskResponse,
     Box<dyn Error + Send + Sync>,
 > {
-    let resp = crate::workers::send_task_to_worker(conn, req, timeout_secs).await?;
+    let resp = crate::workers::send_task_to_worker(conn, req, auth_ctx, timeout_secs).await?;
 
     let task_manager = {
         let state = shared_data.lock().await;
@@ -141,6 +163,7 @@ pub async fn run_task_for_input(
         operation,
         payload,
         std::collections::HashMap::new(),
+        None,
         timeout_secs,
     )
     .await
@@ -153,6 +176,7 @@ pub async fn run_task_for_input_with_params(
     operation: &str,
     payload: String,
     params: std::collections::HashMap<String, String>,
+    auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     // Resolve session and worker key
@@ -202,7 +226,8 @@ pub async fn run_task_for_input_with_params(
             .set_state(&task_id, crate::tasks::TaskState::Running)
             .await;
     }
-    let resp = dispatch_task_and_record(shared_data, conn, req, &task_id, timeout_secs).await?;
+    let resp =
+        dispatch_task_and_record(shared_data, conn, req, auth_ctx, &task_id, timeout_secs).await?;
 
     if resp.status == "ok" {
         Ok(resp.result_location)
@@ -233,6 +258,7 @@ pub async fn run_stage_groups_for_input(
     shared_data: &SharedData,
     session_id: &str,
     stage_groups: &[crate::statement_handler::distributed_dag::StageTaskGroup],
+    auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if stage_groups.is_empty() {
@@ -321,6 +347,7 @@ pub async fn run_stage_groups_for_input(
         for group in stage_partitions {
             let shared_clone = shared_data.clone();
             let session_id_owned = session_id.to_string();
+            let auth_ctx_cloned = auth_ctx.cloned();
             join_set.spawn(async move {
                 let partition_location = run_task_for_input_with_params(
                     &shared_clone,
@@ -328,6 +355,7 @@ pub async fn run_stage_groups_for_input(
                     &group.operation,
                     group.payload.clone(),
                     group.params.clone(),
+                    auth_ctx_cloned.as_ref(),
                     timeout_secs,
                 )
                 .await;

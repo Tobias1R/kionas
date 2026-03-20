@@ -52,7 +52,7 @@ fn resolve_worker_flight_port() -> u16 {
         .unwrap_or(32001)
 }
 
-/// What: Decode internal ticket payload into scoped identifiers.
+/// What: Decode signed ticket payload into scoped identifiers.
 ///
 /// Inputs:
 /// - `ticket_raw`: Ticket bytes from Flight `DoGet` request.
@@ -61,22 +61,43 @@ fn resolve_worker_flight_port() -> u16 {
 /// - `(session_id, task_id, worker_id)` when payload is valid.
 ///
 /// Details:
-/// - Expected payload format after base64 decode: `session_id:task_id:worker_id`.
+/// - Expected payload format is signed compact JWT with `sid`, `tid`, and `wid` claims.
 fn decode_internal_ticket(ticket_raw: &[u8]) -> Result<(String, String, String), Status> {
-    let encoded = std::str::from_utf8(ticket_raw)
+    let token = std::str::from_utf8(ticket_raw)
         .map_err(|_| Status::invalid_argument("ticket is not valid UTF-8"))?;
 
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| Status::invalid_argument("ticket is not valid base64"))?;
+    let mut parts = token.split('.');
+    let _header = parts
+        .next()
+        .ok_or_else(|| Status::invalid_argument("invalid signed ticket format"))?;
+    let claims = parts
+        .next()
+        .ok_or_else(|| Status::invalid_argument("invalid signed ticket format"))?;
 
-    let decoded_text = String::from_utf8(decoded)
-        .map_err(|_| Status::invalid_argument("ticket payload is not valid UTF-8"))?;
+    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims)
+        .map_err(|_| Status::invalid_argument("ticket claims are not valid base64url"))?;
+    let claims_json: serde_json::Value = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| Status::invalid_argument("ticket claims are not valid JSON"))?;
 
-    let mut parts = decoded_text.splitn(3, ':');
-    let session_id = parts.next().unwrap_or_default().trim().to_string();
-    let task_id = parts.next().unwrap_or_default().trim().to_string();
-    let worker_id = parts.next().unwrap_or_default().trim().to_string();
+    let session_id = claims_json
+        .get("sid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let task_id = claims_json
+        .get("tid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let worker_id = claims_json
+        .get("wid")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
 
     if session_id.is_empty() || task_id.is_empty() || worker_id.is_empty() {
         return Err(Status::invalid_argument(
@@ -150,6 +171,21 @@ fn map_upstream_status(status: Status, context: &str) -> Status {
     Status::new(status.code(), format!("{}: {}", context, status.message()))
 }
 
+fn copy_auth_metadata<T, U>(from: &Request<T>, to: &mut Request<U>) {
+    for key in [
+        "authorization",
+        "session_id",
+        "rbac_user",
+        "rbac_role",
+        "auth_scope",
+        "query_id",
+    ] {
+        if let Some(value) = from.metadata().get(key) {
+            to.metadata_mut().insert(key, value.clone());
+        }
+    }
+}
+
 #[tonic14::async_trait]
 impl FlightService for ProxyFlightService {
     type HandshakeStream = FlightStream<HandshakeResponse>;
@@ -180,7 +216,7 @@ impl FlightService for ProxyFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let descriptor = request.into_inner();
+        let descriptor = request.get_ref().clone();
         let worker_id = parse_descriptor_worker_scope(&descriptor)?;
 
         let worker_endpoint = resolve_worker_flight_endpoint(&worker_id);
@@ -196,8 +232,10 @@ impl FlightService for ProxyFlightService {
             })?;
 
         let mut client = FlightServiceClient::new(channel);
+        let mut upstream_request = Request::new(descriptor);
+        copy_auth_metadata(&request, &mut upstream_request);
         client
-            .get_flight_info(descriptor)
+            .get_flight_info(upstream_request)
             .await
             .map_err(|e| map_upstream_status(e, "worker GetFlightInfo failed"))
     }
@@ -215,7 +253,7 @@ impl FlightService for ProxyFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let descriptor = request.into_inner();
+        let descriptor = request.get_ref().clone();
         let worker_id = parse_descriptor_worker_scope(&descriptor)?;
 
         let worker_endpoint = resolve_worker_flight_endpoint(&worker_id);
@@ -231,8 +269,10 @@ impl FlightService for ProxyFlightService {
             })?;
 
         let mut client = FlightServiceClient::new(channel);
+        let mut upstream_request = Request::new(descriptor);
+        copy_auth_metadata(&request, &mut upstream_request);
         client
-            .get_schema(descriptor)
+            .get_schema(upstream_request)
             .await
             .map_err(|e| map_upstream_status(e, "worker GetSchema failed"))
     }
@@ -241,7 +281,7 @@ impl FlightService for ProxyFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket = request.into_inner();
+        let ticket = request.get_ref().clone();
         let (_, _, worker_id) = decode_internal_ticket(&ticket.ticket)?;
 
         let worker_endpoint = resolve_worker_flight_endpoint(&worker_id);
@@ -257,8 +297,10 @@ impl FlightService for ProxyFlightService {
             })?;
 
         let mut client = FlightServiceClient::new(channel);
+        let mut upstream_request = Request::new(ticket);
+        copy_auth_metadata(&request, &mut upstream_request);
         let upstream = client
-            .do_get(ticket)
+            .do_get(upstream_request)
             .await
             .map_err(|e| map_upstream_status(e, "worker DoGet failed"))?
             .into_inner();

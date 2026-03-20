@@ -1,3 +1,4 @@
+use crate::services::request_context::RequestContext;
 use crate::statement_handler::distributed_dag;
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
@@ -61,6 +62,7 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
 pub(crate) async fn handle_select_query(
     shared_data: &SharedData,
     session_id: &str,
+    ctx: &RequestContext,
     ast: SelectQueryAst<'_>,
 ) -> String {
     let (default_database, default_schema) = {
@@ -169,10 +171,19 @@ pub(crate) async fn handle_select_query(
                     .insert("query_run_id".to_string(), query_run_id.clone());
             }
 
+            let auth_scope = format!("select:{}.{}.{}", database, schema, table);
+            let dispatch_auth_ctx = helpers::DispatchAuthContext {
+                rbac_user: ctx.rbac_user.clone(),
+                rbac_role: ctx.role.clone(),
+                scope: auth_scope,
+                query_id: ctx.query_id.clone(),
+            };
+
             let worker_result_location = match helpers::run_stage_groups_for_input(
                 shared_data,
                 session_id,
                 &stage_groups,
+                Some(&dispatch_auth_ctx),
                 120,
             )
             .await
