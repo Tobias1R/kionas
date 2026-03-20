@@ -91,7 +91,8 @@ fn operator_names_from_payload(operators: &[serde_json::Value]) -> Result<Vec<St
 fn validate_supported_operator_set(names: &[String]) -> Result<(), String> {
     for name in names {
         match name.as_str() {
-            "TableScan" | "Filter" | "Projection" | "Sort" | "Limit" | "Materialize" => {}
+            "TableScan" | "Filter" | "Projection" | "HashJoin" | "Sort" | "Limit"
+            | "Materialize" => {}
             other => {
                 return Err(format!(
                     "physical operator '{}' is not supported in this phase",
@@ -210,6 +211,30 @@ fn validate_physical_pipeline_shape(operators: &[serde_json::Value]) -> Result<(
             .ok_or_else(|| "physical_plan must include Projection".to_string())?;
         if sort_index < projection_index {
             return Err("physical_plan Sort must appear after Projection".to_string());
+        }
+    }
+
+    let hash_join_count = names
+        .iter()
+        .filter(|name| name.as_str() == "HashJoin")
+        .count();
+    if hash_join_count > 1 {
+        return Err("physical_plan must include at most one HashJoin operator".to_string());
+    }
+
+    if let Some(hash_join_index) = names.iter().position(|name| name.as_str() == "HashJoin") {
+        let projection_index = names
+            .iter()
+            .position(|name| name.as_str() == "Projection")
+            .ok_or_else(|| "physical_plan must include Projection".to_string())?;
+        if hash_join_index > projection_index {
+            return Err("physical_plan HashJoin must appear before Projection".to_string());
+        }
+
+        if let Some(sort_index) = names.iter().position(|name| name.as_str() == "Sort")
+            && hash_join_index > sort_index
+        {
+            return Err("physical_plan HashJoin must appear before Sort".to_string());
         }
     }
 
@@ -868,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deferred_operator_variant_in_worker_payload() {
+    fn accepts_hash_join_operator_variant_in_worker_payload() {
         let task = crate::services::worker_service_server::worker_service::Task {
             task_id: "t1".to_string(),
             operation: "query".to_string(),
@@ -884,7 +909,7 @@ mod tests {
                 "physical_plan": {
                     "operators": [
                         {"TableScan": {"relation": {"database": "db1", "schema": "s1", "table": "t1"}}},
-                        {"HashJoin": {"on": []}},
+                        {"HashJoin": {"spec": {"join_type": "Inner", "right_relation": {"database": "db1", "schema": "s1", "table": "t2"}, "keys": [{"left": "t1.id", "right": "t2.id"}]}}},
                         {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
                         "Materialize"
                     ]
@@ -895,9 +920,9 @@ mod tests {
             params: std::collections::HashMap::new(),
         };
 
-        let err = resolve_query_namespace(&task)
-            .expect_err("must reject deferred physical operator in worker payload");
-        assert!(err.contains("HashJoin"));
+        let namespace = resolve_query_namespace(&task)
+            .expect("must accept constrained hash join operator in worker payload");
+        assert_eq!(namespace.table, "t1");
     }
 
     #[test]

@@ -10,4 +10,4 @@ if [ "$1" == "b" ]; then
     CLIENT_BIN="./target/debug/client"
 fi
 
-$CLIENT_BIN --username $USERNAME --password $PASSWORD --server-url $SERVER_ADDR
+$CLIENT_BIN --username $USERNAME --password $PASSWORD

@@ -45,50 +45,73 @@ Roadmap 2 continues the validated loop client -> server -> worker -> flight -> c
 4.2 Add regression coverage for ORDER BY + LIMIT interactions.
 4.3 Harden validation and error taxonomy for unsupported query shapes.
 4.4 When possible use different mod or files. Create new ones often. dont concentrate too much logic on the same file. 
+[X] DONE
 
 [DISCOVER INTERMISSION]
-Better sql predicates & operators to support next phases(planner, executor)
+- Who we should implement first? GROUP or JOIN?
+- How is our planner current situation to start breaking down SCAN+FILTER+JOIN
+- Can JOIN be implement vertically now?
+[X] DONE
 
-5. Phase 5: Window foundation
-5.1 Introduce minimal supported window semantics with explicit constraints.
-5.2 Add planner/runtime contracts for partition and frame metadata.
-5.3 Add observability hooks for window execution diagnostics.
+### Intermission Resolution
+- Decision: implement JOIN before GROUP.
+- Planner readiness: SCAN and FILTER are vertically ready; JOIN is cataloged but still blocked by model extraction, logical representation, physical translation, validation gates, and worker execution.
+- Vertical feasibility: JOIN can be implemented now as a constrained vertical slice (INNER equi-join first), followed by GROUP as a separate phase on top of the JOIN-ready planner/runtime foundation.
+- Technical deep dive: [roadmaps/dive-in/roadmap2_divein_discovery_intermission_4-5.md](roadmaps/dive-in/roadmap2_divein_discovery_intermission_4-5.md)
+- Closure matrix: [roadmaps/ROADMAP2_INTERMISSION_4-5_MATRIX.md](roadmaps/ROADMAP2_INTERMISSION_4-5_MATRIX.md)
 
-6. Phase 6: QUALIFY
-6.1 Add QUALIFY evaluation on top of window outputs.
-6.2 Ensure stable filtering semantics and actionable validation errors.
-6.3 Add explainability for post-window filtering behavior.
+5. Phase 5: JOIN foundation
+5.1 Introduce minimal JOIN semantics with explicit constraints (INNER equi-join first).
+5.2 Add planner/runtime contracts for multi-relation modeling and JOIN operator execution.
+5.3 Add explain and diagnostics visibility for JOIN strategy and predicates.
 
-7. Phase 7: Query part II
-7.1 Expand supported query semantics iteratively behind capability gates.
-7.2 Keep backward compatibility on response and handle contracts.
+6. Phase 6: GROUP foundation
+6.1 Introduce minimal GROUP semantics with explicit constraints and deterministic aggregate behavior.
+6.2 Add planner/runtime contracts for aggregate partial/final metadata.
+6.3 Add observability hooks for aggregation execution diagnostics.
 
-8. Phase 8: Query part III
-8.1 Complete remaining targeted query semantics for this roadmap line.
-8.2 Resolve deferred hardening items from prior query phases.
+7. Phase 7: Window foundation
+7.1 Introduce minimal supported window semantics with explicit constraints.
+7.2 Add planner/runtime contracts for partition and frame metadata.
+7.3 Add observability hooks for window execution diagnostics.
 
-9. Phase 9: Reliability and observability hardening
-9.1 Add lifecycle telemetry and audit traces across dispatch and retrieval.
-9.2 Add resilience tests for partial failures and retries.
+8. Phase 8: QUALIFY
+8.1 Add QUALIFY evaluation on top of window outputs.
+8.2 Ensure stable filtering semantics and actionable validation errors.
+8.3 Add explainability for post-window filtering behavior.
 
-10. Phase 10: Server session expansion
-10.1 Expand session context to support richer query-state requirements.
-10.2 Keep auth and scope contracts stable with bounded compatibility changes.
+9. Phase 9: Query part II
+9.1 Expand supported query semantics iteratively behind capability gates.
+9.2 Keep backward compatibility on response and handle contracts.
 
-11. Phase 11: Transition gate to mutation roadmap
-11.1 Define explicit prerequisites for UPDATE/DELETE track.
-11.2 Produce a handoff matrix for mutation phases.
+10. Phase 10: Query part III
+10.1 Complete remaining targeted query semantics for this roadmap line.
+10.2 Resolve deferred hardening items from prior query phases.
+
+11. Phase 11: Reliability and observability hardening
+11.1 Add lifecycle telemetry and audit traces across dispatch and retrieval.
+11.2 Add resilience tests for partial failures and retries.
+
+12. Phase 12: Server session expansion
+12.1 Expand session context to support richer query-state requirements.
+12.2 Keep auth and scope contracts stable with bounded compatibility changes.
+
+13. Phase 13: Transition gate to mutation roadmap
+13.1 Define explicit prerequisites for UPDATE/DELETE track.
+13.2 Produce a handoff matrix for mutation phases.
 
 **Parallelism and Dependencies**
 1. Phase 1 blocks Phase 2.
-2. Phase 2 blocks Phases 3 through 6 because model and architecture decisions must be frozen first.
+2. Phase 2 blocks Phases 3 through 8 because model and architecture decisions must be frozen first.
 3. Phase 3 blocks Phase 4.
-4. Phase 5 blocks Phase 6.
-5. Phases 7 and 8 can overlap partially after Phase 6 with strict matrix-gated milestones.
-6. Phase 11 depends on completion outcomes from Phases 7 through 10.
+4. Phase 4 blocks Phase 5.
+5. Phase 5 blocks Phase 6.
+6. Phase 7 blocks Phase 8.
+7. Phases 9 and 10 can overlap partially after Phase 8 with strict matrix-gated milestones.
+8. Phase 13 depends on completion outcomes from Phases 9 through 12.
 
 **Critical Path**
-1. Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6.
+1. Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7 -> Phase 8.
 
 **Contributor Tracks**
 1. Planner/model track: query model, logical/physical plan contracts, validation gates.
@@ -116,4 +139,6 @@ Better sql predicates & operators to support next phases(planner, executor)
 **Decisions**
 - Start with ORDER BY as the first semantics implementation slice.
 - Keep phases 7-11 focused on query semantics and planner hardening.
+- Resolve intermission with JOIN-first sequencing, then GROUP, then Window/QUALIFY.
+- Keep phases 9-13 focused on query semantics completion, reliability hardening, and transition gating.
 - Defer UPDATE/DELETE to a dedicated mutation roadmap after transition gating.

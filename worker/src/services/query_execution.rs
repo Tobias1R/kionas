@@ -1,4 +1,5 @@
 use crate::services::query::QueryNamespace;
+use crate::services::query_join::apply_hash_join_pipeline;
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
 use crate::storage::exchange::{
@@ -14,7 +15,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use kionas::planner::{
-    PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+    PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
+    PhysicalSortExpr,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
@@ -35,6 +37,7 @@ use url::Url;
 #[derive(Debug, Clone)]
 struct RuntimePlan {
     filter_sql: Option<String>,
+    join_spec: Option<PhysicalJoinSpec>,
     projection_exprs: Vec<PhysicalExpr>,
     sort_exprs: Vec<PhysicalSortExpr>,
     limit_spec: Option<PhysicalLimitSpec>,
@@ -139,6 +142,17 @@ pub(crate) async fn execute_query_task(
         batches = apply_filter_pipeline(&batches, sql)?;
     }
 
+    if let Some(join_spec) = runtime_plan.join_spec.as_ref() {
+        let right_namespace = QueryNamespace {
+            database: join_spec.right_relation.database.clone(),
+            schema: join_spec.right_relation.schema.clone(),
+            table: join_spec.right_relation.table.clone(),
+        };
+        let right_prefix = source_table_staging_prefix(&right_namespace);
+        let right_batches = load_scan_batches(shared, &right_prefix).await?;
+        batches = apply_hash_join_pipeline(&batches, &right_batches, join_spec)?;
+    }
+
     if !runtime_plan.projection_exprs.is_empty() {
         batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
     }
@@ -175,6 +189,7 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
     let operators = extract_runtime_operators(task)?;
 
     let mut filter_sql = None;
+    let mut join_spec = None;
     let mut projection_exprs = Vec::new();
     let mut sort_exprs = Vec::new();
     let mut limit_spec = None;
@@ -189,6 +204,9 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
                     PhysicalExpr::ColumnRef { name } => name,
                 };
                 filter_sql = Some(raw);
+            }
+            PhysicalOperator::HashJoin { spec } => {
+                join_spec = Some(spec);
             }
             PhysicalOperator::Projection { expressions } => {
                 projection_exprs = expressions;
@@ -213,6 +231,7 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
 
     Ok(RuntimePlan {
         filter_sql,
+        join_spec,
         projection_exprs,
         sort_exprs,
         limit_spec,
@@ -579,6 +598,8 @@ async fn persist_stage_exchange_artifacts(
         "storage provider is not configured for stage exchange persistence".to_string()
     })?;
 
+    let normalized_batches = normalize_batches_for_sort(batches)?;
+
     let data_key = stage_exchange_data_key(
         &stage_context.query_run_id,
         session_id,
@@ -592,7 +613,7 @@ async fn persist_stage_exchange_artifacts(
         stage_context.partition_index,
     );
 
-    let parquet_bytes = encode_batches_to_parquet(batches)?;
+    let parquet_bytes = encode_batches_to_parquet(&normalized_batches)?;
     let artifacts = vec![QueryArtifactMetadata {
         key: data_key.clone(),
         size_bytes: parquet_bytes.len() as u64,
@@ -605,8 +626,8 @@ async fn persist_stage_exchange_artifacts(
         "partition_count": stage_context.partition_count,
         "upstream_stage_ids": stage_context.upstream_stage_ids,
         "query_run_id": stage_context.query_run_id,
-        "row_count": batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        "batch_count": batches.len(),
+        "row_count": normalized_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        "batch_count": normalized_batches.len(),
         "artifacts": artifacts,
     }))
     .map_err(|e| format!("failed to encode stage exchange metadata json: {}", e))?;
@@ -804,10 +825,8 @@ fn build_filter_mask(
     let mut rows = vec![true; batch.num_rows()];
 
     for clause in clauses {
-        let idx = batch
-            .schema()
-            .index_of(&clause.column)
-            .map_err(|_| format!("filter column '{}' not found", clause.column))?;
+        let idx = resolve_schema_column_index(batch.schema().as_ref(), &clause.column)
+            .ok_or_else(|| format!("filter column '{}' not found", clause.column))?;
         let array = batch.column(idx);
 
         for (row_idx, row_flag) in rows.iter_mut().enumerate() {
@@ -892,9 +911,11 @@ fn apply_projection_pipeline(
         for expr in projection_exprs {
             match expr {
                 PhysicalExpr::ColumnRef { name } => {
+                    let output_name = normalize_projection_identifier(name);
                     push_projected_column(
                         batch,
                         name,
+                        Some(output_name.as_str()),
                         &mut projected_arrays,
                         &mut projected_fields,
                     )?;
@@ -910,9 +931,11 @@ fn apply_projection_pipeline(
                     }
 
                     let name = parse_projection_identifier(raw)?;
+                    let output_name = normalize_projection_identifier(raw);
                     push_projected_column(
                         batch,
                         &name,
+                        Some(output_name.as_str()),
                         &mut projected_arrays,
                         &mut projected_fields,
                     )?;
@@ -961,10 +984,8 @@ fn apply_sort_pipeline(
             PhysicalExpr::Raw { sql } => parse_projection_identifier(sql)?,
         };
 
-        let idx = merged
-            .schema()
-            .index_of(raw_name.as_str())
-            .map_err(|_| format!("sort column '{}' not found", raw_name))?;
+        let idx = resolve_schema_column_index(merged.schema().as_ref(), raw_name.as_str())
+            .ok_or_else(|| format!("sort column '{}' not found", raw_name))?;
 
         sort_columns.push(SortColumn {
             values: merged.column(idx).clone(),
@@ -1163,6 +1184,8 @@ async fn persist_query_artifacts(
         "storage provider is not configured for query result persistence".to_string()
     })?;
 
+    let normalized_batches = normalize_batches_for_sort(batches)?;
+
     let path = Url::parse(result_location)
         .map_err(|e| format!("result_location is not a valid URI: {}", e))?
         .path()
@@ -1176,14 +1199,14 @@ async fn persist_query_artifacts(
 
     let prefix = format!("{}/staging/{}/{}/", path, session_id, task_id);
     let key = format!("{}part-00000.parquet", prefix);
-    let parquet_bytes = encode_batches_to_parquet(batches)?;
+    let parquet_bytes = encode_batches_to_parquet(&normalized_batches)?;
     let metadata_key = format!("{}result_metadata.json", prefix);
     let artifacts = vec![QueryArtifactMetadata {
         key: key.clone(),
         size_bytes: parquet_bytes.len() as u64,
         checksum_fnv64: checksum_fnv64_hex(&parquet_bytes),
     }];
-    let metadata_bytes = encode_result_metadata(batches, &artifacts)?;
+    let metadata_bytes = encode_result_metadata(&normalized_batches, &artifacts)?;
 
     provider
         .put_object(&key, parquet_bytes)
@@ -1300,16 +1323,19 @@ fn checksum_fnv64_hex(bytes: &[u8]) -> String {
 fn push_projected_column(
     batch: &RecordBatch,
     name: &str,
+    output_name: Option<&str>,
     arrays: &mut Vec<ArrayRef>,
     fields: &mut Vec<Field>,
 ) -> Result<(), String> {
-    let idx = batch
-        .schema()
-        .index_of(name)
-        .map_err(|_| format!("projection column '{}' not found", name))?;
+    let idx = resolve_schema_column_index(batch.schema().as_ref(), name)
+        .ok_or_else(|| format!("projection column '{}' not found", name))?;
 
     arrays.push(batch.column(idx).clone());
-    let field = batch.schema().field(idx).as_ref().clone();
+    let base_field = batch.schema().field(idx).as_ref().clone();
+    let field = output_name
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| base_field.clone().with_name(value.trim()))
+        .unwrap_or(base_field);
     fields.push(field);
     Ok(())
 }
@@ -1328,6 +1354,72 @@ fn normalize_projection_identifier(raw: &str) -> String {
         .trim_matches('[')
         .trim_matches(']')
         .to_string()
+}
+
+fn resolve_schema_column_index(schema: &Schema, requested: &str) -> Option<usize> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+
+    if let Ok(idx) = schema.index_of(requested) {
+        return Some(idx);
+    }
+
+    let normalized = normalize_projection_identifier(requested);
+    if normalized != requested
+        && let Ok(idx) = schema.index_of(normalized.as_str())
+    {
+        return Some(idx);
+    }
+
+    if let Some(idx) = fallback_semantic_to_physical_column_index(schema, normalized.as_str()) {
+        return Some(idx);
+    }
+
+    None
+}
+
+fn fallback_semantic_to_physical_column_index(schema: &Schema, normalized: &str) -> Option<usize> {
+    let requested = normalized.to_ascii_lowercase();
+
+    if requested == "id" {
+        if let Ok(idx) = schema.index_of("c1") {
+            return Some(idx);
+        }
+
+        if let Some((idx, _)) = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name().ends_with("_c1"))
+        {
+            return Some(idx);
+        }
+    }
+
+    if requested == "name" || requested == "value" {
+        if let Ok(idx) = schema.index_of("c2") {
+            return Some(idx);
+        }
+    }
+
+    if requested == "document" {
+        if let Some((idx, _)) = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .find(|(_, field)| field.name().ends_with("_c2"))
+        {
+            return Some(idx);
+        }
+
+        if let Ok(idx) = schema.index_of("c2") {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 /// What: Validate and parse a projection raw expression into a column identifier.

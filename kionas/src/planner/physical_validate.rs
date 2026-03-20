@@ -95,6 +95,46 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
             )
         })?;
 
+    let hash_join_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+        .count();
+    if hash_join_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one hash join".to_string(),
+        ));
+    }
+
+    if let Some(join_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+    {
+        if join_index > projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear before projection".to_string(),
+            ));
+        }
+
+        if join_index == 0 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear after table scan".to_string(),
+            ));
+        }
+
+        if let Some(sort_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+            && join_index > sort_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear before sort".to_string(),
+            ));
+        }
+    }
+
     if let Some(sort_index) = plan
         .operators
         .iter()
@@ -154,10 +194,21 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
                 }
             }
             PhysicalOperator::Limit { spec: _ } => {}
-            PhysicalOperator::HashJoin { .. } => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "HashJoin".to_string(),
-                ));
+            PhysicalOperator::HashJoin { spec } => {
+                if spec.keys.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "hash join must include at least one key".to_string(),
+                    ));
+                }
+
+                if spec.right_relation.database.trim().is_empty()
+                    || spec.right_relation.schema.trim().is_empty()
+                    || spec.right_relation.table.trim().is_empty()
+                {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "hash join right relation must be non-empty".to_string(),
+                    ));
+                }
             }
             PhysicalOperator::NestedLoopJoin => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
@@ -242,10 +293,6 @@ mod tests {
     #[test]
     fn rejects_each_deferred_operator() {
         let cases = vec![
-            (
-                PhysicalOperator::HashJoin { on: Vec::new() },
-                "HashJoin".to_string(),
-            ),
             (
                 PhysicalOperator::NestedLoopJoin,
                 "NestedLoopJoin".to_string(),
@@ -334,6 +381,30 @@ mod tests {
         );
 
         validate_physical_plan(&plan).expect("must accept supported predicate");
+    }
+
+    #[test]
+    fn accepts_hash_join_with_keys_after_projection() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::HashJoin {
+                spec: crate::planner::PhysicalJoinSpec {
+                    join_type: crate::planner::JoinType::Inner,
+                    right_relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    keys: vec![crate::planner::JoinKeyPair {
+                        left: "users.id".to_string(),
+                        right: "orders.user_id".to_string(),
+                    }],
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("hash join with keys must be accepted");
     }
 
     #[test]

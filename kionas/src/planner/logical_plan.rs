@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::planner::join_spec::LogicalJoinSpec;
+
 /// What: Logical expression for Phase 1 minimal SELECT support.
 ///
 /// Inputs:
@@ -73,6 +75,7 @@ pub struct LogicalSortExpr {
 /// - `relation`: Single source relation.
 /// - `projection`: Projection expression node.
 /// - `selection`: Optional filter node.
+/// - `joins`: Optional join directives.
 /// - `order_by`: Optional ordering directives.
 /// - `limit`: Optional row-count limit.
 /// - `offset`: Optional row offset applied before limit.
@@ -85,6 +88,7 @@ pub struct LogicalPlan {
     pub relation: LogicalRelation,
     pub projection: LogicalProjection,
     pub selection: Option<LogicalSelection>,
+    pub joins: Vec<LogicalJoinSpec>,
     pub order_by: Vec<LogicalSortExpr>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,

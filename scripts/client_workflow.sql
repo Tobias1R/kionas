@@ -42,3 +42,12 @@ select * from abc.schema1.table1 order by c1 limit 3 offset 2;
 select * from abc.schema1.table1 limit 0;
 select * from abc.schema1.table1 limit 5 offset 999;
 
+-- EQUI JOIN TESTS
+-- Create another table to join with
+create table abc.schema1.table2 (id int, document string);
+insert into abc.schema1.table2 values (1, 'Doc1'), (2, 'Doc2'), (3, 'Doc3'), (4, 'Doc4'), (5, 'Doc5');
+
+-- Simple INNER JOIN
+select t1.id, t1.name, t2.document from abc.schema1.table1 t1 join abc.schema1.table2 t2 on t1.id = t2.id where t1.id > 1 order by t1.id limit 6;
+
+select t1.c1, t1.c2, t2.table2_c2 from abc.schema1.table1 t1 join abc.schema1.table2 t2 on t1.c1 = t2.c1 order by t1.c1;

@@ -9,6 +9,7 @@
 pub enum PlannerError {
     EmptyProjection,
     EmptyRelation,
+    InvalidLogicalPlan(String),
     EmptyPhysicalPlan,
     InvalidPhysicalPipeline(String),
     InvalidDistributedPlan(String),
@@ -21,6 +22,9 @@ impl std::fmt::Display for PlannerError {
         match self {
             PlannerError::EmptyProjection => write!(f, "logical plan projection cannot be empty"),
             PlannerError::EmptyRelation => write!(f, "logical plan relation cannot be empty"),
+            PlannerError::InvalidLogicalPlan(message) => {
+                write!(f, "invalid logical plan: {}", message)
+            }
             PlannerError::EmptyPhysicalPlan => {
                 write!(f, "physical plan operator list cannot be empty")
             }

@@ -38,6 +38,22 @@ fn render_operator_diagnostic(operator: &PhysicalOperator) -> String {
         PhysicalOperator::Limit { spec } => {
             format!("Limit(count={}, offset={})", spec.count, spec.offset)
         }
+        PhysicalOperator::HashJoin { spec } => {
+            let keys = spec
+                .keys
+                .iter()
+                .map(|key| format!("{}={}", key.left, key.right))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "HashJoin(type={:?}, right={}.{}.{}, keys=[{}])",
+                spec.join_type,
+                spec.right_relation.database,
+                spec.right_relation.schema,
+                spec.right_relation.table,
+                keys
+            )
+        }
         _ => operator.canonical_name().to_string(),
     }
 }
@@ -57,12 +73,13 @@ pub fn explain_logical_plan(plan: &LogicalPlan) -> String {
     };
 
     format!(
-        "LogicalPlan relation={}.{}.{} projection_count={} selection={}",
+        "LogicalPlan relation={}.{}.{} projection_count={} selection={} join_count={}",
         plan.relation.database,
         plan.relation.schema,
         plan.relation.table,
         plan.projection.expressions.len(),
-        selection
+        selection,
+        plan.joins.len()
     )
 }
 
@@ -151,6 +168,7 @@ mod tests {
                     sql: "active = true".to_string(),
                 },
             }),
+            joins: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,

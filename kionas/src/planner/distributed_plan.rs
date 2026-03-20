@@ -84,6 +84,49 @@ pub struct DistributedPhysicalPlan {
 /// Details:
 /// - This compatibility bridge allows phased rollout without changing current execution behavior.
 pub fn distributed_from_physical_plan(plan: &PhysicalPlan) -> DistributedPhysicalPlan {
+    if let Some(join_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+    {
+        let mut stage0_ops = plan.operators[..join_index].to_vec();
+        if !matches!(stage0_ops.last(), Some(PhysicalOperator::Materialize)) {
+            stage0_ops.push(PhysicalOperator::Materialize);
+        }
+
+        let mut stage1_ops = plan.operators[join_index..].to_vec();
+        if !matches!(stage1_ops.last(), Some(PhysicalOperator::Materialize)) {
+            stage1_ops.push(PhysicalOperator::Materialize);
+        }
+
+        let stage0_partition = match &plan.operators[join_index] {
+            PhysicalOperator::HashJoin { spec } if !spec.keys.is_empty() => PartitionSpec::Hash {
+                keys: spec.keys.iter().map(|k| k.left.clone()).collect::<Vec<_>>(),
+            },
+            _ => PartitionSpec::Single,
+        };
+
+        return DistributedPhysicalPlan {
+            stages: vec![
+                DistributedStage {
+                    stage_id: 0,
+                    operators: stage0_ops,
+                    partition_spec: stage0_partition,
+                },
+                DistributedStage {
+                    stage_id: 1,
+                    operators: stage1_ops,
+                    partition_spec: PartitionSpec::Single,
+                },
+            ],
+            dependencies: vec![StageDependency {
+                from_stage_id: 0,
+                to_stage_id: 1,
+            }],
+            sql: plan.sql.clone(),
+        };
+    }
+
     DistributedPhysicalPlan {
         stages: vec![DistributedStage {
             stage_id: 0,
@@ -98,6 +141,7 @@ pub fn distributed_from_physical_plan(plan: &PhysicalPlan) -> DistributedPhysica
 #[cfg(test)]
 mod tests {
     use super::distributed_from_physical_plan;
+    use crate::planner::join_spec::PhysicalJoinSpec;
     use crate::planner::logical_plan::LogicalRelation;
     use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 
@@ -127,5 +171,52 @@ mod tests {
         assert!(distributed.dependencies.is_empty());
         assert_eq!(distributed.stages[0].stage_id, 0);
         assert_eq!(distributed.stages[0].operators, plan.operators);
+    }
+
+    #[test]
+    fn splits_hash_join_into_two_stages() {
+        let plan = PhysicalPlan {
+            operators: vec![
+                PhysicalOperator::TableScan {
+                    relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "users".to_string(),
+                    },
+                },
+                PhysicalOperator::Filter {
+                    predicate: PhysicalExpr::Raw {
+                        sql: "active = true".to_string(),
+                    },
+                },
+                PhysicalOperator::HashJoin {
+                    spec: PhysicalJoinSpec {
+                        join_type: crate::planner::JoinType::Inner,
+                        right_relation: LogicalRelation {
+                            database: "sales".to_string(),
+                            schema: "public".to_string(),
+                            table: "orders".to_string(),
+                        },
+                        keys: vec![crate::planner::JoinKeyPair {
+                            left: "users.id".to_string(),
+                            right: "orders.user_id".to_string(),
+                        }],
+                    },
+                },
+                PhysicalOperator::Projection {
+                    expressions: vec![PhysicalExpr::Raw {
+                        sql: "users.id".to_string(),
+                    }],
+                },
+                PhysicalOperator::Materialize,
+            ],
+            sql: "SELECT users.id FROM sales.public.users INNER JOIN sales.public.orders ON users.id = orders.user_id".to_string(),
+        };
+
+        let distributed = distributed_from_physical_plan(&plan);
+        assert_eq!(distributed.stages.len(), 2);
+        assert_eq!(distributed.dependencies.len(), 1);
+        assert_eq!(distributed.dependencies[0].from_stage_id, 0);
+        assert_eq!(distributed.dependencies[0].to_stage_id, 1);
     }
 }

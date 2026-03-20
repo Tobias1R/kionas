@@ -1,5 +1,6 @@
 use crate::parser::datafusion_sql::sqlparser::ast::{
-    Query as SqlQuery, Select, SetExpr, TableFactor,
+    BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query as SqlQuery, Select, SetExpr,
+    TableFactor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,6 +58,48 @@ pub struct SortSpec {
     pub ascending: bool,
 }
 
+/// What: Supported join type in query-model payload.
+///
+/// Inputs:
+/// - Variant selected during AST extraction.
+///
+/// Output:
+/// - Stable join type consumed by logical translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QueryJoinType {
+    Inner,
+}
+
+/// What: One equi-join key pair from a JOIN ON clause.
+///
+/// Inputs:
+/// - `left`: Left expression text.
+/// - `right`: Right expression text.
+///
+/// Output:
+/// - Serializable join key pair entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryJoinKey {
+    pub left: String,
+    pub right: String,
+}
+
+/// What: Canonical query-model representation for one JOIN clause.
+///
+/// Inputs:
+/// - `join_type`: Supported join variant.
+/// - `right`: Canonical right relation namespace.
+/// - `keys`: Equi-join key pairs.
+///
+/// Output:
+/// - Serializable join directive consumed by logical planner translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryJoinSpec {
+    pub join_type: QueryJoinType,
+    pub right: QueryNamespace,
+    pub keys: Vec<QueryJoinKey>,
+}
+
 /// What: Shared semantic model for a minimal SELECT query.
 ///
 /// Inputs:
@@ -79,6 +122,7 @@ pub struct SelectQueryModel {
     pub namespace: QueryNamespace,
     pub projection: Vec<String>,
     pub selection: Option<String>,
+    pub joins: Vec<QueryJoinSpec>,
     pub order_by: Vec<SortSpec>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -115,6 +159,10 @@ pub enum QueryModelError {
     UnsupportedSetOperation,
     UnsupportedMultiTableFrom,
     UnsupportedJoin,
+    UnsupportedJoinType(String),
+    UnsupportedJoinConstraint,
+    UnsupportedJoinExpression(String),
+    MissingJoinKeys,
     UnsupportedTableFactor,
     PlannerTranslationFailed(String),
     PlannerPhysicalFailed(String),
@@ -138,6 +186,18 @@ impl std::fmt::Display for QueryModelError {
             }
             QueryModelError::UnsupportedJoin => {
                 write!(f, "JOIN is not supported in this phase")
+            }
+            QueryModelError::UnsupportedJoinType(kind) => {
+                write!(f, "JOIN type '{}' is not supported in this phase", kind)
+            }
+            QueryModelError::UnsupportedJoinConstraint => {
+                write!(f, "JOIN must use an ON clause in this phase")
+            }
+            QueryModelError::UnsupportedJoinExpression(message) => {
+                write!(f, "unsupported JOIN expression: {}", message)
+            }
+            QueryModelError::MissingJoinKeys => {
+                write!(f, "JOIN must include at least one equality key")
             }
             QueryModelError::UnsupportedTableFactor => write!(
                 f,
@@ -365,12 +425,95 @@ fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> 
         return Err(QueryModelError::UnsupportedMultiTableFrom);
     }
 
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return Err(QueryModelError::UnsupportedJoin);
+    // Removed unused variable
+    Ok(select)
+}
+
+fn parse_join_column_ref(expr: &Expr) -> Result<String, QueryModelError> {
+    match expr {
+        Expr::Identifier(identifier) => Ok(identifier.to_string()),
+        Expr::CompoundIdentifier(parts) => Ok(parts
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".")),
+        _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+    }
+}
+
+fn parse_join_keys(expr: &Expr, out: &mut Vec<QueryJoinKey>) -> Result<(), QueryModelError> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                parse_join_keys(left, out)?;
+                parse_join_keys(right, out)?;
+                Ok(())
+            }
+            BinaryOperator::Eq => {
+                let left_key = parse_join_column_ref(left)?;
+                let right_key = parse_join_column_ref(right)?;
+                out.push(QueryJoinKey {
+                    left: left_key,
+                    right: right_key,
+                });
+                Ok(())
+            }
+            _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+        },
+        _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+    }
+}
+
+fn parse_join_specs(
+    joins: &[Join],
+    default_database: &str,
+    default_schema: &str,
+) -> Result<Vec<QueryJoinSpec>, QueryModelError> {
+    let mut specs = Vec::with_capacity(joins.len());
+
+    for join in joins {
+        let right_table = match &join.relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(QueryModelError::UnsupportedTableFactor),
+        };
+
+        let (join_type, constraint) = match &join.join_operator {
+            JoinOperator::Inner(constraint) => (QueryJoinType::Inner, constraint),
+            JoinOperator::Join(constraint) => (QueryJoinType::Inner, constraint),
+            _ => {
+                return Err(QueryModelError::UnsupportedJoinType(
+                    "non-inner".to_string(),
+                ));
+            }
+        };
+
+        let on = match constraint {
+            JoinConstraint::On(expr) => expr,
+            _ => return Err(QueryModelError::UnsupportedJoinConstraint),
+        };
+
+        let mut keys = Vec::new();
+        parse_join_keys(on, &mut keys)?;
+        if keys.is_empty() {
+            return Err(QueryModelError::MissingJoinKeys);
+        }
+
+        let (database, schema, table) =
+            canonicalize_table_namespace(&right_table, default_database, default_schema);
+
+        specs.push(QueryJoinSpec {
+            join_type,
+            right: QueryNamespace {
+                database,
+                schema,
+                table,
+                raw: right_table,
+            },
+            keys,
+        });
     }
 
-    Ok(select)
+    Ok(specs)
 }
 
 /// What: Build a shared dispatch envelope for a minimal SELECT query.
@@ -425,6 +568,7 @@ pub fn build_select_query_dispatch_envelope(
             .selection
             .as_ref()
             .map(std::string::ToString::to_string),
+        joins: parse_join_specs(&from.joins, default_database, default_schema)?,
         order_by: parse_order_by_from_sql(canonical_sql.as_str()),
         limit,
         offset,
@@ -461,6 +605,7 @@ pub fn build_select_query_dispatch_envelope(
         "namespace": model.namespace,
         "projection": model.projection,
         "selection": model.selection,
+        "joins": model.joins,
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,

@@ -25,6 +25,21 @@ pub fn validate_logical_plan(plan: &LogicalPlan) -> Result<(), PlannerError> {
         return Err(PlannerError::EmptyProjection);
     }
 
+    for join in &plan.joins {
+        if join.right_relation.database.trim().is_empty()
+            || join.right_relation.schema.trim().is_empty()
+            || join.right_relation.table.trim().is_empty()
+        {
+            return Err(PlannerError::EmptyRelation);
+        }
+
+        if join.keys.is_empty() {
+            return Err(PlannerError::InvalidLogicalPlan(
+                "join must include at least one key".to_string(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -46,6 +61,7 @@ mod tests {
                 expressions: Vec::new(),
             },
             selection: None,
+            joins: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,

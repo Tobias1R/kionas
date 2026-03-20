@@ -533,15 +533,28 @@ async fn execute_and_render_query(
         .map_err(|e| format!("query dispatch failed: {}", e))?
         .into_inner();
 
-    println!(
-        "status={} error_code={} message={}",
-        response.status, response.error_code, response.message
-    );
+    // if status is not OK, we expect error_code and message to be populated for debugging. If status is OK, error_code should be 0 and message may or may not be populated but should not contain critical error info.
+    // print the error code and message in either case for visibility, but the client should primarily rely on the status field for control flow decisions.
 
-    if let Some(handle) = query_handle_from_response(&response) {
-        println!("Structured query handle: {}", handle);
-        let batches = fetch_doget_batches(&handle).await?;
-        print_batches_as_table(&batches)?;
+    if response.error_code != "0".to_string() {
+        println!(
+            "Query failed with status={} error_code={} message={}",
+            response.status, response.error_code, response.message
+        );
+    } else {
+        if let Some(handle) = query_handle_from_response(&response) {
+            // println!("Structured query handle: {}", handle);
+            let batches = fetch_doget_batches(&handle).await?;
+            print_batches_as_table(&batches)?;
+        }
+        if response.status == "OK".to_string() {
+            println!("Query executed successfully");
+        } else {
+            println!(
+                "Query completed with status={} error_code={} message={}",
+                response.status, response.error_code, response.message
+            );
+        }
     }
 
     Ok(())

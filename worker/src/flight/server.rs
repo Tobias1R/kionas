@@ -1,6 +1,6 @@
 use crate::state::SharedData;
-use arrow::datatypes::{DataType, Field};
 use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;

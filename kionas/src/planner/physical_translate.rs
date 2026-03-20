@@ -1,6 +1,7 @@
 use crate::planner::distributed_plan::{DistributedPhysicalPlan, distributed_from_physical_plan};
 use crate::planner::distributed_validate::validate_distributed_physical_plan;
 use crate::planner::error::PlannerError;
+use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::LogicalPlan;
 use crate::planner::physical_plan::{
     PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
@@ -28,6 +29,16 @@ pub fn build_physical_plan_from_logical_plan(
     if let Some(selection) = &plan.selection {
         operators.push(PhysicalOperator::Filter {
             predicate: PhysicalExpr::from(&selection.predicate),
+        });
+    }
+
+    for join in &plan.joins {
+        operators.push(PhysicalOperator::HashJoin {
+            spec: PhysicalJoinSpec {
+                join_type: join.join_type.clone(),
+                right_relation: join.right_relation.clone(),
+                keys: join.keys.clone(),
+            },
         });
     }
 
@@ -102,6 +113,7 @@ mod tests {
         LogicalSortExpr,
     };
     use crate::planner::physical_plan::PhysicalOperator;
+    use crate::planner::{JoinKeyPair, JoinType, LogicalJoinSpec};
 
     #[test]
     fn builds_linear_pipeline_with_filter() {
@@ -121,6 +133,7 @@ mod tests {
                     sql: "active = true".to_string(),
                 },
             }),
+            joins: Vec::new(),
             order_by: vec![LogicalSortExpr {
                 expression: LogicalExpr::Raw {
                     sql: "id".to_string(),
@@ -174,6 +187,7 @@ mod tests {
                 }],
             },
             selection: None,
+            joins: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -185,5 +199,46 @@ mod tests {
         assert_eq!(distributed.stages.len(), 1);
         assert!(distributed.dependencies.is_empty());
         assert_eq!(distributed.sql, plan.sql);
+    }
+
+    #[test]
+    fn emits_hash_join_operator_for_join_spec() {
+        let plan = LogicalPlan {
+            relation: LogicalRelation {
+                database: "sales".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+            },
+            projection: LogicalProjection {
+                expressions: vec![LogicalExpr::Raw {
+                    sql: "users.id".to_string(),
+                }],
+            },
+            selection: None,
+            joins: vec![LogicalJoinSpec {
+                join_type: JoinType::Inner,
+                right_relation: LogicalRelation {
+                    database: "sales".to_string(),
+                    schema: "public".to_string(),
+                    table: "orders".to_string(),
+                },
+                keys: vec![JoinKeyPair {
+                    left: "users.id".to_string(),
+                    right: "orders.user_id".to_string(),
+                }],
+            }],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            sql: "SELECT users.id FROM sales.public.users INNER JOIN sales.public.orders ON users.id = orders.user_id".to_string(),
+        };
+
+        let physical = build_physical_plan_from_logical_plan(&plan).expect("physical plan");
+        assert!(
+            physical
+                .operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+        );
     }
 }

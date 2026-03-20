@@ -1,4 +1,5 @@
 use crate::planner::error::PlannerError;
+use crate::planner::join_spec::{JoinKeyPair, JoinType, LogicalJoinSpec};
 use crate::planner::logical_plan::{
     LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };
@@ -38,6 +39,28 @@ pub fn build_logical_plan_from_select_model(
                 sql: predicate.clone(),
             },
         }),
+        joins: model
+            .joins
+            .iter()
+            .map(|join| LogicalJoinSpec {
+                join_type: match join.join_type {
+                    crate::sql::query_model::QueryJoinType::Inner => JoinType::Inner,
+                },
+                right_relation: LogicalRelation {
+                    database: join.right.database.clone(),
+                    schema: join.right.schema.clone(),
+                    table: join.right.table.clone(),
+                },
+                keys: join
+                    .keys
+                    .iter()
+                    .map(|key| JoinKeyPair {
+                        left: key.left.clone(),
+                        right: key.right.clone(),
+                    })
+                    .collect::<Vec<_>>(),
+            })
+            .collect::<Vec<_>>(),
         order_by: model
             .order_by
             .iter()
@@ -76,6 +99,7 @@ mod tests {
             },
             projection: vec!["id".to_string(), "name".to_string()],
             selection: Some("active = true".to_string()),
+            joins: Vec::new(),
             order_by: vec![SortSpec {
                 expression: "id".to_string(),
                 ascending: true,

@@ -1,3 +1,4 @@
+use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::{LogicalExpr, LogicalRelation};
 use serde::{Deserialize, Serialize};
 
@@ -60,7 +61,7 @@ pub enum PhysicalOperator {
     Projection { expressions: Vec<PhysicalExpr> },
     Materialize,
 
-    HashJoin { on: Vec<String> },
+    HashJoin { spec: PhysicalJoinSpec },
     NestedLoopJoin,
     AggregatePartial,
     AggregateFinal,
