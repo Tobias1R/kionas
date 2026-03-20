@@ -4,6 +4,7 @@ pub(crate) mod create_table;
 pub(crate) mod distributed_dag;
 pub(crate) mod helpers;
 pub(crate) mod query_select;
+pub(crate) mod rbac;
 pub mod use_warehouse;
 
 use crate::warehouse::state::SharedData;
@@ -253,6 +254,11 @@ pub async fn maybe_handle_direct_command(
     session_id: &str,
     shared_data: &SharedData,
 ) -> Option<String> {
+    if let Some(msg) = rbac::maybe_handle_rbac_direct_command(query, session_id, shared_data).await
+    {
+        return Some(msg);
+    }
+
     let q_trim = query.trim();
     let q_lower = q_trim.to_lowercase();
     if q_lower.starts_with("use warehouse") {

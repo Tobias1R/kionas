@@ -1,9 +1,13 @@
 use crate::services::metastore_service::metastore_service::{
-    CreateDatabaseRequest, CreateDatabaseResponse, CreateSchemaRequest, CreateSchemaResponse,
-    CreateTableRequest, CreateTableResponse, DropSchemaRequest, DropSchemaResponse,
-    DropTableRequest, DropTableResponse, GetDatabaseRequest, GetDatabaseResponse, GetSchemaRequest,
+    CreateDatabaseRequest, CreateDatabaseResponse, CreateGroupRequest, CreateGroupResponse,
+    CreateRoleRequest, CreateRoleResponse, CreateSchemaRequest, CreateSchemaResponse,
+    CreateTableRequest, CreateTableResponse, CreateUserRequest, CreateUserResponse,
+    DeleteGroupRequest, DeleteGroupResponse, DeleteUserRequest, DeleteUserResponse,
+    DropRoleRequest, DropRoleResponse, DropSchemaRequest, DropSchemaResponse, DropTableRequest,
+    DropTableResponse, GetDatabaseRequest, GetDatabaseResponse, GetSchemaRequest,
     GetSchemaResponse, GetTableRequest, GetTableResponse, GetTableStatisticsRequest,
-    GetTableStatisticsResponse, UpdateTableStatisticsRequest, UpdateTableStatisticsResponse,
+    GetTableStatisticsResponse, GrantRoleRequest, GrantRoleResponse, UpdateTableStatisticsRequest,
+    UpdateTableStatisticsResponse,
 };
 use crate::services::metastore_service::metastore_service::{
     CreateTransactionRequest, CreateTransactionResponse, GetTransactionRequest,
@@ -42,6 +46,83 @@ pub trait MetastoreProvider: Send + Sync {
         req: UpdateTransactionStateRequest,
     ) -> UpdateTransactionStateResponse;
     async fn get_transaction(&self, req: GetTransactionRequest) -> GetTransactionResponse;
+    /// What: Creates a new RBAC user principal.
+    ///
+    /// Inputs:
+    /// - `req`: Create user payload containing `username`
+    ///
+    /// Output:
+    /// - `CreateUserResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Reserved principal validation is applied by provider implementation.
+    async fn create_user(&self, req: CreateUserRequest) -> CreateUserResponse;
+    /// What: Deletes an existing RBAC user principal.
+    ///
+    /// Inputs:
+    /// - `req`: Delete user payload containing `username`
+    ///
+    /// Output:
+    /// - `DeleteUserResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Reserved principals are protected from deletion.
+    async fn delete_user(&self, req: DeleteUserRequest) -> DeleteUserResponse;
+    /// What: Creates a new RBAC group principal.
+    ///
+    /// Inputs:
+    /// - `req`: Create group payload containing `group_name`
+    ///
+    /// Output:
+    /// - `CreateGroupResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Group name uniqueness is enforced by database constraints.
+    async fn create_group(&self, req: CreateGroupRequest) -> CreateGroupResponse;
+    /// What: Deletes an RBAC group principal.
+    ///
+    /// Inputs:
+    /// - `req`: Delete group payload containing `group_name`
+    ///
+    /// Output:
+    /// - `DeleteGroupResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Dependent relationships are handled by schema constraints.
+    async fn delete_group(&self, req: DeleteGroupRequest) -> DeleteGroupResponse;
+    /// What: Creates a new RBAC role.
+    ///
+    /// Inputs:
+    /// - `req`: Create role payload with name and optional description
+    ///
+    /// Output:
+    /// - `CreateRoleResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Role names are normalized by implementation before persistence.
+    async fn create_role(&self, req: CreateRoleRequest) -> CreateRoleResponse;
+    /// What: Removes an RBAC role.
+    ///
+    /// Inputs:
+    /// - `req`: Drop role payload containing `role_name`
+    ///
+    /// Output:
+    /// - `DropRoleResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Reserved ADMIN role is protected from removal.
+    async fn drop_role(&self, req: DropRoleRequest) -> DropRoleResponse;
+    /// What: Binds an RBAC role to a user or group principal.
+    ///
+    /// Inputs:
+    /// - `req`: Grant payload with role, principal type/name, and actor
+    ///
+    /// Output:
+    /// - `GrantRoleResponse` with success flag and message
+    ///
+    /// Details:
+    /// - Provider validates principal and role existence before insert.
+    async fn grant_role(&self, req: GrantRoleRequest) -> GrantRoleResponse;
 }
 
 // Example Postgres provider stub
@@ -63,6 +144,67 @@ impl PostgresProvider {
         let pool = deadpool_postgres::Pool::builder(mgr).max_size(16).build()?;
         Ok(PostgresProvider { pool })
     }
+}
+
+/// What: Formats Postgres errors for RBAC operations with actionable diagnostics.
+///
+/// Inputs:
+/// - `context`: Operation-specific prefix for the error message
+/// - `error`: Postgres driver error
+///
+/// Output:
+/// - Human-readable error string including SQLSTATE when available
+///
+/// Details:
+/// - Adds an explicit migration hint when SQLSTATE is `42P01` (undefined table), which
+///   usually indicates metastore initialization has not applied RBAC tables yet.
+fn format_rbac_db_error(context: &str, error: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = error.as_db_error() {
+        let sqlstate = db_error.code().code();
+        if sqlstate == "42P01" {
+            return format!(
+                "{}: missing RBAC metastore tables (sqlstate {}). run scripts/metastore/init.sql and restart metastore",
+                context, sqlstate
+            );
+        }
+
+        let detail = db_error.detail().unwrap_or("");
+        if detail.is_empty() {
+            return format!(
+                "{}: {} (sqlstate {})",
+                context,
+                db_error.message(),
+                sqlstate
+            );
+        }
+        return format!(
+            "{}: {} (sqlstate {}, detail: {})",
+            context,
+            db_error.message(),
+            sqlstate,
+            detail
+        );
+    }
+
+    format!("{}: {}", context, error)
+}
+
+/// What: Checks whether a Postgres error is a unique-constraint violation.
+///
+/// Inputs:
+/// - `error`: Postgres driver error from an operation
+///
+/// Output:
+/// - `true` when SQLSTATE is `23505`
+///
+/// Details:
+/// - Used to convert database uniqueness failures into deterministic
+///   user-facing RBAC validation messages.
+fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
+    error
+        .as_db_error()
+        .map(|db_error| db_error.code().code() == "23505")
+        .unwrap_or(false)
 }
 
 #[async_trait]
@@ -643,6 +785,456 @@ impl MetastoreProvider for PostgresProvider {
                 message: format!("Failed to get transaction: {}", e),
                 transaction: None,
             },
+        }
+    }
+
+    /// What: Creates a new RBAC user row in metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Create user payload
+    ///
+    /// Output:
+    /// - `CreateUserResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Enforces reserved-name and non-empty username checks.
+    async fn create_user(&self, req: CreateUserRequest) -> CreateUserResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return CreateUserResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let username = req.username.trim().to_ascii_lowercase();
+        if username.is_empty() {
+            return CreateUserResponse {
+                success: false,
+                message: "username cannot be empty".to_string(),
+            };
+        }
+        if username == "kionas" {
+            return CreateUserResponse {
+                success: false,
+                message: "user 'kionas' is reserved".to_string(),
+            };
+        }
+
+        let stmt = "INSERT INTO users_rbac (username, can_login) VALUES ($1, TRUE)";
+        match client.execute(stmt, &[&username]).await {
+            Ok(_) => CreateUserResponse {
+                success: true,
+                message: format!("user '{}' created", username),
+            },
+            Err(e) => {
+                if is_unique_violation(&e) {
+                    return CreateUserResponse {
+                        success: false,
+                        message: format!("user already exists: {}", username),
+                    };
+                }
+                CreateUserResponse {
+                    success: false,
+                    message: format_rbac_db_error("failed to create user", &e),
+                }
+            }
+        }
+    }
+
+    /// What: Deletes an RBAC user row from metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Delete user payload
+    ///
+    /// Output:
+    /// - `DeleteUserResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Reserved bootstrap user cannot be removed.
+    async fn delete_user(&self, req: DeleteUserRequest) -> DeleteUserResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return DeleteUserResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let username = req.username.trim().to_ascii_lowercase();
+        if username.is_empty() {
+            return DeleteUserResponse {
+                success: false,
+                message: "username cannot be empty".to_string(),
+            };
+        }
+        if username == "kionas" {
+            return DeleteUserResponse {
+                success: false,
+                message: "user 'kionas' is reserved and cannot be deleted".to_string(),
+            };
+        }
+
+        let stmt = "DELETE FROM users_rbac WHERE username = $1";
+        match client.execute(stmt, &[&username]).await {
+            Ok(0) => DeleteUserResponse {
+                success: false,
+                message: format!("user not found: {}", username),
+            },
+            Ok(_) => DeleteUserResponse {
+                success: true,
+                message: format!("user '{}' deleted", username),
+            },
+            Err(e) => DeleteUserResponse {
+                success: false,
+                message: format_rbac_db_error("failed to delete user", &e),
+            },
+        }
+    }
+
+    /// What: Creates a new RBAC group row in metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Create group payload
+    ///
+    /// Output:
+    /// - `CreateGroupResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Group names are normalized and validated for emptiness.
+    async fn create_group(&self, req: CreateGroupRequest) -> CreateGroupResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return CreateGroupResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let group_name = req.group_name.trim().to_ascii_lowercase();
+        if group_name.is_empty() {
+            return CreateGroupResponse {
+                success: false,
+                message: "group_name cannot be empty".to_string(),
+            };
+        }
+
+        let stmt = "INSERT INTO groups_rbac (group_name) VALUES ($1)";
+        match client.execute(stmt, &[&group_name]).await {
+            Ok(_) => CreateGroupResponse {
+                success: true,
+                message: format!("group '{}' created", group_name),
+            },
+            Err(e) => {
+                if is_unique_violation(&e) {
+                    return CreateGroupResponse {
+                        success: false,
+                        message: format!("group already exists: {}", group_name),
+                    };
+                }
+                CreateGroupResponse {
+                    success: false,
+                    message: format_rbac_db_error("failed to create group", &e),
+                }
+            }
+        }
+    }
+
+    /// What: Deletes an RBAC group row from metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Delete group payload
+    ///
+    /// Output:
+    /// - `DeleteGroupResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Returns not-found semantics when no row is affected.
+    async fn delete_group(&self, req: DeleteGroupRequest) -> DeleteGroupResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return DeleteGroupResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let group_name = req.group_name.trim().to_ascii_lowercase();
+        if group_name.is_empty() {
+            return DeleteGroupResponse {
+                success: false,
+                message: "group_name cannot be empty".to_string(),
+            };
+        }
+
+        let stmt = "DELETE FROM groups_rbac WHERE group_name = $1";
+        match client.execute(stmt, &[&group_name]).await {
+            Ok(0) => DeleteGroupResponse {
+                success: false,
+                message: format!("group not found: {}", group_name),
+            },
+            Ok(_) => DeleteGroupResponse {
+                success: true,
+                message: format!("group '{}' deleted", group_name),
+            },
+            Err(e) => DeleteGroupResponse {
+                success: false,
+                message: format_rbac_db_error("failed to delete group", &e),
+            },
+        }
+    }
+
+    /// What: Creates a new RBAC role row in metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Create role payload
+    ///
+    /// Output:
+    /// - `CreateRoleResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Role name is normalized to uppercase for canonical matching.
+    async fn create_role(&self, req: CreateRoleRequest) -> CreateRoleResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return CreateRoleResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let role_name = req.role_name.trim().to_ascii_uppercase();
+        if role_name.is_empty() {
+            return CreateRoleResponse {
+                success: false,
+                message: "role_name cannot be empty".to_string(),
+            };
+        }
+
+        let stmt = "INSERT INTO roles_rbac (role_name, description) VALUES ($1, $2)";
+        match client.execute(stmt, &[&role_name, &req.description]).await {
+            Ok(_) => CreateRoleResponse {
+                success: true,
+                message: format!("role '{}' created", role_name),
+            },
+            Err(e) => {
+                if is_unique_violation(&e) {
+                    return CreateRoleResponse {
+                        success: false,
+                        message: format!("role already exists: {}", role_name),
+                    };
+                }
+                CreateRoleResponse {
+                    success: false,
+                    message: format_rbac_db_error("failed to create role", &e),
+                }
+            }
+        }
+    }
+
+    /// What: Deletes an RBAC role row from metastore.
+    ///
+    /// Inputs:
+    /// - `req`: Drop role payload
+    ///
+    /// Output:
+    /// - `DropRoleResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Protected ADMIN role is rejected.
+    async fn drop_role(&self, req: DropRoleRequest) -> DropRoleResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return DropRoleResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let role_name = req.role_name.trim().to_ascii_uppercase();
+        if role_name.is_empty() {
+            return DropRoleResponse {
+                success: false,
+                message: "role_name cannot be empty".to_string(),
+            };
+        }
+        if role_name == "ADMIN" {
+            return DropRoleResponse {
+                success: false,
+                message: "role 'ADMIN' is reserved and cannot be dropped".to_string(),
+            };
+        }
+
+        let stmt = "DELETE FROM roles_rbac WHERE role_name = $1";
+        match client.execute(stmt, &[&role_name]).await {
+            Ok(0) => DropRoleResponse {
+                success: false,
+                message: format!("role not found: {}", role_name),
+            },
+            Ok(_) => DropRoleResponse {
+                success: true,
+                message: format!("role '{}' dropped", role_name),
+            },
+            Err(e) => DropRoleResponse {
+                success: false,
+                message: format_rbac_db_error("failed to drop role", &e),
+            },
+        }
+    }
+
+    /// What: Creates a role binding for a user or group principal.
+    ///
+    /// Inputs:
+    /// - `req`: Grant role payload
+    ///
+    /// Output:
+    /// - `GrantRoleResponse` indicating operation result
+    ///
+    /// Details:
+    /// - Validates principal type and resolves both principal and role IDs before insertion.
+    async fn grant_role(&self, req: GrantRoleRequest) -> GrantRoleResponse {
+        let client = match self.pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                return GrantRoleResponse {
+                    success: false,
+                    message: format!("Failed to get DB client: {}", e),
+                };
+            }
+        };
+
+        let principal_type = req.principal_type.trim().to_ascii_lowercase();
+        if principal_type != "user" && principal_type != "group" {
+            return GrantRoleResponse {
+                success: false,
+                message: "principal_type must be 'user' or 'group'".to_string(),
+            };
+        }
+        let principal_name = req.principal_name.trim().to_ascii_lowercase();
+        let role_name = req.role_name.trim().to_ascii_uppercase();
+        if principal_name.is_empty() || role_name.is_empty() {
+            return GrantRoleResponse {
+                success: false,
+                message: "principal_name and role_name are required".to_string(),
+            };
+        }
+
+        let role_id: i64 = match client
+            .query_opt(
+                "SELECT id FROM roles_rbac WHERE role_name = $1",
+                &[&role_name],
+            )
+            .await
+        {
+            Ok(Some(row)) => row.get(0),
+            Ok(None) => {
+                return GrantRoleResponse {
+                    success: false,
+                    message: format!("role not found: {}", role_name),
+                };
+            }
+            Err(e) => {
+                return GrantRoleResponse {
+                    success: false,
+                    message: format_rbac_db_error("failed to load role", &e),
+                };
+            }
+        };
+
+        let principal_id: i64 = if principal_type == "user" {
+            match client
+                .query_opt(
+                    "SELECT id FROM users_rbac WHERE username = $1",
+                    &[&principal_name],
+                )
+                .await
+            {
+                Ok(Some(row)) => row.get(0),
+                Ok(None) => {
+                    return GrantRoleResponse {
+                        success: false,
+                        message: format!("user not found: {}", principal_name),
+                    };
+                }
+                Err(e) => {
+                    return GrantRoleResponse {
+                        success: false,
+                        message: format_rbac_db_error("failed to load user principal", &e),
+                    };
+                }
+            }
+        } else {
+            match client
+                .query_opt(
+                    "SELECT id FROM groups_rbac WHERE group_name = $1",
+                    &[&principal_name],
+                )
+                .await
+            {
+                Ok(Some(row)) => row.get(0),
+                Ok(None) => {
+                    return GrantRoleResponse {
+                        success: false,
+                        message: format!("group not found: {}", principal_name),
+                    };
+                }
+                Err(e) => {
+                    return GrantRoleResponse {
+                        success: false,
+                        message: format_rbac_db_error("failed to load group principal", &e),
+                    };
+                }
+            }
+        };
+
+        let granted_by = if req.granted_by.trim().is_empty() {
+            "kionas".to_string()
+        } else {
+            req.granted_by.trim().to_ascii_lowercase()
+        };
+
+        let insert_stmt = "INSERT INTO role_bindings_rbac (principal_type, principal_id, role_id, granted_by) VALUES ($1, $2, $3, $4)";
+        match client
+            .execute(
+                insert_stmt,
+                &[&principal_type, &principal_id, &role_id, &granted_by],
+            )
+            .await
+        {
+            Ok(_) => GrantRoleResponse {
+                success: true,
+                message: format!(
+                    "role '{}' granted to {} '{}'",
+                    role_name, principal_type, principal_name
+                ),
+            },
+            Err(e) => {
+                if is_unique_violation(&e) {
+                    return GrantRoleResponse {
+                        success: false,
+                        message: format!(
+                            "role already granted: {} '{}' has role '{}'",
+                            principal_type, principal_name, role_name
+                        ),
+                    };
+                }
+                GrantRoleResponse {
+                    success: false,
+                    message: format_rbac_db_error("failed to grant role", &e),
+                }
+            }
         }
     }
 }

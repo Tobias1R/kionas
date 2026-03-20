@@ -48,6 +48,10 @@ Build a decent client to read inputs and display data;
 6.4 Implement first distributed use-case slice (parallel scan + merge) before joins/aggregations.
 [X] DONE
 
+[INTERMISSION]
+The RBAC system.
+[X] DONE
+
 7. Phase 6: Authentication and Authorization Revamp
 7.1 Propagate auth context explicitly through query execution artifacts where needed (server dispatch, worker execution, Flight retrieval).
 7.2 Add worker-side enforcement points for query execution authorization and scope checks.
