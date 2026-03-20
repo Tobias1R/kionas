@@ -8,10 +8,14 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray,
 };
 use arrow::compute::filter_record_batch;
+use arrow::compute::kernels::cast::cast;
+use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+use kionas::planner::{
+    PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -32,6 +36,8 @@ use url::Url;
 struct RuntimePlan {
     filter_sql: Option<String>,
     projection_exprs: Vec<PhysicalExpr>,
+    sort_exprs: Vec<PhysicalSortExpr>,
+    limit_spec: Option<PhysicalLimitSpec>,
     has_materialize: bool,
 }
 
@@ -137,6 +143,14 @@ pub(crate) async fn execute_query_task(
         batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
     }
 
+    if !runtime_plan.sort_exprs.is_empty() {
+        batches = apply_sort_pipeline(&batches, &runtime_plan.sort_exprs)?;
+    }
+
+    if let Some(limit_spec) = runtime_plan.limit_spec.as_ref() {
+        batches = apply_limit_pipeline(&batches, limit_spec)?;
+    }
+
     if batches.is_empty() {
         return Err("query execution produced no record batches".to_string());
     }
@@ -162,6 +176,8 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
 
     let mut filter_sql = None;
     let mut projection_exprs = Vec::new();
+    let mut sort_exprs = Vec::new();
+    let mut limit_spec = None;
     let mut has_materialize = false;
 
     for op in operators {
@@ -176,6 +192,12 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
             }
             PhysicalOperator::Projection { expressions } => {
                 projection_exprs = expressions;
+            }
+            PhysicalOperator::Sort { keys } => {
+                sort_exprs = keys;
+            }
+            PhysicalOperator::Limit { spec } => {
+                limit_spec = Some(spec);
             }
             PhysicalOperator::Materialize => {
                 has_materialize = true;
@@ -192,6 +214,8 @@ fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, Stri
     Ok(RuntimePlan {
         filter_sql,
         projection_exprs,
+        sort_exprs,
+        limit_spec,
         has_materialize,
     })
 }
@@ -905,6 +929,218 @@ fn apply_projection_pipeline(
     Ok(out)
 }
 
+/// What: Apply ORDER BY sorting to input batches.
+///
+/// Inputs:
+/// - `input`: Source batches.
+/// - `sort_exprs`: Ordered sort directives.
+///
+/// Output:
+/// - Sorted batches with deterministic row order.
+fn apply_sort_pipeline(
+    input: &[RecordBatch],
+    sort_exprs: &[PhysicalSortExpr],
+) -> Result<Vec<RecordBatch>, String> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let normalized_batches = normalize_batches_for_sort(input)?;
+    let schema = normalized_batches[0].schema();
+    let merged = concat_batches(&schema, &normalized_batches)
+        .map_err(|e| format!("failed to merge batches for sorting: {}", e))?;
+
+    if merged.num_rows() <= 1 {
+        return Ok(vec![merged]);
+    }
+
+    let mut sort_columns = Vec::with_capacity(sort_exprs.len());
+    for sort_expr in sort_exprs {
+        let raw_name = match &sort_expr.expression {
+            PhysicalExpr::ColumnRef { name } => name.trim().to_string(),
+            PhysicalExpr::Raw { sql } => parse_projection_identifier(sql)?,
+        };
+
+        let idx = merged
+            .schema()
+            .index_of(raw_name.as_str())
+            .map_err(|_| format!("sort column '{}' not found", raw_name))?;
+
+        sort_columns.push(SortColumn {
+            values: merged.column(idx).clone(),
+            options: Some(SortOptions {
+                descending: !sort_expr.ascending,
+                nulls_first: false,
+            }),
+        });
+    }
+
+    let indices = lexsort_to_indices(&sort_columns, None)
+        .map_err(|e| format!("failed to compute sort indices: {}", e))?;
+
+    let sorted_columns = merged
+        .columns()
+        .iter()
+        .map(|column| {
+            take(column.as_ref(), &indices, None)
+                .map_err(|e| format!("failed to reorder sorted column: {}", e))
+        })
+        .collect::<Result<Vec<ArrayRef>, String>>()?;
+
+    let sorted = RecordBatch::try_new(merged.schema(), sorted_columns)
+        .map_err(|e| format!("failed to build sorted record batch: {}", e))?;
+
+    Ok(vec![sorted])
+}
+
+/// What: Apply LIMIT/OFFSET slicing to input batches while preserving row order.
+///
+/// Inputs:
+/// - `input`: Ordered source batches.
+/// - `limit_spec`: Count and offset values.
+///
+/// Output:
+/// - Sliced batches that satisfy OFFSET then LIMIT semantics.
+fn apply_limit_pipeline(
+    input: &[RecordBatch],
+    limit_spec: &PhysicalLimitSpec,
+) -> Result<Vec<RecordBatch>, String> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if limit_spec.count == 0 {
+        return Ok(vec![RecordBatch::new_empty(input[0].schema())]);
+    }
+
+    let mut remaining_offset = usize::try_from(limit_spec.offset)
+        .map_err(|_| "OFFSET value is too large for this platform".to_string())?;
+    let mut remaining_count = usize::try_from(limit_spec.count)
+        .map_err(|_| "LIMIT value is too large for this platform".to_string())?;
+
+    let mut out = Vec::new();
+    for batch in input {
+        if remaining_count == 0 {
+            break;
+        }
+
+        let row_count = batch.num_rows();
+        if remaining_offset >= row_count {
+            remaining_offset -= row_count;
+            continue;
+        }
+
+        let start = remaining_offset;
+        remaining_offset = 0;
+        let available = row_count - start;
+        let take_count = std::cmp::min(available, remaining_count);
+        if take_count == 0 {
+            continue;
+        }
+
+        out.push(batch.slice(start, take_count));
+        remaining_count -= take_count;
+    }
+
+    if out.is_empty() {
+        return Ok(vec![RecordBatch::new_empty(input[0].schema())]);
+    }
+
+    Ok(out)
+}
+
+/// What: Normalize input batches into a compatible schema for global sorting.
+///
+/// Inputs:
+/// - `input`: Source batches that may carry type variations across files.
+///
+/// Output:
+/// - New batch list with per-column types aligned for concat and sort.
+fn normalize_batches_for_sort(input: &[RecordBatch]) -> Result<Vec<RecordBatch>, String> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let column_count = input[0].num_columns();
+    for batch in input {
+        if batch.num_columns() != column_count {
+            return Err("cannot sort batches with different column counts".to_string());
+        }
+    }
+
+    let mut fields = Vec::with_capacity(column_count);
+    for col_idx in 0..column_count {
+        let base_field = input[0].schema().field(col_idx).as_ref().clone();
+        let mut target_type: Option<DataType> = None;
+
+        for batch in input {
+            let data_type = batch.column(col_idx).data_type();
+            target_type = Some(unify_sort_column_type(target_type.as_ref(), data_type));
+        }
+
+        let resolved_type = target_type.unwrap_or(DataType::Null);
+        fields.push(Field::new(
+            base_field.name(),
+            resolved_type,
+            base_field.is_nullable(),
+        ));
+    }
+
+    let target_schema = Arc::new(Schema::new(fields));
+    let mut normalized = Vec::with_capacity(input.len());
+    for batch in input {
+        let mut arrays = Vec::with_capacity(column_count);
+        for col_idx in 0..column_count {
+            let source = batch.column(col_idx);
+            let target_type = target_schema.field(col_idx).data_type();
+            if source.data_type() == target_type {
+                arrays.push(source.clone());
+                continue;
+            }
+
+            let casted = cast(source.as_ref(), target_type).map_err(|e| {
+                format!(
+                    "failed to cast column '{}' from {:?} to {:?} for sorting: {}",
+                    target_schema.field(col_idx).name(),
+                    source.data_type(),
+                    target_type,
+                    e
+                )
+            })?;
+            arrays.push(casted);
+        }
+
+        let rebuilt = RecordBatch::try_new(target_schema.clone(), arrays)
+            .map_err(|e| format!("failed to rebuild normalized batch for sorting: {}", e))?;
+        normalized.push(rebuilt);
+    }
+
+    Ok(normalized)
+}
+
+fn unify_sort_column_type(existing: Option<&DataType>, incoming: &DataType) -> DataType {
+    match existing {
+        None => incoming.clone(),
+        Some(current) if current == incoming => current.clone(),
+        Some(DataType::Null) => incoming.clone(),
+        Some(current) if matches!(incoming, DataType::Null) => current.clone(),
+        Some(current) if is_int_type(current) && is_int_type(incoming) => DataType::Int64,
+        Some(current)
+            if matches!(current, DataType::Utf8) || matches!(incoming, DataType::Utf8) =>
+        {
+            DataType::Utf8
+        }
+        Some(current) => current.clone(),
+    }
+}
+
+fn is_int_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
 /// What: Persist result batches to deterministic task-scoped artifact location.
 ///
 /// Inputs:
@@ -1272,10 +1508,11 @@ fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryArtifactMetadata, apply_filter_pipeline, apply_projection_pipeline,
-        decode_parquet_batches, encode_result_metadata, parse_partition_index_from_exchange_key,
-        parse_projection_identifier, partition_input_batches, source_table_staging_prefix,
-        split_case_insensitive, validate_upstream_exchange_partition_set,
+        QueryArtifactMetadata, apply_filter_pipeline, apply_limit_pipeline,
+        apply_projection_pipeline, decode_parquet_batches, encode_result_metadata,
+        extract_runtime_plan, parse_partition_index_from_exchange_key, parse_projection_identifier,
+        partition_input_batches, source_table_staging_prefix, split_case_insensitive,
+        validate_upstream_exchange_partition_set,
     };
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1465,5 +1702,93 @@ mod tests {
         let err = validate_upstream_exchange_partition_set(1, &keys, 3)
             .expect_err("incomplete partition set must be rejected");
         assert!(err.contains("mismatch"));
+    }
+
+    #[test]
+    fn applies_limit_pipeline_with_offset_across_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64])) as ArrayRef],
+        )
+        .expect("batch1 must build");
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![4_i64, 5_i64, 6_i64])) as ArrayRef],
+        )
+        .expect("batch2 must build");
+
+        let sliced = apply_limit_pipeline(
+            &[batch1, batch2],
+            &kionas::planner::PhysicalLimitSpec {
+                count: 2,
+                offset: 3,
+            },
+        )
+        .expect("limit pipeline must succeed");
+
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(sliced[0].num_rows(), 2);
+        let ids = sliced[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column must be Int64");
+        assert_eq!(ids.value(0), 4);
+        assert_eq!(ids.value(1), 5);
+    }
+
+    #[test]
+    fn applies_zero_limit_as_empty_result() {
+        let sliced = apply_limit_pipeline(
+            &[batch_two_rows()],
+            &kionas::planner::PhysicalLimitSpec {
+                count: 0,
+                offset: 0,
+            },
+        )
+        .expect("limit pipeline must succeed");
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(sliced[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn applies_high_offset_as_empty_result() {
+        let sliced = apply_limit_pipeline(
+            &[batch_two_rows()],
+            &kionas::planner::PhysicalLimitSpec {
+                count: 5,
+                offset: 999,
+            },
+        )
+        .expect("limit pipeline must succeed");
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(sliced[0].num_rows(), 0);
+    }
+
+    #[test]
+    fn extracts_runtime_limit_spec() {
+        let task = crate::services::worker_service_server::worker_service::Task {
+            task_id: "t-limit".to_string(),
+            operation: "query".to_string(),
+            input: serde_json::json!({
+                "physical_plan": {
+                    "operators": [
+                        {"TableScan": {"relation": {"database": "db1", "schema": "s1", "table": "t1"}}},
+                        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+                        {"Limit": {"spec": {"count": 5, "offset": 2}}},
+                        "Materialize"
+                    ]
+                }
+            })
+            .to_string(),
+            output: String::new(),
+            params: std::collections::HashMap::new(),
+        };
+
+        let plan = extract_runtime_plan(&task).expect("runtime plan must parse");
+        let limit = plan.limit_spec.expect("limit must be extracted");
+        assert_eq!(limit.count, 5);
+        assert_eq!(limit.offset, 2);
     }
 }

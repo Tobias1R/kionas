@@ -43,6 +43,20 @@ pub struct QueryNamespace {
     pub raw: String,
 }
 
+/// What: Canonical ORDER BY expression shape preserved in query model payload.
+///
+/// Inputs:
+/// - `expression`: Sort key SQL text.
+/// - `ascending`: `true` for ASC, `false` for DESC.
+///
+/// Output:
+/// - Deterministic ordering directive consumed by planner translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SortSpec {
+    pub expression: String,
+    pub ascending: bool,
+}
+
 /// What: Shared semantic model for a minimal SELECT query.
 ///
 /// Inputs:
@@ -52,6 +66,7 @@ pub struct QueryNamespace {
 /// - `namespace`: Resolved query namespace metadata.
 /// - `projection`: Projection expressions.
 /// - `selection`: Optional filter expression.
+/// - `order_by`: Optional ORDER BY directives.
 /// - `sql`: Canonical SQL text representation.
 ///
 /// Output:
@@ -64,6 +79,9 @@ pub struct SelectQueryModel {
     pub namespace: QueryNamespace,
     pub projection: Vec<String>,
     pub selection: Option<String>,
+    pub order_by: Vec<SortSpec>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub sql: String,
 }
 
@@ -103,6 +121,9 @@ pub enum QueryModelError {
     InvalidPhysicalPipeline(String),
     UnsupportedPhysicalOperator(String),
     UnsupportedPredicate(String),
+    UnsupportedLimitExpression(String),
+    UnsupportedFetchClause,
+    OffsetWithoutLimit,
 }
 
 impl std::fmt::Display for QueryModelError {
@@ -140,6 +161,15 @@ impl std::fmt::Display for QueryModelError {
             }
             QueryModelError::UnsupportedPredicate(name) => {
                 write!(f, "predicate is not supported in this phase: {}", name)
+            }
+            QueryModelError::UnsupportedLimitExpression(message) => {
+                write!(f, "unsupported LIMIT/OFFSET expression: {}", message)
+            }
+            QueryModelError::UnsupportedFetchClause => {
+                write!(f, "FETCH clause is not supported in this phase")
+            }
+            QueryModelError::OffsetWithoutLimit => {
+                write!(f, "OFFSET without LIMIT is not supported in this phase")
             }
         }
     }
@@ -205,6 +235,126 @@ fn canonicalize_table_namespace(
     }
 }
 
+fn split_once_case_insensitive<'a>(haystack: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    lower_haystack.find(&lower_needle).map(|index| {
+        let head = &haystack[..index];
+        let tail = &haystack[index + needle.len()..];
+        (head, tail)
+    })
+}
+
+fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
+    let (_, after_order_by) = match split_once_case_insensitive(sql, "order by") {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+
+    let mut order_clause = after_order_by.trim();
+    for stopper in [" limit ", " offset ", " fetch "] {
+        if let Some((head, _)) = split_once_case_insensitive(order_clause, stopper) {
+            order_clause = head.trim();
+        }
+    }
+
+    if order_clause.is_empty() {
+        return Vec::new();
+    }
+
+    order_clause
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let lower = segment.to_ascii_lowercase();
+            if lower.ends_with(" desc") {
+                SortSpec {
+                    expression: segment[..segment.len() - 5].trim().to_string(),
+                    ascending: false,
+                }
+            } else if lower.ends_with(" asc") {
+                SortSpec {
+                    expression: segment[..segment.len() - 4].trim().to_string(),
+                    ascending: true,
+                }
+            } else {
+                SortSpec {
+                    expression: segment.to_string(),
+                    ascending: true,
+                }
+            }
+        })
+        .filter(|spec| !spec.expression.is_empty())
+        .collect::<Vec<_>>()
+}
+
+/// What: Parse a SQL numeric clause token as non-negative integer.
+///
+/// Inputs:
+/// - `raw`: Clause token text.
+/// - `label`: Clause label used in validation errors.
+///
+/// Output:
+/// - Parsed unsigned integer value.
+fn parse_non_negative_u64_token(raw: &str, label: &str) -> Result<u64, QueryModelError> {
+    let token = raw.split_whitespace().next().unwrap_or_default();
+    token.parse::<u64>().map_err(|_| {
+        QueryModelError::UnsupportedLimitExpression(format!("{}='{}'", label, raw.trim()))
+    })
+}
+
+/// What: Extract LIMIT and OFFSET values from canonical SQL text.
+///
+/// Inputs:
+/// - `sql`: Canonical SQL text from parsed query AST.
+///
+/// Output:
+/// - Tuple with optional `(limit, offset)` values.
+fn parse_limit_offset_from_sql(sql: &str) -> Result<(Option<u64>, Option<u64>), QueryModelError> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains(" fetch ") {
+        return Err(QueryModelError::UnsupportedFetchClause);
+    }
+
+    let limit = if let Some((_, after_limit)) = split_once_case_insensitive(sql, " limit ") {
+        let limit_raw =
+            if let Some((head, _)) = split_once_case_insensitive(after_limit, " offset ") {
+                head.trim()
+            } else {
+                after_limit.trim()
+            };
+
+        if limit_raw.is_empty() {
+            return Err(QueryModelError::UnsupportedLimitExpression(
+                "LIMIT clause is empty".to_string(),
+            ));
+        }
+
+        Some(parse_non_negative_u64_token(limit_raw, "LIMIT")?)
+    } else {
+        None
+    };
+
+    let offset = if let Some((_, after_offset)) = split_once_case_insensitive(sql, " offset ") {
+        let offset_raw = after_offset.trim();
+        if offset_raw.is_empty() {
+            return Err(QueryModelError::UnsupportedLimitExpression(
+                "OFFSET clause is empty".to_string(),
+            ));
+        }
+        Some(parse_non_negative_u64_token(offset_raw, "OFFSET")?)
+    } else {
+        None
+    };
+
+    if offset.is_some() && limit.is_none() {
+        return Err(QueryModelError::OffsetWithoutLimit);
+    }
+
+    Ok((limit, offset))
+}
+
 fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> {
     let select = match query.body.as_ref() {
         SetExpr::Select(select) => select.as_ref(),
@@ -254,6 +404,8 @@ pub fn build_select_query_dispatch_envelope(
     let (database, schema, table) =
         canonicalize_table_namespace(&table_name, default_database, default_schema);
 
+    let canonical_sql = query.to_string();
+    let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
     let model = SelectQueryModel {
         version: QUERY_PAYLOAD_VERSION,
         statement: "Select".to_string(),
@@ -273,7 +425,10 @@ pub fn build_select_query_dispatch_envelope(
             .selection
             .as_ref()
             .map(std::string::ToString::to_string),
-        sql: query.to_string(),
+        order_by: parse_order_by_from_sql(canonical_sql.as_str()),
+        limit,
+        offset,
+        sql: canonical_sql,
     };
 
     let logical_plan = crate::planner::build_logical_plan_from_select_model(&model)
@@ -291,6 +446,13 @@ pub fn build_select_query_dispatch_envelope(
             }
             _ => QueryModelError::PlannerPhysicalFailed(e.to_string()),
         })?;
+    let logical_plan_text = crate::planner::explain::explain_logical_plan(&logical_plan);
+    let physical_plan_text = crate::planner::explain::explain_physical_plan(&physical_plan);
+    let physical_pipeline = physical_plan
+        .operators
+        .iter()
+        .map(|op| op.canonical_name().to_string())
+        .collect::<Vec<_>>();
 
     let payload = json!({
         "version": model.version,
@@ -299,9 +461,17 @@ pub fn build_select_query_dispatch_envelope(
         "namespace": model.namespace,
         "projection": model.projection,
         "selection": model.selection,
+        "order_by": model.order_by,
+        "limit": model.limit,
+        "offset": model.offset,
         "sql": model.sql,
         "logical_plan": logical_plan,
         "physical_plan": physical_plan,
+        "diagnostics": {
+            "logical_plan_text": logical_plan_text,
+            "physical_plan_text": physical_plan_text,
+            "physical_pipeline": physical_pipeline,
+        },
     })
     .to_string();
 
@@ -341,7 +511,80 @@ mod tests {
         assert!(envelope.payload.contains("\"database\":\"sales\""));
         assert!(envelope.payload.contains("\"logical_plan\""));
         assert!(envelope.payload.contains("\"physical_plan\""));
+        assert!(envelope.payload.contains("\"diagnostics\""));
         assert_eq!(envelope.table, "users");
+    }
+
+    #[test]
+    fn captures_order_by_in_payload() {
+        let statements =
+            parse_query("SELECT id FROM sales.public.users ORDER BY id DESC LIMIT 5 OFFSET 2")
+                .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .expect("payload should build");
+        let parsed: Value =
+            serde_json::from_str(&envelope.payload).expect("payload should be valid json");
+        let order_by = parsed
+            .get("order_by")
+            .and_then(Value::as_array)
+            .expect("payload should include order_by");
+
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(
+            order_by[0].get("expression").and_then(Value::as_str),
+            Some("id")
+        );
+        assert_eq!(
+            order_by[0].get("ascending").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(parsed.get("limit").and_then(Value::as_u64), Some(5));
+        assert_eq!(parsed.get("offset").and_then(Value::as_u64), Some(2));
+
+        let diagnostics = parsed
+            .get("diagnostics")
+            .expect("payload should include diagnostics");
+        let physical_text = diagnostics
+            .get("physical_plan_text")
+            .and_then(Value::as_str)
+            .expect("diagnostics should include physical_plan_text");
+        assert!(physical_text.contains("Sort(id DESC)"));
+    }
+
+    #[test]
+    fn rejects_offset_without_limit() {
+        let statements = parse_query("SELECT id FROM sales.public.users OFFSET 2")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .expect_err("must reject offset without limit");
+        assert!(matches!(err, QueryModelError::OffsetWithoutLimit));
+    }
+
+    #[test]
+    fn rejects_fetch_clause() {
+        let statements = parse_query("SELECT id FROM sales.public.users FETCH FIRST 1 ROWS ONLY")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .expect_err("must reject fetch");
+        assert!(matches!(err, QueryModelError::UnsupportedFetchClause));
     }
 
     #[test]
@@ -509,6 +752,18 @@ mod tests {
             (
                 QueryModelError::UnsupportedPredicate("x".to_string()),
                 VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+            ),
+            (
+                QueryModelError::UnsupportedLimitExpression("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::UnsupportedFetchClause,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::OffsetWithoutLimit,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
             ),
         ];
 

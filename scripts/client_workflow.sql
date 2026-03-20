@@ -9,8 +9,10 @@ create schema abc.schema1;
 create table abc.schema1.table1 (id int, name string);
 
 insert into abc.schema1.table1 values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'Diana'), (5, 'Eve');
-
+insert into abc.schema1.table1 values (1, NULL);
 select * from abc.schema1.table1 order by id;
+
+select * from abc.schema1.table1 where c2 is not null order by c1;
 
 select * from abc.schema1.table1 where c1=13;
 
@@ -34,4 +36,9 @@ delete user test_user;
 delete group test_group;
 delete role test_role;
 
+
+select * from abc.schema1.table1 order by c1 limit 5;
+select * from abc.schema1.table1 order by c1 limit 3 offset 2;
+select * from abc.schema1.table1 limit 0;
+select * from abc.schema1.table1 limit 5 offset 999;
 

@@ -2,7 +2,9 @@ use crate::planner::distributed_plan::{DistributedPhysicalPlan, distributed_from
 use crate::planner::distributed_validate::validate_distributed_physical_plan;
 use crate::planner::error::PlannerError;
 use crate::planner::logical_plan::LogicalPlan;
-use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+use crate::planner::physical_plan::{
+    PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+};
 
 /// What: Build a Phase 2 physical plan from a validated logical plan.
 ///
@@ -13,7 +15,7 @@ use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan
 /// - Physical plan with deterministic operator ordering.
 ///
 /// Details:
-/// - The pipeline is always `TableScan -> [Filter] -> Projection -> Materialize`.
+/// - The pipeline is always `TableScan -> [Filter] -> Projection -> [Sort] -> [Limit] -> Materialize`.
 /// - Capability checks are delegated to physical validation.
 pub fn build_physical_plan_from_logical_plan(
     plan: &LogicalPlan,
@@ -38,6 +40,29 @@ pub fn build_physical_plan_from_logical_plan(
     operators.push(PhysicalOperator::Projection {
         expressions: projection_exprs,
     });
+
+    if !plan.order_by.is_empty() {
+        operators.push(PhysicalOperator::Sort {
+            keys: plan
+                .order_by
+                .iter()
+                .map(|sort| PhysicalSortExpr {
+                    expression: PhysicalExpr::from(&sort.expression),
+                    ascending: sort.ascending,
+                })
+                .collect::<Vec<_>>(),
+        });
+    }
+
+    if let Some(count) = plan.limit {
+        operators.push(PhysicalOperator::Limit {
+            spec: PhysicalLimitSpec {
+                count,
+                offset: plan.offset.unwrap_or(0),
+            },
+        });
+    }
+
     operators.push(PhysicalOperator::Materialize);
 
     let physical = PhysicalPlan {
@@ -74,6 +99,7 @@ mod tests {
     use super::{build_distributed_plan_from_logical_plan, build_physical_plan_from_logical_plan};
     use crate::planner::logical_plan::{
         LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection,
+        LogicalSortExpr,
     };
     use crate::planner::physical_plan::PhysicalOperator;
 
@@ -95,11 +121,19 @@ mod tests {
                     sql: "active = true".to_string(),
                 },
             }),
+            order_by: vec![LogicalSortExpr {
+                expression: LogicalExpr::Raw {
+                    sql: "id".to_string(),
+                },
+                ascending: false,
+            }],
+            limit: Some(3),
+            offset: Some(1),
             sql: "SELECT id FROM sales.public.users WHERE active = true".to_string(),
         };
 
         let physical = build_physical_plan_from_logical_plan(&plan).expect("physical plan");
-        assert_eq!(physical.operators.len(), 4);
+        assert_eq!(physical.operators.len(), 6);
         assert!(matches!(
             physical.operators[0],
             PhysicalOperator::TableScan { .. }
@@ -114,6 +148,14 @@ mod tests {
         ));
         assert!(matches!(
             physical.operators[3],
+            PhysicalOperator::Sort { .. }
+        ));
+        assert!(matches!(
+            physical.operators[4],
+            PhysicalOperator::Limit { .. }
+        ));
+        assert!(matches!(
+            physical.operators[5],
             PhysicalOperator::Materialize
         ));
     }
@@ -132,6 +174,9 @@ mod tests {
                 }],
             },
             selection: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
             sql: "SELECT id FROM sales.public.users".to_string(),
         };
 

@@ -46,6 +46,9 @@ mod tests {
                 expressions: Vec::new(),
             },
             selection: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
             sql: "SELECT FROM sales.public.users".to_string(),
         };
 

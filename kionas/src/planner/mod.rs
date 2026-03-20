@@ -16,9 +16,11 @@ pub use distributed_plan::{
 pub use distributed_validate::validate_distributed_physical_plan;
 pub use error::PlannerError;
 pub use logical_plan::{
-    LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection,
+    LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };
-pub use physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+pub use physical_plan::{
+    PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+};
 pub use physical_translate::{
     build_distributed_plan_from_logical_plan, build_physical_plan_from_logical_plan,
 };

@@ -74,12 +74,86 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         ));
     }
 
+    let sort_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::Sort { .. }))
+        .count();
+    if sort_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one sort".to_string(),
+        ));
+    }
+
+    let projection_index = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Projection { .. }))
+        .ok_or_else(|| {
+            PlannerError::InvalidPhysicalPipeline(
+                "pipeline must contain a projection operator".to_string(),
+            )
+        })?;
+
+    if let Some(sort_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+        && sort_index < projection_index
+    {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "sort must appear after projection".to_string(),
+        ));
+    }
+
+    let limit_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::Limit { .. }))
+        .count();
+    if limit_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one limit".to_string(),
+        ));
+    }
+
+    if let Some(limit_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Limit { .. }))
+    {
+        if limit_index < projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "limit must appear after projection".to_string(),
+            ));
+        }
+
+        if let Some(sort_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+            && limit_index < sort_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "limit must appear after sort".to_string(),
+            ));
+        }
+    }
+
     for op in &plan.operators {
         match op {
             PhysicalOperator::Filter { predicate } => ensure_supported_predicate(predicate)?,
             PhysicalOperator::TableScan { .. }
             | PhysicalOperator::Projection { .. }
             | PhysicalOperator::Materialize => {}
+            PhysicalOperator::Sort { keys } => {
+                if keys.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "sort operator must include at least one key".to_string(),
+                    ));
+                }
+            }
+            PhysicalOperator::Limit { spec: _ } => {}
             PhysicalOperator::HashJoin { .. } => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
                     "HashJoin".to_string(),
@@ -98,16 +172,6 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
             PhysicalOperator::AggregateFinal => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
                     "AggregateFinal".to_string(),
-                ));
-            }
-            PhysicalOperator::Sort => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "Sort".to_string(),
-                ));
-            }
-            PhysicalOperator::Limit => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "Limit".to_string(),
                 ));
             }
             PhysicalOperator::ExchangeShuffle { .. } => {
@@ -146,7 +210,9 @@ mod tests {
     use super::validate_physical_plan;
     use crate::planner::error::PlannerError;
     use crate::planner::logical_plan::LogicalRelation;
-    use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+    use crate::planner::physical_plan::{
+        PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+    };
 
     fn base_relation() -> LogicalRelation {
         LogicalRelation {
@@ -192,8 +258,6 @@ mod tests {
                 PhysicalOperator::AggregateFinal,
                 "AggregateFinal".to_string(),
             ),
-            (PhysicalOperator::Sort, "Sort".to_string()),
-            (PhysicalOperator::Limit, "Limit".to_string()),
             (
                 PhysicalOperator::ExchangeShuffle {
                     keys: vec!["id".to_string()],
@@ -270,5 +334,81 @@ mod tests {
         );
 
         validate_physical_plan(&plan).expect("must accept supported predicate");
+    }
+
+    #[test]
+    fn accepts_sort_when_keys_are_present() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+
+        validate_physical_plan(&plan).expect("sort should be accepted in this phase");
+    }
+
+    #[test]
+    fn accepts_limit_after_sort() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+        plan.operators.insert(
+            3,
+            PhysicalOperator::Limit {
+                spec: PhysicalLimitSpec {
+                    count: 5,
+                    offset: 2,
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("limit should be accepted in this phase");
+    }
+
+    #[test]
+    fn rejects_limit_before_sort() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Limit {
+                spec: PhysicalLimitSpec {
+                    count: 5,
+                    offset: 0,
+                },
+            },
+        );
+        plan.operators.insert(
+            3,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+
+        let err = validate_physical_plan(&plan).expect_err("limit before sort must be rejected");
+        assert_eq!(
+            err,
+            PlannerError::InvalidPhysicalPipeline("limit must appear after sort".to_string())
+        );
     }
 }

@@ -1,6 +1,6 @@
 use crate::planner::error::PlannerError;
 use crate::planner::logical_plan::{
-    LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection,
+    LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };
 use crate::sql::query_model::SelectQueryModel;
 
@@ -38,6 +38,18 @@ pub fn build_logical_plan_from_select_model(
                 sql: predicate.clone(),
             },
         }),
+        order_by: model
+            .order_by
+            .iter()
+            .map(|sort| LogicalSortExpr {
+                expression: LogicalExpr::Raw {
+                    sql: sort.expression.clone(),
+                },
+                ascending: sort.ascending,
+            })
+            .collect::<Vec<_>>(),
+        limit: model.limit,
+        offset: model.offset,
         sql: model.sql.clone(),
     };
 
@@ -48,7 +60,7 @@ pub fn build_logical_plan_from_select_model(
 #[cfg(test)]
 mod tests {
     use super::build_logical_plan_from_select_model;
-    use crate::sql::query_model::{QueryNamespace, SelectQueryModel};
+    use crate::sql::query_model::{QueryNamespace, SelectQueryModel, SortSpec};
 
     #[test]
     fn builds_plan_from_select_model() {
@@ -64,6 +76,12 @@ mod tests {
             },
             projection: vec!["id".to_string(), "name".to_string()],
             selection: Some("active = true".to_string()),
+            order_by: vec![SortSpec {
+                expression: "id".to_string(),
+                ascending: true,
+            }],
+            limit: Some(5),
+            offset: Some(2),
             sql: "SELECT id, name FROM sales.public.users WHERE active = true".to_string(),
         };
 
@@ -73,5 +91,8 @@ mod tests {
         assert_eq!(plan.relation.table, "users");
         assert_eq!(plan.projection.expressions.len(), 2);
         assert!(plan.selection.is_some());
+        assert_eq!(plan.order_by.len(), 1);
+        assert_eq!(plan.limit, Some(5));
+        assert_eq!(plan.offset, Some(2));
     }
 }

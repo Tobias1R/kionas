@@ -14,6 +14,34 @@ pub enum PhysicalExpr {
     Raw { sql: String },
 }
 
+/// What: One physical ORDER BY expression.
+///
+/// Inputs:
+/// - `expression`: Sort key expression.
+/// - `ascending`: `true` for ASC, `false` for DESC.
+///
+/// Output:
+/// - Serializable sort directive consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalSortExpr {
+    pub expression: PhysicalExpr,
+    pub ascending: bool,
+}
+
+/// What: Physical LIMIT/OFFSET directive.
+///
+/// Inputs:
+/// - `count`: Maximum number of rows to return after offset.
+/// - `offset`: Number of rows to skip before returning rows.
+///
+/// Output:
+/// - Serializable limit directive consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalLimitSpec {
+    pub count: u64,
+    pub offset: u64,
+}
+
 /// What: Supported and cataloged physical operators for query execution planning.
 ///
 /// Inputs:
@@ -36,8 +64,8 @@ pub enum PhysicalOperator {
     NestedLoopJoin,
     AggregatePartial,
     AggregateFinal,
-    Sort,
-    Limit,
+    Sort { keys: Vec<PhysicalSortExpr> },
+    Limit { spec: PhysicalLimitSpec },
     ExchangeShuffle { keys: Vec<String> },
     ExchangeBroadcast,
     Repartition,
@@ -63,8 +91,8 @@ impl PhysicalOperator {
             PhysicalOperator::NestedLoopJoin => "NestedLoopJoin",
             PhysicalOperator::AggregatePartial => "AggregatePartial",
             PhysicalOperator::AggregateFinal => "AggregateFinal",
-            PhysicalOperator::Sort => "Sort",
-            PhysicalOperator::Limit => "Limit",
+            PhysicalOperator::Sort { .. } => "Sort",
+            PhysicalOperator::Limit { .. } => "Limit",
             PhysicalOperator::ExchangeShuffle { .. } => "ExchangeShuffle",
             PhysicalOperator::ExchangeBroadcast => "ExchangeBroadcast",
             PhysicalOperator::Repartition => "Repartition",

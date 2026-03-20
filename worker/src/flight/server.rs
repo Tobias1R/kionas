@@ -1,4 +1,5 @@
 use crate::state::SharedData;
+use arrow::datatypes::{DataType, Field};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -507,6 +508,82 @@ fn validate_metadata_alignment(
     Ok(())
 }
 
+/// What: Parse Arrow data type from metadata-encoded debug string.
+///
+/// Inputs:
+/// - `raw`: Data type string from metadata JSON.
+///
+/// Output:
+/// - Arrow data type supported by current query result metadata contract.
+fn parse_metadata_data_type(raw: &str) -> Result<DataType, Status> {
+    match raw.trim() {
+        "Int16" => Ok(DataType::Int16),
+        "Int32" => Ok(DataType::Int32),
+        "Int64" => Ok(DataType::Int64),
+        "Boolean" => Ok(DataType::Boolean),
+        "Utf8" => Ok(DataType::Utf8),
+        "Null" => Ok(DataType::Null),
+        other => Err(Status::failed_precondition(format!(
+            "unsupported metadata column data_type '{}'",
+            other
+        ))),
+    }
+}
+
+/// What: Build Arrow schema from result metadata columns.
+///
+/// Inputs:
+/// - `metadata`: Parsed query result metadata JSON.
+///
+/// Output:
+/// - Arrow schema reconstructed from metadata column entries.
+fn schema_from_metadata(metadata: &serde_json::Value) -> Result<Schema, Status> {
+    let columns = metadata
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Status::failed_precondition("result metadata missing columns"))?;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
+        let name = column
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing name",
+                    idx
+                ))
+            })?;
+
+        let data_type_raw = column
+            .get("data_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing data_type",
+                    idx
+                ))
+            })?;
+        let data_type = parse_metadata_data_type(data_type_raw)?;
+
+        let nullable = column
+            .get("nullable")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing nullable",
+                    idx
+                ))
+            })?;
+
+        fields.push(Field::new(name, data_type, nullable));
+    }
+
+    Ok(Schema::new(fields))
+}
+
 /// What: Load all staged parquet batches for a worker task result location.
 ///
 /// Inputs:
@@ -587,9 +664,18 @@ async fn load_result_batches(
     }
 
     if all_batches.is_empty() {
-        return Err(Status::not_found(
-            "result parquet files contain no record batches",
-        ));
+        let expected_row_count = metadata
+            .get("row_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Status::failed_precondition("result metadata missing row_count"))?;
+        if expected_row_count == 0 {
+            let schema = schema_from_metadata(&metadata)?;
+            all_batches.push(RecordBatch::new_empty(std::sync::Arc::new(schema)));
+        } else {
+            return Err(Status::not_found(
+                "result parquet files contain no record batches",
+            ));
+        }
     }
 
     validate_metadata_alignment(
@@ -872,8 +958,8 @@ pub(crate) async fn serve_flight(
 #[cfg(test)]
 mod tests {
     use super::{
-        checksum_fnv64_hex, expected_artifacts_from_metadata, to_staging_prefix,
-        validate_metadata_alignment,
+        checksum_fnv64_hex, expected_artifacts_from_metadata, schema_from_metadata,
+        to_staging_prefix, validate_metadata_alignment,
     };
     use arrow::array::{ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1040,5 +1126,20 @@ mod tests {
         let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
             .expect_err("column order mismatch must fail");
         assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn builds_schema_from_metadata_columns() {
+        let metadata = serde_json::json!({
+            "columns": [
+                {"name": "id", "data_type": "Int64", "nullable": false},
+                {"name": "name", "data_type": "Utf8", "nullable": true}
+            ]
+        });
+
+        let schema = schema_from_metadata(&metadata).expect("schema should build");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(format!("{:?}", schema.field(1).data_type()), "Utf8");
     }
 }

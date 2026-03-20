@@ -91,7 +91,7 @@ fn operator_names_from_payload(operators: &[serde_json::Value]) -> Result<Vec<St
 fn validate_supported_operator_set(names: &[String]) -> Result<(), String> {
     for name in names {
         match name.as_str() {
-            "TableScan" | "Filter" | "Projection" | "Materialize" => {}
+            "TableScan" | "Filter" | "Projection" | "Sort" | "Limit" | "Materialize" => {}
             other => {
                 return Err(format!(
                     "physical operator '{}' is not supported in this phase",
@@ -196,6 +196,42 @@ fn validate_physical_pipeline_shape(operators: &[serde_json::Value]) -> Result<(
         .count();
     if projection_count != 1 {
         return Err("physical_plan must include exactly one Projection operator".to_string());
+    }
+
+    let sort_count = names.iter().filter(|name| name.as_str() == "Sort").count();
+    if sort_count > 1 {
+        return Err("physical_plan must include at most one Sort operator".to_string());
+    }
+
+    if let Some(sort_index) = names.iter().position(|name| name.as_str() == "Sort") {
+        let projection_index = names
+            .iter()
+            .position(|name| name.as_str() == "Projection")
+            .ok_or_else(|| "physical_plan must include Projection".to_string())?;
+        if sort_index < projection_index {
+            return Err("physical_plan Sort must appear after Projection".to_string());
+        }
+    }
+
+    let limit_count = names.iter().filter(|name| name.as_str() == "Limit").count();
+    if limit_count > 1 {
+        return Err("physical_plan must include at most one Limit operator".to_string());
+    }
+
+    if let Some(limit_index) = names.iter().position(|name| name.as_str() == "Limit") {
+        let projection_index = names
+            .iter()
+            .position(|name| name.as_str() == "Projection")
+            .ok_or_else(|| "physical_plan must include Projection".to_string())?;
+        if limit_index < projection_index {
+            return Err("physical_plan Limit must appear after Projection".to_string());
+        }
+
+        if let Some(sort_index) = names.iter().position(|name| name.as_str() == "Sort")
+            && limit_index < sort_index
+        {
+            return Err("physical_plan Limit must appear after Sort".to_string());
+        }
     }
 
     validate_filter_predicates(operators)?;
@@ -490,7 +526,7 @@ fn build_result_location(
 ///
 /// Details:
 /// - Preserves existing query handle contract while replacing stub behavior.
-/// - Runtime execution supports scan/filter/projection/materialize subset only.
+/// - Runtime execution supports scan/filter/projection/sort/limit/materialize subset only.
 pub(crate) async fn execute_query_task_stub(
     shared: &SharedData,
     task: &worker_service::Task,
@@ -896,5 +932,71 @@ mod tests {
             .expect_err("must reject deferred predicate in worker payload");
         assert!(err.contains("predicate is not supported"));
         assert!(err.contains("LIKE"));
+    }
+
+    #[test]
+    fn accepts_limit_after_sort_pipeline() {
+        let task = crate::services::worker_service_server::worker_service::Task {
+            task_id: "t1".to_string(),
+            operation: "query".to_string(),
+            input: serde_json::json!({
+                "version": 2,
+                "statement": "Select",
+                "namespace": {
+                    "database": "db1",
+                    "schema": "s1",
+                    "table": "t1"
+                },
+                "logical_plan": {},
+                "physical_plan": {
+                    "operators": [
+                        {"TableScan": {"relation": {"database": "db1", "schema": "s1", "table": "t1"}}},
+                        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+                        {"Sort": {"keys": [{"expression": {"Raw": {"sql": "id"}}, "ascending": true}]}},
+                        {"Limit": {"spec": {"count": 5, "offset": 2}}},
+                        "Materialize"
+                    ]
+                }
+            })
+            .to_string(),
+            output: String::new(),
+            params: std::collections::HashMap::new(),
+        };
+
+        let namespace = resolve_query_namespace(&task).expect("must accept limit pipeline");
+        assert_eq!(namespace.table, "t1");
+    }
+
+    #[test]
+    fn rejects_limit_before_sort_pipeline() {
+        let task = crate::services::worker_service_server::worker_service::Task {
+            task_id: "t1".to_string(),
+            operation: "query".to_string(),
+            input: serde_json::json!({
+                "version": 2,
+                "statement": "Select",
+                "namespace": {
+                    "database": "db1",
+                    "schema": "s1",
+                    "table": "t1"
+                },
+                "logical_plan": {},
+                "physical_plan": {
+                    "operators": [
+                        {"TableScan": {"relation": {"database": "db1", "schema": "s1", "table": "t1"}}},
+                        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+                        {"Limit": {"spec": {"count": 5, "offset": 0}}},
+                        {"Sort": {"keys": [{"expression": {"Raw": {"sql": "id"}}, "ascending": true}]}},
+                        "Materialize"
+                    ]
+                }
+            })
+            .to_string(),
+            output: String::new(),
+            params: std::collections::HashMap::new(),
+        };
+
+        let err = resolve_query_namespace(&task).expect_err("must reject invalid limit placement");
+        assert!(err.contains("Limit must appear after Sort"));
     }
 }
