@@ -442,7 +442,22 @@ fn build_result_location(
     let (endpoint_host, endpoint_port) =
         resolve_query_result_endpoint(&shared.worker_info.host, shared.worker_info.port);
 
-    format!(
+    let ticket_opt = task.params.get("__auth_scope").and_then(|scope| {
+        let rbac_user = task.params.get("__rbac_user")?.clone();
+        let rbac_role = task.params.get("__rbac_role")?.clone();
+        let ctx = crate::authz::DispatchAuthContext {
+            session_id: session_id.to_string(),
+            rbac_user,
+            rbac_role,
+            auth_scope: scope.clone(),
+            query_id: task.params.get("__query_id").cloned().unwrap_or_default(),
+        };
+        crate::authz::WorkerAuthorizer::new()
+            .issue_signed_flight_ticket(&ctx, &task.task_id, &shared.worker_info.worker_id)
+            .ok()
+    });
+
+    let mut handle = format!(
         "flight://{}:{}/query/{}/{}/{}/{}?session_id={}&task_id={}",
         endpoint_host,
         endpoint_port,
@@ -452,7 +467,14 @@ fn build_result_location(
         shared.worker_info.worker_id,
         session_id,
         task.task_id
-    )
+    );
+
+    if let Some(ticket) = ticket_opt {
+        handle.push_str("&ticket=");
+        handle.push_str(&ticket);
+    }
+
+    handle
 }
 
 /// What: Execute query task with local worker pipeline and deterministic result handle.

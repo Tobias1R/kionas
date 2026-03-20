@@ -7,7 +7,6 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, Location, PutResult, SchemaResult, Ticket,
 };
-use base64::Engine;
 use bytes::Bytes;
 use futures::{Stream, stream};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -17,6 +16,83 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
+
+fn map_tonic_status(status: tonic::Status) -> Status {
+    let code = match status.code() {
+        tonic::Code::Ok => tonic14::Code::Ok,
+        tonic::Code::Cancelled => tonic14::Code::Cancelled,
+        tonic::Code::Unknown => tonic14::Code::Unknown,
+        tonic::Code::InvalidArgument => tonic14::Code::InvalidArgument,
+        tonic::Code::DeadlineExceeded => tonic14::Code::DeadlineExceeded,
+        tonic::Code::NotFound => tonic14::Code::NotFound,
+        tonic::Code::AlreadyExists => tonic14::Code::AlreadyExists,
+        tonic::Code::PermissionDenied => tonic14::Code::PermissionDenied,
+        tonic::Code::ResourceExhausted => tonic14::Code::ResourceExhausted,
+        tonic::Code::FailedPrecondition => tonic14::Code::FailedPrecondition,
+        tonic::Code::Aborted => tonic14::Code::Aborted,
+        tonic::Code::OutOfRange => tonic14::Code::OutOfRange,
+        tonic::Code::Unimplemented => tonic14::Code::Unimplemented,
+        tonic::Code::Internal => tonic14::Code::Internal,
+        tonic::Code::Unavailable => tonic14::Code::Unavailable,
+        tonic::Code::DataLoss => tonic14::Code::DataLoss,
+        tonic::Code::Unauthenticated => tonic14::Code::Unauthenticated,
+    };
+    Status::new(code, status.message().to_string())
+}
+
+fn dispatch_context_from_flight_metadata(
+    metadata: &tonic14::metadata::MetadataMap,
+    fallback_session_id: &str,
+) -> Result<crate::authz::DispatchAuthContext, Status> {
+    let session_id = metadata
+        .get("session_id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(fallback_session_id)
+        .to_string();
+    if session_id.is_empty() {
+        return Err(Status::unauthenticated("missing session_id metadata"));
+    }
+
+    let rbac_user = metadata
+        .get("rbac_user")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::permission_denied("missing rbac_user metadata"))?
+        .to_string();
+
+    let rbac_role = metadata
+        .get("rbac_role")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::permission_denied("missing rbac_role metadata"))?
+        .to_string();
+
+    let auth_scope = metadata
+        .get("auth_scope")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::permission_denied("missing auth_scope metadata"))?
+        .to_string();
+
+    let query_id = metadata
+        .get("query_id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_default();
+
+    Ok(crate::authz::DispatchAuthContext {
+        session_id,
+        rbac_user,
+        rbac_role,
+        auth_scope,
+        query_id,
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct WorkerFlightService {
@@ -29,56 +105,25 @@ impl WorkerFlightService {
     }
 }
 
-/// What: Decode the internal opaque Flight ticket into session, task, and worker identifiers.
+/// What: Decode and verify the signed internal Flight ticket.
 ///
 /// Inputs:
 /// - `ticket_raw`: UTF-8 bytes from `Ticket.ticket`, expected as URL-safe base64 without padding.
 ///
 /// Output:
-/// - Tuple `(session_id, task_id, worker_id)` when ticket is valid.
+/// - Verified signed ticket claims.
 ///
 /// Details:
-/// - Ticket payload is encoded as `session_id:task_id:worker_id`.
-fn decode_internal_ticket(ticket_raw: &[u8]) -> Result<(String, String, String), Status> {
-    let encoded = std::str::from_utf8(ticket_raw)
+/// - Ticket payload is a compact JWT signed by worker auth policy.
+fn decode_internal_ticket(
+    ticket_raw: &[u8],
+    authorizer: &crate::authz::WorkerAuthorizer,
+) -> Result<crate::authz::FlightTicketClaims, Status> {
+    let token = std::str::from_utf8(ticket_raw)
         .map_err(|_| Status::invalid_argument("ticket is not valid UTF-8"))?;
-
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| Status::invalid_argument("ticket is not valid base64"))?;
-
-    let decoded_text = String::from_utf8(decoded)
-        .map_err(|_| Status::invalid_argument("ticket payload is not valid UTF-8"))?;
-
-    let mut parts = decoded_text.splitn(3, ':');
-    let session_id = parts.next().unwrap_or_default().trim().to_string();
-    let task_id = parts.next().unwrap_or_default().trim().to_string();
-    let worker_id = parts.next().unwrap_or_default().trim().to_string();
-
-    if session_id.is_empty() || task_id.is_empty() || worker_id.is_empty() {
-        return Err(Status::invalid_argument(
-            "ticket payload is invalid; expected session_id:task_id:worker_id",
-        ));
-    }
-
-    Ok((session_id, task_id, worker_id))
-}
-
-/// What: Build internal worker ticket payload for a session task pair.
-///
-/// Inputs:
-/// - `session_id`: Session identifier.
-/// - `task_id`: Task identifier.
-/// - `worker_id`: Worker identifier.
-///
-/// Output:
-/// - URL-safe base64 ticket bytes as UTF-8 string.
-///
-/// Details:
-/// - Encoding format is `session_id:task_id:worker_id`.
-fn build_internal_ticket(session_id: &str, task_id: &str, worker_id: &str) -> String {
-    let payload = format!("{}:{}:{}", session_id, task_id, worker_id);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    authorizer
+        .verify_signed_flight_ticket(token)
+        .map_err(map_tonic_status)
 }
 
 /// What: Resolve worker Flight port from environment or default worker port.
@@ -590,8 +635,20 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let descriptor = request.into_inner();
+        let authz = crate::authz::WorkerAuthorizer::new();
+        let descriptor = request.get_ref().clone();
         let (session_id, task_id) = parse_descriptor_scope(&descriptor)?;
+        let dispatch_ctx = dispatch_context_from_flight_metadata(request.metadata(), &session_id)?;
+        authz
+            .validate_dispatch_context(&dispatch_ctx)
+            .await
+            .map_err(map_tonic_status)?;
+
+        if dispatch_ctx.session_id != session_id {
+            return Err(Status::permission_denied(
+                "flight descriptor session_id does not match auth context",
+            ));
+        }
 
         let result_location = self
             .shared_data
@@ -617,11 +674,13 @@ impl FlightService for WorkerFlightService {
             &self.shared_data.worker_info.host,
             self.shared_data.worker_info.port,
         );
-        let ticket = build_internal_ticket(
-            &session_id,
-            &task_id,
-            &self.shared_data.worker_info.worker_id,
-        );
+        let ticket = authz
+            .issue_signed_flight_ticket(
+                &dispatch_ctx,
+                &task_id,
+                &self.shared_data.worker_info.worker_id,
+            )
+            .map_err(map_tonic_status)?;
 
         let flight_info = FlightInfo {
             schema: schema_result.schema,
@@ -656,8 +715,20 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        let descriptor = request.into_inner();
+        let authz = crate::authz::WorkerAuthorizer::new();
+        let descriptor = request.get_ref().clone();
         let (session_id, task_id) = parse_descriptor_scope(&descriptor)?;
+        let dispatch_ctx = dispatch_context_from_flight_metadata(request.metadata(), &session_id)?;
+        authz
+            .validate_dispatch_context(&dispatch_ctx)
+            .await
+            .map_err(map_tonic_status)?;
+
+        if dispatch_ctx.session_id != session_id {
+            return Err(Status::permission_denied(
+                "flight descriptor session_id does not match auth context",
+            ));
+        }
 
         let result_location = self
             .shared_data
@@ -684,10 +755,31 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let authz = crate::authz::WorkerAuthorizer::new();
+        let metadata = request.metadata().clone();
         let ticket = request.into_inner();
-        let (session_id, task_id, ticket_worker_id) = decode_internal_ticket(&ticket.ticket)?;
+        let claims = decode_internal_ticket(&ticket.ticket, &authz)?;
 
-        if ticket_worker_id != self.shared_data.worker_info.worker_id {
+        if metadata.get("rbac_user").is_some() {
+            let dispatch_ctx = dispatch_context_from_flight_metadata(&metadata, &claims.sid)?;
+            authz
+                .validate_dispatch_context(&dispatch_ctx)
+                .await
+                .map_err(map_tonic_status)?;
+
+            if dispatch_ctx.session_id != claims.sid {
+                return Err(Status::permission_denied(
+                    "flight auth session does not match ticket session",
+                ));
+            }
+            if dispatch_ctx.rbac_user != claims.sub || dispatch_ctx.rbac_role != claims.role {
+                return Err(Status::permission_denied(
+                    "flight auth context does not match ticket principal",
+                ));
+            }
+        }
+
+        if claims.wid != self.shared_data.worker_info.worker_id {
             return Err(Status::permission_denied(
                 "ticket worker_id does not match this worker",
             ));
@@ -695,17 +787,22 @@ impl FlightService for WorkerFlightService {
 
         let result_location = self
             .shared_data
-            .get_task_result_location(&session_id, &task_id)
+            .get_task_result_location(&claims.sid, &claims.tid)
             .await
             .ok_or_else(|| {
                 Status::not_found(format!(
                     "result location missing or expired for task_id={}",
-                    task_id
+                    claims.tid
                 ))
             })?;
 
-        let batches =
-            load_result_batches(&self.shared_data, &result_location, &session_id, &task_id).await?;
+        let batches = load_result_batches(
+            &self.shared_data,
+            &result_location,
+            &claims.sid,
+            &claims.tid,
+        )
+        .await?;
         let schema = batches
             .first()
             .map(|b| b.schema())

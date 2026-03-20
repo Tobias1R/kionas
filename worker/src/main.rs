@@ -1,3 +1,4 @@
+mod authz;
 mod flight;
 mod init;
 mod interops;
@@ -156,7 +157,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    let svc = services::worker_service_server::WorkerService { shared_data };
+    let svc = services::worker_service_server::WorkerService {
+        shared_data,
+        authorizer: std::sync::Arc::new(crate::authz::WorkerAuthorizer::new()),
+    };
     println!("Starting interops_server on {}", addr);
     tonic::transport::Server::builder()
         //.tls_config(tls_config)?

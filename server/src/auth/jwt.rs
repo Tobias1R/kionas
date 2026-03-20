@@ -33,7 +33,7 @@ impl JwtInterceptor {
 }
 
 impl Interceptor for JwtInterceptor {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         let token = request
             .metadata()
             .get("authorization")
@@ -41,7 +41,11 @@ impl Interceptor for JwtInterceptor {
             .and_then(|header| header.strip_prefix("Bearer "))
             .ok_or_else(|| Status::unauthenticated("Missing or malformed token"))?;
 
-        self.validate_token(token)?;
+        let claims = self.validate_token(token)?;
+
+        if let Ok(subject) = tonic::metadata::MetadataValue::try_from(claims.sub.as_str()) {
+            request.metadata_mut().insert("rbac_user", subject);
+        }
 
         if let Some(_session_id) = request
             .metadata()

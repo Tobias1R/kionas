@@ -7,6 +7,7 @@ pub(crate) mod query_select;
 pub(crate) mod rbac;
 pub mod use_warehouse;
 
+use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
 use std::collections::HashMap;
@@ -109,6 +110,7 @@ pub async fn get_worker_addr_for_session(
 pub async fn handle_statement(
     stmt: &Statement,
     session_id: &str,
+    ctx: &RequestContext,
     shared_data: &SharedData,
 ) -> String {
     match stmt {
@@ -138,6 +140,7 @@ pub async fn handle_statement(
                 "insert",
                 payload,
                 params,
+                None,
                 30,
             )
             .await
@@ -155,7 +158,7 @@ pub async fn handle_statement(
                     return format!("RESULT|VALIDATION|INVALID_QUERY_STATEMENT|{}", e);
                 }
             };
-            query_select::handle_select_query(shared_data, session_id, ast).await
+            query_select::handle_select_query(shared_data, session_id, ctx, ast).await
         }
         Statement::CreateSchema {
             schema_name,

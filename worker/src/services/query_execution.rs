@@ -95,6 +95,36 @@ pub(crate) async fn execute_query_task(
     namespace: &QueryNamespace,
     result_location: &str,
 ) -> Result<(), String> {
+    let auth_scope = task
+        .params
+        .get("__auth_scope")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "query authorization scope metadata is missing".to_string())?;
+    let rbac_user = task
+        .params
+        .get("__rbac_user")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "query rbac_user metadata is missing".to_string())?;
+    let rbac_role = task
+        .params
+        .get("__rbac_role")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "query rbac_role metadata is missing".to_string())?;
+
+    let expected_scope = format!(
+        "select:{}.{}.{}",
+        namespace.database, namespace.schema, namespace.table
+    );
+    if auth_scope != expected_scope && auth_scope != "select:*" && auth_scope != "select:*.*.*" {
+        return Err(format!(
+            "query authorization denied for principal {} with role {} on {}",
+            rbac_user, rbac_role, expected_scope
+        ));
+    }
+
     let runtime_plan = extract_runtime_plan(task)?;
     let stage_context = stage_execution_context(task);
     let mut batches = load_input_batches(shared, session_id, namespace, &stage_context).await?;

@@ -46,6 +46,7 @@ struct ParsedHandle {
     session_id: String,
     task_id: String,
     worker_id: String,
+    signed_ticket: Option<String>,
 }
 
 /// What: Decode a query handle from structured response bytes.
@@ -105,6 +106,7 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
 
     let mut session_id = String::new();
     let mut task_id = String::new();
+    let mut signed_ticket = None;
     for pair in query.split('&') {
         let (k, v) = pair
             .split_once('=')
@@ -113,6 +115,8 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
             session_id = v.to_string();
         } else if k == "task_id" {
             task_id = v.to_string();
+        } else if k == "ticket" {
+            signed_ticket = Some(v.to_string());
         }
     }
 
@@ -128,6 +132,7 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
         session_id,
         task_id,
         worker_id,
+        signed_ticket,
     })
 }
 
@@ -142,6 +147,10 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
 /// Details:
 /// - Encodes payload using `session_id:task_id:worker_id` order required by worker ticket validation.
 fn build_internal_ticket(parsed: &ParsedHandle) -> String {
+    if let Some(ticket) = &parsed.signed_ticket {
+        return ticket.clone();
+    }
+
     let payload = format!(
         "{}:{}:{}",
         parsed.session_id, parsed.task_id, parsed.worker_id

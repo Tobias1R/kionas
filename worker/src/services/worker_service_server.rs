@@ -1,5 +1,5 @@
 use crate::state::SharedData;
-use base64::Engine;
+use std::sync::Arc;
 
 use serde_json::Value;
 use url::Url;
@@ -11,6 +11,7 @@ pub mod worker_service {
 #[derive(Default)]
 pub struct WorkerService {
     pub shared_data: SharedData,
+    pub authorizer: Arc<crate::authz::WorkerAuthorizer>,
 }
 
 fn resolve_flight_port(default_worker_port: u32) -> u32 {
@@ -26,9 +27,42 @@ fn resolve_flight_endpoint(worker_host: &str, worker_port: u32) -> String {
     format!("http://{}:{}", worker_host, flight_port)
 }
 
-fn build_flight_ticket(session_id: &str, task_id: &str, worker_id: &str) -> String {
-    let raw = format!("{}:{}:{}", session_id, task_id, worker_id);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
+fn parse_scope_relation_from_task(task: &worker_service::Task) -> Option<(String, String, String)> {
+    if let (Some(database), Some(schema), Some(table)) = (
+        task.params.get("database_name"),
+        task.params.get("schema_name"),
+        task.params.get("table_name"),
+    ) {
+        let database = database.trim().to_ascii_lowercase();
+        let schema = schema.trim().to_ascii_lowercase();
+        let table = table.trim().to_ascii_lowercase();
+        if !database.is_empty() && !schema.is_empty() && !table.is_empty() {
+            return Some((database, schema, table));
+        }
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&task.input).ok()?;
+    let namespace = payload.get("namespace")?;
+    let database = namespace
+        .get("database")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    let schema = namespace
+        .get("schema")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    let table = namespace
+        .get("table")?
+        .as_str()?
+        .trim()
+        .to_ascii_lowercase();
+    if database.is_empty() || schema.is_empty() || table.is_empty() {
+        return None;
+    }
+
+    Some((database, schema, table))
 }
 
 /// What: Build the task-scoped staging prefix from a task result location.
@@ -135,7 +169,57 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         &self,
         request: tonic::Request<worker_service::TaskRequest>,
     ) -> Result<tonic::Response<worker_service::TaskResponse>, tonic::Status> {
-        let req = request.into_inner();
+        let is_query_task = request
+            .get_ref()
+            .tasks
+            .first()
+            .map(|t| t.operation.eq_ignore_ascii_case("query"))
+            .unwrap_or(false);
+        let request_session_id = request.get_ref().session_id.clone();
+
+        let auth_ctx_opt = if is_query_task {
+            let auth_ctx = self
+                .authorizer
+                .extract_dispatch_context(request.metadata(), request_session_id.as_str())?;
+            self.authorizer.validate_dispatch_context(&auth_ctx).await?;
+            Some(auth_ctx)
+        } else {
+            None
+        };
+
+        let mut req = request.into_inner();
+        if let Some(auth_ctx) = &auth_ctx_opt
+            && req.session_id.trim().is_empty()
+        {
+            req.session_id = auth_ctx.session_id.clone();
+        }
+
+        if let Some(task) = req.tasks.first()
+            && task.operation.eq_ignore_ascii_case("query")
+            && let Some((database, schema, table)) = parse_scope_relation_from_task(task)
+            && let Some(auth_ctx) = &auth_ctx_opt
+        {
+            self.authorizer.validate_query_scope(
+                &auth_ctx.auth_scope,
+                &database,
+                &schema,
+                &table,
+            )?;
+        }
+
+        if let Some(auth_ctx) = &auth_ctx_opt {
+            for task in &mut req.tasks {
+                task.params
+                    .insert("__auth_scope".to_string(), auth_ctx.auth_scope.clone());
+                task.params
+                    .insert("__rbac_user".to_string(), auth_ctx.rbac_user.clone());
+                task.params
+                    .insert("__rbac_role".to_string(), auth_ctx.rbac_role.clone());
+                task.params
+                    .insert("__query_id".to_string(), auth_ctx.query_id.clone());
+            }
+        }
+
         log::info!("Received task: {}", req.session_id);
 
         let resp =
@@ -254,6 +338,12 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         &self,
         request: tonic::Request<worker_service::FlightInfoRequest>,
     ) -> Result<tonic::Response<worker_service::FlightInfoResponse>, tonic::Status> {
+        let request_session_id = request.get_ref().session_id.clone();
+        let auth_ctx = self
+            .authorizer
+            .extract_dispatch_context(request.metadata(), request_session_id.as_str())?;
+        self.authorizer.validate_dispatch_context(&auth_ctx).await?;
+
         let req = request.into_inner();
         if req.task_id.trim().is_empty() {
             return Err(tonic::Status::invalid_argument("task_id is required"));
@@ -281,11 +371,11 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         let metadata = load_result_metadata(&self.shared_data, &prefix).await?;
         let schema = schema_json_from_metadata(&metadata)?;
 
-        let ticket = build_flight_ticket(
-            &req.session_id,
+        let ticket = self.authorizer.issue_signed_flight_ticket(
+            &auth_ctx,
             &req.task_id,
             &self.shared_data.worker_info.worker_id,
-        );
+        )?;
 
         let resp = worker_service::FlightInfoResponse {
             endpoint,
