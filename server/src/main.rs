@@ -7,6 +7,7 @@ mod auth_setup;
 mod consul;
 //mod core;
 mod handlers;
+mod janitor;
 mod server;
 mod services;
 mod session;

@@ -100,6 +100,10 @@ Lets discuss a new place for this code. They shouldnt be here in services
 - CONSTRAINTS: [roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md](roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md)
 - CONSTRAINTS FOUNDATION discovery: [roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md](roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md)
 - CONSTRAINTS FOUNDATION matrix: [roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md)
+- UI: [roadmaps/SILK_ROAD/UI/ROADMAP_UI.md](roadmaps/SILK_ROAD/UI/ROADMAP_UI.md)
+- UI FOUNDATION discovery: [roadmaps/SILK_ROAD/UI/discovery/discovery-UI-FOUNDATION.md](roadmaps/SILK_ROAD/UI/discovery/discovery-UI-FOUNDATION.md)
+- UI FOUNDATION plan: [roadmaps/SILK_ROAD/UI/plans/plan-UI-FOUNDATION.md](roadmaps/SILK_ROAD/UI/plans/plan-UI-FOUNDATION.md)
+- UI FOUNDATION matrix: [roadmaps/ROADMAP_UI_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_UI_FOUNDATION_MATRIX.md)
 
 [INTERMISSION Code Cleanup - Worker]
 - Decision: move DDL task handlers from `worker/src/services` to `worker/src/transactions/ddl` to align ownership with transaction execution.
@@ -165,9 +169,11 @@ Lets discuss a new place for this code. They shouldnt be here in services
 - Closure matrix: [roadmaps/ROADMAP2_INTERMISSION_WORKER_TESTS_CLEANUP_MATRIX.md](roadmaps/ROADMAP2_INTERMISSION_WORKER_TESTS_CLEANUP_MATRIX.md)
 [X] DONE
 
-[INTERMISSION Code Cleanup - Kionas]
-[INTERMISSION Code Cleanup - Kionas - Tests]
+[INTERMISSION Code Cleanup - Kionas] - Deferred
+- Refactor planner modules to group by logical/physical and operator categories.
 - move all tests to kionas/src/tests/
+
+
 
 7. Phase 7: Window foundation
 7.1 Introduce minimal supported window semantics with explicit constraints.

@@ -32,5 +32,15 @@ Foundation plan: [roadmaps/SILK_ROAD/DATATYPES/plans/plan-DATATYPES-FOUNDATION.m
 
 Foundation matrix: [roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md)
 
+## Road to UI
+
+Current roadmap: [roadmaps/SILK_ROAD/UI/ROADMAP_UI.md](roadmaps/SILK_ROAD/UI/ROADMAP_UI.md)
+
+Foundation discovery: [roadmaps/SILK_ROAD/UI/discovery/discovery-UI-FOUNDATION.md](roadmaps/SILK_ROAD/UI/discovery/discovery-UI-FOUNDATION.md)
+
+Foundation plan: [roadmaps/SILK_ROAD/UI/plans/plan-UI-FOUNDATION.md](roadmaps/SILK_ROAD/UI/plans/plan-UI-FOUNDATION.md)
+
+Foundation matrix: [roadmaps/ROADMAP_UI_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_UI_FOUNDATION_MATRIX.md)
+
 
 

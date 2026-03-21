@@ -30,3 +30,13 @@ pub const REDIS_POOL_SIZE_ENV: &str = "REDIS_POOL_SIZE";
  */
 pub const REDIS_TASK_RESULT_KEY_PREFIX: &str = "kionas:worker:task_result";
 pub const REDIS_TASK_RESULT_TTL_SECONDS: u64 = 86_400;
+
+/*
+ * UI dashboard cache keys
+ */
+pub const REDIS_UI_DASHBOARD_SERVER_STATS_KEY: &str = "kionas:ui:dashboard:server_stats";
+pub const REDIS_UI_DASHBOARD_SESSIONS_KEY: &str = "kionas:ui:dashboard:sessions";
+pub const REDIS_UI_DASHBOARD_TOKENS_KEY: &str = "kionas:ui:dashboard:tokens";
+pub const REDIS_UI_DASHBOARD_WORKERS_KEY: &str = "kionas:ui:dashboard:workers";
+pub const REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY: &str =
+    "kionas:ui:dashboard:consul_cluster_summary";
