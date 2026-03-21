@@ -33,6 +33,102 @@ pub(crate) struct StageExecutionContext {
     pub(crate) partition_count: u32,
     pub(crate) partition_index: u32,
     pub(crate) query_run_id: String,
+    pub(crate) scan_hints: RuntimeScanHints,
+}
+
+/// What: Runtime scan execution mode resolved from task metadata.
+///
+/// Inputs:
+/// - Serialized `scan_mode` value from task params.
+///
+/// Output:
+/// - Concrete runtime mode used by scan loading flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeScanMode {
+    Full,
+    MetadataPruned,
+}
+
+impl RuntimeScanMode {
+    /// What: Parse runtime scan mode from task param value.
+    ///
+    /// Inputs:
+    /// - `raw`: Raw mode string from task params.
+    ///
+    /// Output:
+    /// - Parsed mode or `Full` when the value is unknown.
+    fn parse_or_default(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("metadata_pruned") => Self::MetadataPruned,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// What: Scan metadata contract passed from planner/server to worker runtime.
+///
+/// Inputs:
+/// - `mode`: Requested scan mode for the task.
+/// - `pruning_hints_json`: Optional compact JSON hints for future pruning.
+/// - `delta_version_pin`: Optional Delta version pin used for freshness checks.
+///
+/// Output:
+/// - Runtime scan hint bundle consumed by scan loading functions.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeScanHints {
+    pub(crate) mode: RuntimeScanMode,
+    pub(crate) pruning_hints_json: Option<String>,
+    pub(crate) delta_version_pin: Option<u64>,
+    pub(crate) pruning_eligible: bool,
+    pub(crate) pruning_reason: Option<String>,
+}
+
+impl RuntimeScanHints {
+    /// What: Build a default full-scan hint set.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Full-scan runtime hints with no optional metadata.
+    pub(crate) fn full_scan() -> Self {
+        Self {
+            mode: RuntimeScanMode::Full,
+            pruning_hints_json: None,
+            delta_version_pin: None,
+            pruning_eligible: false,
+            pruning_reason: None,
+        }
+    }
+}
+
+fn parse_pruning_eligibility(pruning_hints_json: Option<&str>) -> (bool, Option<String>) {
+    let Some(raw) = pruning_hints_json else {
+        return (false, Some("missing_pruning_hints".to_string()));
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => return (false, Some("invalid_pruning_hints_json".to_string())),
+    };
+
+    let eligible = parsed
+        .get("eligible")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let reason = parsed
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            if eligible {
+                Some("eligible".to_string())
+            } else {
+                Some("ineligible_or_missing_reason".to_string())
+            }
+        });
+
+    (eligible, reason)
 }
 
 /// What: Parse and extract executable runtime operators from validated physical plan payload.
@@ -180,6 +276,27 @@ pub(crate) fn stage_execution_context(task: &worker_service::Task) -> StageExecu
         .filter(|value| !value.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| format!("legacy-task-{}", task.task_id));
+    let scan_hints = RuntimeScanHints {
+        mode: RuntimeScanMode::parse_or_default(task.params.get("scan_mode").map(String::as_str)),
+        pruning_hints_json: task
+            .params
+            .get("scan_pruning_hints_json")
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+        delta_version_pin: task
+            .params
+            .get("scan_delta_version_pin")
+            .and_then(|value| value.parse::<u64>().ok()),
+        pruning_eligible: false,
+        pruning_reason: None,
+    };
+    let (pruning_eligible, pruning_reason) =
+        parse_pruning_eligibility(scan_hints.pruning_hints_json.as_deref());
+    let scan_hints = RuntimeScanHints {
+        pruning_eligible,
+        pruning_reason,
+        ..scan_hints
+    };
 
     StageExecutionContext {
         stage_id,
@@ -188,5 +305,6 @@ pub(crate) fn stage_execution_context(task: &worker_service::Task) -> StageExecu
         partition_count,
         partition_index,
         query_run_id,
+        scan_hints,
     }
 }

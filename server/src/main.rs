@@ -23,8 +23,22 @@ use kionas::config::AppConfig;
 use kionas::get_local_hostname;
 use std::env;
 
+fn try_install_rustls_crypto_provider() {
+    let res = std::panic::catch_unwind(|| {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let _ = provider.install_default();
+    });
+
+    match res {
+        Ok(_) => log::debug!("rustls CryptoProvider installed default successfully"),
+        Err(_) => log::debug!("rustls CryptoProvider.install_default() panicked or unavailable"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    try_install_rustls_crypto_provider();
+
     // Try to load host-specific config from Consul or /workspace/configs
     let consul_url = env::var("CONSUL_URL").ok();
     let hostname = get_local_hostname().unwrap_or_else(|| "server".to_string());

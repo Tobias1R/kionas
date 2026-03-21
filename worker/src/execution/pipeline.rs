@@ -3,6 +3,7 @@ use crate::execution::aggregate::{
 };
 use crate::execution::artifacts::{persist_query_artifacts, persist_stage_exchange_artifacts};
 use crate::execution::join::apply_hash_join_pipeline;
+use crate::execution::planner::RuntimeScanHints;
 use crate::execution::planner::StageExecutionContext;
 use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
@@ -18,7 +19,556 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+struct PredicateComparisonNode {
+    column: String,
+    op: String,
+    value: String,
+}
+
+#[derive(Debug, Clone)]
+enum PredicateAstNode {
+    Comparison(PredicateComparisonNode),
+    And(Vec<PredicateAstNode>),
+}
+
+#[derive(Debug, Clone)]
+enum PredicateLiteralValue {
+    Number(f64),
+    String(String),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone)]
+struct DeltaFileStats {
+    min_values: serde_json::Map<String, Value>,
+    max_values: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct DeltaPruningCacheEntry {
+    cached_at: Instant,
+    latest_version: u64,
+    file_stats: HashMap<String, DeltaFileStats>,
+}
+
+const DELTA_PRUNING_CACHE_TTL: Duration = Duration::from_secs(30);
+
+static DELTA_PRUNING_CACHE: LazyLock<Mutex<HashMap<String, DeltaPruningCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// What: Load cached Delta version and file stats for a table when entry is fresh.
+///
+/// Inputs:
+/// - `cache_key`: Stable table key derived from source prefix.
+///
+/// Output:
+/// - Cached `(latest_version, file_stats)` when available and not expired.
+fn get_cached_delta_pruning_metadata(
+    cache_key: &str,
+) -> Option<(u64, HashMap<String, DeltaFileStats>)> {
+    let mut cache = DELTA_PRUNING_CACHE.lock().ok()?;
+    let entry = cache.get(cache_key)?;
+    if entry.cached_at.elapsed() > DELTA_PRUNING_CACHE_TTL {
+        cache.remove(cache_key);
+        return None;
+    }
+
+    Some((entry.latest_version, entry.file_stats.clone()))
+}
+
+/// What: Store Delta version and file stats in the pruning cache.
+///
+/// Inputs:
+/// - `cache_key`: Stable table key derived from source prefix.
+/// - `latest_version`: Latest delta log version used for pruning metadata.
+/// - `file_stats`: Parsed file-level min/max stats.
+///
+/// Output:
+/// - None. Cache is updated in place.
+fn put_cached_delta_pruning_metadata(
+    cache_key: String,
+    latest_version: u64,
+    file_stats: HashMap<String, DeltaFileStats>,
+) {
+    if let Ok(mut cache) = DELTA_PRUNING_CACHE.lock() {
+        cache.insert(
+            cache_key,
+            DeltaPruningCacheEntry {
+                cached_at: Instant::now(),
+                latest_version,
+                file_stats,
+            },
+        );
+    }
+}
+
+/// What: Parse predicate AST from scan pruning hints JSON.
+///
+/// Inputs:
+/// - `scan_hints_json`: Serialized pruning hints payload.
+///
+/// Output:
+/// - Parsed predicate AST when a supported `predicate_ast` is present.
+fn parse_predicate_ast_from_hints(scan_hints_json: &str) -> Option<PredicateAstNode> {
+    let hints: Value = serde_json::from_str(scan_hints_json).ok()?;
+    let ast = hints.get("predicate_ast")?;
+    parse_predicate_ast_node(ast)
+}
+
+fn parse_predicate_ast_node(node: &Value) -> Option<PredicateAstNode> {
+    let kind = node.get("kind")?.as_str()?;
+    match kind {
+        "comparison" => Some(PredicateAstNode::Comparison(PredicateComparisonNode {
+            column: node.get("column")?.as_str()?.to_string(),
+            op: node.get("op")?.as_str()?.to_string(),
+            value: node.get("value")?.as_str()?.to_string(),
+        })),
+        "and" => {
+            let terms = node
+                .get("terms")?
+                .as_array()?
+                .iter()
+                .filter_map(parse_predicate_ast_node)
+                .collect::<Vec<_>>();
+            if terms.is_empty() {
+                None
+            } else {
+                Some(PredicateAstNode::And(terms))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// What: Resolve table object prefix from source staging prefix.
+///
+/// Inputs:
+/// - `source_prefix`: Source prefix ending with `staging/`.
+///
+/// Output:
+/// - Table root prefix ending with `/`.
+fn table_prefix_from_source_prefix(source_prefix: &str) -> Option<String> {
+    source_prefix
+        .strip_suffix("staging/")
+        .map(ToString::to_string)
+}
+
+fn delta_log_prefix_from_source_prefix(source_prefix: &str) -> Option<String> {
+    table_prefix_from_source_prefix(source_prefix).map(|prefix| format!("{}_delta_log/", prefix))
+}
+
+/// What: Read latest Delta log version from `_delta_log` JSON files.
+///
+/// Inputs:
+/// - `provider`: Storage provider used for object listing.
+/// - `delta_log_prefix`: Delta log object prefix.
+///
+/// Output:
+/// - Latest JSON log version when present.
+async fn latest_delta_log_version(
+    provider: &std::sync::Arc<dyn crate::storage::StorageProvider + Send + Sync>,
+    delta_log_prefix: &str,
+) -> Result<Option<u64>, String> {
+    let keys = provider.list_objects(delta_log_prefix).await.map_err(|e| {
+        format!(
+            "failed to list delta log objects for {}: {}",
+            delta_log_prefix, e
+        )
+    })?;
+
+    let mut latest = None::<u64>;
+    for key in keys {
+        if !key.ends_with(".json") {
+            continue;
+        }
+        let file_name = key.rsplit('/').next().unwrap_or_default();
+        let stem = file_name.strip_suffix(".json").unwrap_or_default();
+        if stem.len() != 20 || !stem.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(version) = stem.parse::<u64>() {
+            latest = Some(latest.map_or(version, |current| current.max(version)));
+        }
+    }
+
+    Ok(latest)
+}
+
+/// What: Load per-file Delta stats from one JSON log version.
+///
+/// Inputs:
+/// - `provider`: Storage provider used for object reads.
+/// - `delta_log_prefix`: Delta log object prefix.
+/// - `table_prefix`: Table root object prefix.
+/// - `version`: Delta log version to load.
+///
+/// Output:
+/// - Map from full object key to parsed min/max stats.
+async fn load_delta_file_stats_for_version(
+    provider: &std::sync::Arc<dyn crate::storage::StorageProvider + Send + Sync>,
+    delta_log_prefix: &str,
+    table_prefix: &str,
+    version: u64,
+) -> Result<HashMap<String, DeltaFileStats>, String> {
+    let delta_log_key = format!("{}{:020}.json", delta_log_prefix, version);
+    let bytes = provider
+        .get_object(&delta_log_key)
+        .await
+        .map_err(|e| format!("failed to read delta log {}: {}", delta_log_key, e))?
+        .ok_or_else(|| format!("delta log object not found: {}", delta_log_key))?;
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("delta log {} is not valid UTF-8: {}", delta_log_key, e))?;
+
+    let mut file_stats = HashMap::<String, DeltaFileStats>::new();
+
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
+        let row: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let add = match row.get("add") {
+            Some(value) => value,
+            None => continue,
+        };
+
+        let relative_path = match add.get("path").and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => continue,
+        };
+
+        let stats_raw = match add.get("stats").and_then(Value::as_str) {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => continue,
+        };
+
+        let stats_value: Value = match serde_json::from_str(stats_raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let min_values = match stats_value.get("minValues").and_then(Value::as_object) {
+            Some(map) => map.clone(),
+            None => continue,
+        };
+        let max_values = match stats_value.get("maxValues").and_then(Value::as_object) {
+            Some(map) => map.clone(),
+            None => continue,
+        };
+
+        let relative_key = relative_path.trim_start_matches('/');
+        let full_key = format!("{}{}", table_prefix, relative_key);
+        file_stats.insert(
+            full_key,
+            DeltaFileStats {
+                min_values,
+                max_values,
+            },
+        );
+    }
+
+    Ok(file_stats)
+}
+
+fn normalize_column_name(column: &str) -> String {
+    column
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .rsplit('.')
+        .next()
+        .unwrap_or(column)
+        .to_string()
+}
+
+fn parse_predicate_literal(raw: &str) -> Option<PredicateLiteralValue> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+    {
+        return Some(PredicateLiteralValue::String(stripped.to_string()));
+    }
+
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Some(PredicateLiteralValue::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Some(PredicateLiteralValue::Bool(false));
+    }
+
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .map(PredicateLiteralValue::Number)
+}
+
+fn compare_value_and_literal(value: &Value, literal: &PredicateLiteralValue) -> Option<Ordering> {
+    match literal {
+        PredicateLiteralValue::Number(right) => value.as_f64()?.partial_cmp(right),
+        PredicateLiteralValue::String(right) => Some(value.as_str()?.cmp(right)),
+        PredicateLiteralValue::Bool(right) => Some(value.as_bool()?.cmp(right)),
+    }
+}
+
+/// What: Determine if one comparison predicate is definitely false for a file.
+///
+/// Inputs:
+/// - `comparison`: Parsed comparison node.
+/// - `stats`: Delta file min/max stats.
+///
+/// Output:
+/// - `true` when the file can be safely skipped.
+fn is_comparison_definitely_false(
+    comparison: &PredicateComparisonNode,
+    stats: &DeltaFileStats,
+) -> bool {
+    let column = normalize_column_name(&comparison.column);
+    let min_value = match stats.min_values.get(&column) {
+        Some(value) => value,
+        None => return false,
+    };
+    let max_value = match stats.max_values.get(&column) {
+        Some(value) => value,
+        None => return false,
+    };
+    let literal = match parse_predicate_literal(&comparison.value) {
+        Some(value) => value,
+        None => return false,
+    };
+
+    let min_cmp = compare_value_and_literal(min_value, &literal);
+    let max_cmp = compare_value_and_literal(max_value, &literal);
+
+    match comparison.op.as_str() {
+        "=" => {
+            matches!(max_cmp, Some(Ordering::Less)) || matches!(min_cmp, Some(Ordering::Greater))
+        }
+        ">" => matches!(max_cmp, Some(Ordering::Less | Ordering::Equal)),
+        ">=" => matches!(max_cmp, Some(Ordering::Less)),
+        "<" => matches!(min_cmp, Some(Ordering::Greater | Ordering::Equal)),
+        "<=" => matches!(min_cmp, Some(Ordering::Greater)),
+        "!=" => {
+            matches!(min_cmp, Some(Ordering::Equal)) && matches!(max_cmp, Some(Ordering::Equal))
+        }
+        _ => false,
+    }
+}
+
+fn predicate_definitely_false_for_file(
+    predicate: &PredicateAstNode,
+    stats: &DeltaFileStats,
+) -> bool {
+    match predicate {
+        PredicateAstNode::Comparison(node) => is_comparison_definitely_false(node, stats),
+        PredicateAstNode::And(terms) => terms
+            .iter()
+            .any(|term| predicate_definitely_false_for_file(term, stats)),
+    }
+}
+
+/// What: Compute pruned file key set from Delta metadata and predicate AST.
+///
+/// Inputs:
+/// - `keys`: Candidate parquet object keys.
+/// - `stats`: Per-file min/max stats map.
+/// - `predicate`: Parsed predicate AST.
+///
+/// Output:
+/// - Filtered key list preserving deterministic order.
+fn prune_keys_by_delta_stats(
+    keys: &[String],
+    stats: &HashMap<String, DeltaFileStats>,
+    predicate: &PredicateAstNode,
+) -> Vec<String> {
+    keys.iter()
+        .filter(|key| match stats.get(key.as_str()) {
+            Some(entry) => !predicate_definitely_false_for_file(predicate, entry),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// What: Attempt metadata-only pruning using Delta log stats and scan hints.
+///
+/// Inputs:
+/// - `provider`: Storage provider used for metadata access.
+/// - `source_prefix`: Source staging prefix.
+/// - `keys`: Candidate parquet object keys.
+/// - `scan_hints`: Runtime scan hint contract.
+///
+/// Output:
+/// - Pruned key list when metadata checks pass; original key list otherwise.
+async fn maybe_prune_scan_keys(
+    provider: &std::sync::Arc<dyn crate::storage::StorageProvider + Send + Sync>,
+    source_prefix: &str,
+    keys: &[String],
+    scan_hints: &RuntimeScanHints,
+) -> Vec<String> {
+    if scan_hints.mode != crate::execution::planner::RuntimeScanMode::MetadataPruned
+        || !scan_hints.pruning_eligible
+    {
+        return keys.to_vec();
+    }
+
+    let Some(scan_hints_json) = scan_hints.pruning_hints_json.as_deref() else {
+        log::warn!(
+            "scan pruning fallback: metadata_pruned mode without scan_pruning_hints_json for prefix={}",
+            source_prefix
+        );
+        return keys.to_vec();
+    };
+
+    let Some(predicate_ast) = parse_predicate_ast_from_hints(scan_hints_json) else {
+        log::warn!(
+            "scan pruning fallback: unable to parse predicate_ast from hints for prefix={}",
+            source_prefix
+        );
+        return keys.to_vec();
+    };
+
+    let Some(delta_log_prefix) = delta_log_prefix_from_source_prefix(source_prefix) else {
+        log::warn!(
+            "scan pruning fallback: invalid source prefix (missing staging suffix) for prefix={}",
+            source_prefix
+        );
+        return keys.to_vec();
+    };
+    let Some(table_prefix) = table_prefix_from_source_prefix(source_prefix) else {
+        log::warn!(
+            "scan pruning fallback: invalid table prefix for source prefix={}",
+            source_prefix
+        );
+        return keys.to_vec();
+    };
+
+    let cache_key = table_prefix.clone();
+    if let Some((cached_version, cached_stats)) = get_cached_delta_pruning_metadata(&cache_key) {
+        if let Some(pin) = scan_hints.delta_version_pin
+            && pin > 0
+            && pin != cached_version
+        {
+            log::warn!(
+                "scan pruning fallback: delta version pin mismatch for prefix={} pin={} latest={} (cache hit)",
+                source_prefix,
+                pin,
+                cached_version
+            );
+            return keys.to_vec();
+        }
+
+        if cached_stats.is_empty() {
+            log::warn!(
+                "scan pruning fallback: no usable delta file stats for prefix={} version={} (cache hit)",
+                source_prefix,
+                cached_version
+            );
+            return keys.to_vec();
+        }
+
+        let pruned = prune_keys_by_delta_stats(keys, &cached_stats, &predicate_ast);
+        log::info!(
+            "scan pruning applied for prefix={} version={} total_files={} retained_files={} pruned_files={} cache=hit",
+            source_prefix,
+            cached_version,
+            keys.len(),
+            pruned.len(),
+            keys.len().saturating_sub(pruned.len())
+        );
+        return pruned;
+    }
+
+    let latest_version = match latest_delta_log_version(provider, &delta_log_prefix).await {
+        Ok(Some(version)) => version,
+        Ok(None) => {
+            log::warn!(
+                "scan pruning fallback: no delta log json version found under {}",
+                delta_log_prefix
+            );
+            return keys.to_vec();
+        }
+        Err(err) => {
+            log::warn!(
+                "scan pruning fallback: failed reading latest delta log version under {}: {}",
+                delta_log_prefix,
+                err
+            );
+            return keys.to_vec();
+        }
+    };
+
+    if let Some(pin) = scan_hints.delta_version_pin
+        && pin > 0
+        && pin != latest_version
+    {
+        log::warn!(
+            "scan pruning fallback: delta version pin mismatch for prefix={} pin={} latest={}",
+            source_prefix,
+            pin,
+            latest_version
+        );
+        return keys.to_vec();
+    }
+
+    let stats = match load_delta_file_stats_for_version(
+        provider,
+        &delta_log_prefix,
+        &table_prefix,
+        latest_version,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!(
+                "scan pruning fallback: failed to load delta file stats for prefix={} version={}: {}",
+                source_prefix,
+                latest_version,
+                err
+            );
+            return keys.to_vec();
+        }
+    };
+
+    if stats.is_empty() {
+        log::warn!(
+            "scan pruning fallback: no usable delta file stats for prefix={} version={}",
+            source_prefix,
+            latest_version
+        );
+        return keys.to_vec();
+    }
+
+    put_cached_delta_pruning_metadata(cache_key, latest_version, stats.clone());
+
+    let pruned = prune_keys_by_delta_stats(keys, &stats, &predicate_ast);
+    log::info!(
+        "scan pruning applied for prefix={} version={} total_files={} retained_files={} pruned_files={} cache=miss",
+        source_prefix,
+        latest_version,
+        keys.len(),
+        pruned.len(),
+        keys.len().saturating_sub(pruned.len())
+    );
+    pruned
+}
 
 /// What: Execute validated query payload on the worker and materialize deterministic artifacts.
 ///
@@ -92,7 +642,8 @@ pub(crate) async fn execute_query_task(
             table: join_spec.right_relation.table.clone(),
         };
         let right_prefix = source_table_staging_prefix(&right_namespace);
-        let mut right_batches = load_scan_batches(shared, &right_prefix).await?;
+        let mut right_batches =
+            load_scan_batches(shared, &right_prefix, &RuntimeScanHints::full_scan()).await?;
         let right_relation_key = relation_key(&right_namespace);
         if let Some(columns) = relation_columns_by_key.get(right_relation_key.as_str()) {
             right_batches = apply_relation_column_names(&right_batches, columns)?;
@@ -313,7 +864,8 @@ pub(crate) async fn load_input_batches(
 ) -> Result<Vec<RecordBatch>, String> {
     if stage_context.upstream_stage_ids.is_empty() {
         let source_prefix = source_table_staging_prefix(namespace);
-        let source_batches = load_scan_batches(shared, &source_prefix).await?;
+        let source_batches =
+            load_scan_batches(shared, &source_prefix, &stage_context.scan_hints).await?;
         return partition_input_batches(
             &source_batches,
             stage_context.partition_count,
@@ -487,11 +1039,38 @@ pub(crate) fn source_table_staging_prefix(namespace: &QueryNamespace) -> String 
 pub(crate) async fn load_scan_batches(
     shared: &SharedData,
     source_prefix: &str,
+    scan_hints: &RuntimeScanHints,
 ) -> Result<Vec<RecordBatch>, String> {
     let provider = shared
         .storage_provider
         .as_ref()
         .ok_or_else(|| "storage provider is not configured for query execution".to_string())?;
+
+    if scan_hints.mode == crate::execution::planner::RuntimeScanMode::MetadataPruned {
+        if scan_hints.pruning_eligible {
+            log::info!(
+                "scan_mode=metadata_pruned requested for prefix={} delta_version_pin={:?} hints_present={} reason={} (fallback to full scan until pruning phase is implemented)",
+                source_prefix,
+                scan_hints.delta_version_pin,
+                scan_hints.pruning_hints_json.is_some(),
+                scan_hints.pruning_reason.as_deref().unwrap_or("eligible")
+            );
+        } else {
+            log::warn!(
+                "scan_mode=metadata_pruned requested but hints are not eligible for prefix={} delta_version_pin={:?} reason={} (falling back to full scan)",
+                source_prefix,
+                scan_hints.delta_version_pin,
+                scan_hints.pruning_reason.as_deref().unwrap_or("unknown")
+            );
+        }
+    } else if scan_hints.pruning_hints_json.is_some() || scan_hints.delta_version_pin.is_some() {
+        log::debug!(
+            "scan hints supplied while mode=full for prefix={} delta_version_pin={:?} hints_present={}",
+            source_prefix,
+            scan_hints.delta_version_pin,
+            scan_hints.pruning_hints_json.is_some()
+        );
+    }
 
     let mut keys = provider
         .list_objects(source_prefix)
@@ -503,6 +1082,14 @@ pub(crate) async fn load_scan_batches(
     if keys.is_empty() {
         return Err(format!(
             "no source parquet files found for query prefix {}",
+            source_prefix
+        ));
+    }
+
+    let keys = maybe_prune_scan_keys(provider, source_prefix, &keys, scan_hints).await;
+    if keys.is_empty() {
+        return Err(format!(
+            "scan pruning eliminated all source parquet files for query prefix {}",
             source_prefix
         ));
     }
@@ -548,4 +1135,151 @@ pub(crate) fn decode_parquet_batches(parquet_bytes: Vec<u8>) -> Result<Vec<Recor
     }
 
     Ok(batches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_prune_scan_keys;
+    use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
+    use crate::storage::StorageProvider;
+    use crate::storage::mock::MockProvider;
+    use std::sync::Arc;
+
+    fn metadata_pruned_hints(predicate_ast: serde_json::Value, pin: u64) -> RuntimeScanHints {
+        RuntimeScanHints {
+            mode: RuntimeScanMode::MetadataPruned,
+            pruning_hints_json: Some(
+                serde_json::json!({
+                    "hint_version": 2,
+                    "eligible": true,
+                    "reason": "eligible_foundation_and_comparisons",
+                    "predicate_ast": predicate_ast,
+                })
+                .to_string(),
+            ),
+            delta_version_pin: Some(pin),
+            pruning_eligible: true,
+            pruning_reason: Some("eligible_foundation_and_comparisons".to_string()),
+        }
+    }
+
+    fn as_storage(provider: Arc<MockProvider>) -> Arc<dyn StorageProvider + Send + Sync> {
+        provider
+    }
+
+    #[tokio::test]
+    async fn pruning_falls_back_on_pin_mismatch() {
+        let provider = MockProvider::new().into_arc();
+        provider
+            .put_object(
+                "databases/sales/schemas/public/tables/users/_delta_log/00000000000000000001.json",
+                b"{}".to_vec(),
+            )
+            .await
+            .expect("delta log should be seeded");
+
+        let keys = vec![
+            "databases/sales/schemas/public/tables/users/staging/a.parquet".to_string(),
+            "databases/sales/schemas/public/tables/users/staging/b.parquet".to_string(),
+        ];
+        let hints = metadata_pruned_hints(
+            serde_json::json!({
+                "kind": "comparison",
+                "column": "id",
+                "op": ">",
+                "value": "5",
+            }),
+            99,
+        );
+
+        let pruned = maybe_prune_scan_keys(
+            &as_storage(provider),
+            "databases/sales/schemas/public/tables/users/staging/",
+            &keys,
+            &hints,
+        )
+        .await;
+
+        assert_eq!(pruned, keys);
+    }
+
+    #[tokio::test]
+    async fn pruning_falls_back_when_stats_missing() {
+        let provider = MockProvider::new().into_arc();
+        provider
+            .put_object(
+                "databases/sales/schemas/public/tables/users/_delta_log/00000000000000000001.json",
+                br#"{"add":{"path":"staging/a.parquet"}}"#.to_vec(),
+            )
+            .await
+            .expect("delta log should be seeded");
+
+        let keys = vec![
+            "databases/sales/schemas/public/tables/users/staging/a.parquet".to_string(),
+            "databases/sales/schemas/public/tables/users/staging/b.parquet".to_string(),
+        ];
+        let hints = metadata_pruned_hints(
+            serde_json::json!({
+                "kind": "comparison",
+                "column": "id",
+                "op": ">",
+                "value": "5",
+            }),
+            1,
+        );
+
+        let pruned = maybe_prune_scan_keys(
+            &as_storage(provider),
+            "databases/sales/schemas/public/tables/users/staging/",
+            &keys,
+            &hints,
+        )
+        .await;
+
+        assert_eq!(pruned, keys);
+    }
+
+    #[tokio::test]
+    async fn pruning_removes_definitely_false_file() {
+        let provider = MockProvider::new().into_arc();
+        provider
+            .put_object(
+                "databases/sales/schemas/public/tables/users/_delta_log/00000000000000000001.json",
+                br#"
+{"add":{"path":"staging/a.parquet","stats":"{\"minValues\":{\"id\":1},\"maxValues\":{\"id\":3}}"}}
+{"add":{"path":"staging/b.parquet","stats":"{\"minValues\":{\"id\":9},\"maxValues\":{\"id\":10}}"}}
+"#
+                .to_vec(),
+            )
+            .await
+            .expect("delta log should be seeded");
+
+        let keys = vec![
+            "databases/sales/schemas/public/tables/users/staging/a.parquet".to_string(),
+            "databases/sales/schemas/public/tables/users/staging/b.parquet".to_string(),
+        ];
+        let hints = metadata_pruned_hints(
+            serde_json::json!({
+                "kind": "comparison",
+                "column": "id",
+                "op": ">",
+                "value": "5",
+            }),
+            1,
+        );
+
+        let pruned = maybe_prune_scan_keys(
+            &as_storage(provider),
+            "databases/sales/schemas/public/tables/users/staging/",
+            &keys,
+            &hints,
+        )
+        .await;
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(
+            pruned[0],
+            "databases/sales/schemas/public/tables/users/staging/b.parquet"
+        );
+    }
 }

@@ -8,6 +8,12 @@ Deltatable indexing
 Jump files during scan
 Fast Access Paths
 
+Current roadmap: [roadmaps/SILK_ROAD/INDEXING/ROADMAP_INDEXING.md](roadmaps/SILK_ROAD/INDEXING/ROADMAP_INDEXING.md)
+
+Foundation discovery: [roadmaps/SILK_ROAD/INDEXING/discovery/discovery-INDEXING-FOUNDATION.md](roadmaps/SILK_ROAD/INDEXING/discovery/discovery-INDEXING-FOUNDATION.md)
+
+Foundation matrix: [roadmaps/ROADMAP_PHASE_INDEXING_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_PHASE_INDEXING_FOUNDATION_MATRIX.md)
+
 ## Road to Constraints
 
 

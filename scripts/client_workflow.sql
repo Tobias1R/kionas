@@ -57,3 +57,25 @@ select c1, count(*) from abc.schema1.table1 group by c1 order by c1;
 
 -- group by min, max, avg
 select c1, min(c2), max(c2), avg(c2) from abc.schema1.table1 group by c1 order by c1;
+
+-- fake data
+select id, name, email from bench.seed1.customers order by id limit 5;
+select * from bench.seed1.products order by id limit 15;
+select * from bench.seed1.orders order by id limit 5;
+
+-- group by
+select customer_id, count(*) as order_count from bench.seed1.orders group by customer_id order by order_count desc limit 5;
+select c3, sum(c4) as total_quantity from bench.seed1.orders group by c2 order by c4 desc limit 5;
+
+-- max
+select customer_id, max(quantity) as max_quantity from bench.seed1.orders group by customer_id order by max_quantity desc limit 5;
+select product_id, max(quantity) as max_quantity from bench.seed1.orders group by product_id order by max_quantity desc limit 5;
+
+
+-- join group by
+select c.name, count(*) as order_count from bench.seed1.orders o join bench.seed1.customers c on o.customer_id = c.id group by c.name order by order_count desc limit 5;    
+select p.name, sum(o.quantity) as total_quantity from bench.seed1.orders o join bench.seed1.products p on o.product_id = p.id group by p.name order by total_quantity desc limit 5;
+
+-- join group by max
+select c.name, max(o.quantity) as max_quantity from bench.seed1.orders o join bench.seed1.customers c on o.customer_id = c.id group by c.name order by max_quantity desc limit 5;
+select p.name, max(o.quantity) as max_quantity from bench.seed1.orders o join bench.seed1.products p on o.product_id = p.id where p.id = 15  group by p.name order by max_quantity desc limit 5;
