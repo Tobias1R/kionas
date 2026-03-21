@@ -1,6 +1,10 @@
 use crate::planner::error::PlannerError;
 use crate::planner::logical_plan::LogicalPlan;
 use crate::sql::constraints::TableConstraintContract;
+use crate::sql::datatypes::{
+    ColumnDatatypeSpec, DATATYPE_CONTRACT_VERSION, TableDatatypeContract, TemporalLogicalType,
+    TimezonePolicy,
+};
 
 /// What: Validate Phase 1 logical plan invariants.
 ///
@@ -106,6 +110,226 @@ pub fn validate_constraint_contract(
     }
 
     Ok(())
+}
+
+/// What: Validate normalized table-datatype contract invariants.
+///
+/// Inputs:
+/// - `contract`: Datatype contract created from CREATE TABLE semantics.
+///
+/// Output:
+/// - `Ok(())` when datatype contract is coherent.
+/// - `Err(PlannerError)` when invalid version/shape combinations are found.
+///
+/// Details:
+/// - Validation freezes FOUNDATION decisions: DATETIME remains distinct from
+///   TIMESTAMP and temporal columns must carry timezone-aware policy metadata.
+pub fn validate_datatype_contract(contract: &TableDatatypeContract) -> Result<(), PlannerError> {
+    if contract.version != DATATYPE_CONTRACT_VERSION {
+        return Err(PlannerError::InvalidLogicalPlan(format!(
+            "datatype contract version '{}' is unsupported",
+            contract.version
+        )));
+    }
+
+    if contract.columns.is_empty() {
+        return Err(PlannerError::InvalidLogicalPlan(
+            "datatype contract must include at least one column".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for column in &contract.columns {
+        let name = column.column.trim();
+        if name.is_empty() {
+            return Err(PlannerError::InvalidLogicalPlan(
+                "datatype contract column name cannot be empty".to_string(),
+            ));
+        }
+
+        let canonical = name.to_ascii_lowercase();
+        if !seen.insert(canonical.clone()) {
+            return Err(PlannerError::InvalidLogicalPlan(format!(
+                "datatype contract has duplicate column entry: {}",
+                canonical
+            )));
+        }
+
+        if let Some(temporal_type) = &column.temporal_type {
+            if !matches!(
+                column.timezone_policy,
+                Some(TimezonePolicy::TimezoneAwareUtcNormalized)
+            ) {
+                return Err(PlannerError::InvalidLogicalPlan(format!(
+                    "temporal column '{}' must declare timezone-aware policy",
+                    name
+                )));
+            }
+
+            let expected = match temporal_type {
+                TemporalLogicalType::Timestamp => "timestamp",
+                TemporalLogicalType::Datetime => "datetime",
+            };
+            if column.canonical_type != expected {
+                return Err(PlannerError::InvalidLogicalPlan(format!(
+                    "temporal column '{}' has mismatched canonical type '{}', expected '{}'",
+                    name, column.canonical_type, expected
+                )));
+            }
+        } else if column.timezone_policy.is_some() {
+            return Err(PlannerError::InvalidLogicalPlan(format!(
+                "non-temporal column '{}' must not declare timezone policy",
+                name
+            )));
+        }
+
+        validate_supported_declared_type(column)?;
+        validate_decimal_shape(column)?;
+    }
+
+    Ok(())
+}
+
+/// What: Validate declared type belongs to the supported FOUNDATION contract set.
+///
+/// Inputs:
+/// - `column`: One datatype-contract column descriptor.
+///
+/// Output:
+/// - `Ok(())` when declared type is explicitly supported.
+/// - `Err(PlannerError)` when type would otherwise silently fallback.
+fn validate_supported_declared_type(column: &ColumnDatatypeSpec) -> Result<(), PlannerError> {
+    let declared_lower = column.declared_type.to_ascii_lowercase();
+    let supported = declared_lower.contains("timestamp")
+        || declared_lower.contains("datetime")
+        || declared_lower == "date"
+        || declared_lower.contains("decimal")
+        || declared_lower.contains("numeric")
+        || declared_lower.contains("bigint")
+        || declared_lower == "int8"
+        || declared_lower.contains("smallint")
+        || declared_lower == "int2"
+        || declared_lower == "int"
+        || declared_lower == "integer"
+        || declared_lower == "int4"
+        || declared_lower == "long"
+        || declared_lower.contains("double")
+        || declared_lower.contains("float")
+        || declared_lower.contains("real")
+        || declared_lower.contains("bool")
+        || declared_lower.contains("binary")
+        || declared_lower.contains("char")
+        || declared_lower.contains("text")
+        || declared_lower.contains("string")
+        || declared_lower.contains("uuid")
+        || declared_lower.contains("json");
+
+    if supported {
+        return Ok(());
+    }
+
+    Err(PlannerError::InvalidLogicalPlan(format!(
+        "column '{}' has unsupported declared type '{}' in FOUNDATION; explicit mapping is required to avoid silent fallback",
+        column.column, column.declared_type
+    )))
+}
+
+/// What: Validate decimal contract shape consistency for one column.
+///
+/// Inputs:
+/// - `column`: One datatype-contract column descriptor.
+///
+/// Output:
+/// - `Ok(())` when decimal shape metadata is coherent.
+/// - `Err(PlannerError)` when decimal metadata is missing or invalid.
+fn validate_decimal_shape(column: &ColumnDatatypeSpec) -> Result<(), PlannerError> {
+    let is_decimal = column.canonical_type == "decimal";
+    match (is_decimal, column.decimal_spec.as_ref()) {
+        (true, None) => Err(PlannerError::InvalidLogicalPlan(format!(
+            "decimal column '{}' must declare precision and scale",
+            column.column
+        ))),
+        (true, Some(spec)) => {
+            if spec.scale > spec.precision {
+                return Err(PlannerError::InvalidLogicalPlan(format!(
+                    "decimal column '{}' has invalid precision/scale ({}, {})",
+                    column.column, spec.precision, spec.scale
+                )));
+            }
+            Ok(())
+        }
+        (false, Some(_)) => Err(PlannerError::InvalidLogicalPlan(format!(
+            "non-decimal column '{}' must not declare decimal precision/scale",
+            column.column
+        ))),
+        (false, None) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod datatype_contract_tests {
+    use super::validate_datatype_contract;
+    use crate::sql::datatypes::{
+        ColumnDatatypeSpec, DATATYPE_CONTRACT_VERSION, DecimalCoercionPolicy,
+        TableDatatypeContract, TimezonePolicy,
+    };
+
+    fn base_contract(columns: Vec<ColumnDatatypeSpec>) -> TableDatatypeContract {
+        TableDatatypeContract {
+            version: DATATYPE_CONTRACT_VERSION,
+            timezone_policy: TimezonePolicy::TimezoneAwareUtcNormalized,
+            decimal_coercion_policy: DecimalCoercionPolicy::Strict,
+            columns,
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_declared_type() {
+        let contract = base_contract(vec![ColumnDatatypeSpec {
+            column: "a".to_string(),
+            declared_type: "geography".to_string(),
+            canonical_type: "string".to_string(),
+            temporal_type: None,
+            timezone_policy: None,
+            decimal_spec: None,
+        }]);
+
+        let err = validate_datatype_contract(&contract)
+            .expect_err("unsupported declared type should be rejected");
+        assert!(format!("{}", err).contains("unsupported declared type"));
+    }
+
+    #[test]
+    fn rejects_missing_decimal_shape() {
+        let contract = base_contract(vec![ColumnDatatypeSpec {
+            column: "price".to_string(),
+            declared_type: "decimal".to_string(),
+            canonical_type: "decimal".to_string(),
+            temporal_type: None,
+            timezone_policy: None,
+            decimal_spec: None,
+        }]);
+
+        let err = validate_datatype_contract(&contract)
+            .expect_err("decimal without shape should be rejected");
+        assert!(format!("{}", err).contains("must declare precision and scale"));
+    }
+
+    #[test]
+    fn rejects_non_temporal_timezone_policy() {
+        let contract = base_contract(vec![ColumnDatatypeSpec {
+            column: "name".to_string(),
+            declared_type: "varchar".to_string(),
+            canonical_type: "string".to_string(),
+            temporal_type: None,
+            timezone_policy: Some(TimezonePolicy::TimezoneAwareUtcNormalized),
+            decimal_spec: None,
+        }]);
+
+        let err = validate_datatype_contract(&contract)
+            .expect_err("non-temporal timezone policy should be rejected");
+        assert!(format!("{}", err).contains("must not declare timezone policy"));
+    }
 }
 
 #[cfg(test)]

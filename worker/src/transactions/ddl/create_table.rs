@@ -180,33 +180,66 @@ fn build_arrow_schema(columns: &[ParsedColumn]) -> Result<Schema, String> {
     let fields = columns
         .iter()
         .map(|col| {
-            let dt = col.data_type.to_ascii_lowercase();
-            let arrow_type = if dt.contains("bigint") || dt == "int8" || dt == "long" {
-                DataType::Int64
-            } else if dt.contains("smallint") || dt == "int2" {
-                DataType::Int16
-            } else if dt.contains("int") || dt == "integer" || dt == "int4" {
-                DataType::Int32
-            } else if dt.contains("boolean") || dt == "bool" {
-                DataType::Boolean
-            } else if dt.contains("float") || dt.contains("real") {
-                DataType::Float32
-            } else if dt.contains("double") {
-                DataType::Float64
-            } else if dt.contains("timestamp") {
-                DataType::Timestamp(TimeUnit::Microsecond, None)
-            } else if dt == "date" {
-                DataType::Date32
-            } else if dt.contains("binary") {
-                DataType::Binary
-            } else {
-                DataType::Utf8
-            };
-            Field::new(col.name.clone(), arrow_type, col.nullable)
+            let arrow_type = resolve_arrow_type_for_declared_type(&col.data_type)?;
+            Ok(Field::new(col.name.clone(), arrow_type, col.nullable))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
 
     Ok(Schema::new(fields))
+}
+
+/// What: Resolve an Arrow type from one declared SQL datatype token.
+///
+/// Inputs:
+/// - `declared_type`: Declared SQL datatype text.
+///
+/// Output:
+/// - Arrow datatype for known FOUNDATION mappings.
+/// - Error when no explicit mapping exists (to avoid silent fallback).
+fn resolve_arrow_type_for_declared_type(declared_type: &str) -> Result<DataType, String> {
+    let dt = declared_type.to_ascii_lowercase();
+
+    if dt.contains("bigint") || dt == "int8" || dt == "long" {
+        return Ok(DataType::Int64);
+    }
+    if dt.contains("smallint") || dt == "int2" {
+        return Ok(DataType::Int16);
+    }
+    if dt.contains("int") || dt == "integer" || dt == "int4" {
+        return Ok(DataType::Int32);
+    }
+    if dt.contains("boolean") || dt == "bool" {
+        return Ok(DataType::Boolean);
+    }
+    if dt.contains("float") || dt.contains("real") {
+        return Ok(DataType::Float32);
+    }
+    if dt.contains("double") {
+        return Ok(DataType::Float64);
+    }
+    if dt.contains("timestamp") {
+        return Ok(DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+    if dt.contains("datetime") {
+        return Ok(DataType::Utf8);
+    }
+    if dt == "date" {
+        return Ok(DataType::Date32);
+    }
+    if dt.contains("decimal") || dt.contains("numeric") {
+        return Ok(DataType::Utf8);
+    }
+    if dt.contains("binary") {
+        return Ok(DataType::Binary);
+    }
+    if dt.contains("char") || dt.contains("text") || dt.contains("string") {
+        return Ok(DataType::Utf8);
+    }
+
+    Err(format!(
+        "create_table has unsupported declared data_type '{}' and cannot fallback implicitly",
+        declared_type
+    ))
 }
 
 /// What: Execute create_table storage initialization on worker.

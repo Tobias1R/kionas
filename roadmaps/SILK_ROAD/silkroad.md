@@ -22,5 +22,15 @@ Foundation discovery: [roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTR
 
 Foundation matrix: [roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md)
 
+## Road to Rich Datatypes
+
+Current roadmap: [roadmaps/SILK_ROAD/DATATYPES/ROADMAP_DATATYPES.md](roadmaps/SILK_ROAD/DATATYPES/ROADMAP_DATATYPES.md)
+
+Foundation discovery: [roadmaps/SILK_ROAD/DATATYPES/discovery/discovery-DATATYPES-FOUNDATION.md](roadmaps/SILK_ROAD/DATATYPES/discovery/discovery-DATATYPES-FOUNDATION.md)
+
+Foundation plan: [roadmaps/SILK_ROAD/DATATYPES/plans/plan-DATATYPES-FOUNDATION.md](roadmaps/SILK_ROAD/DATATYPES/plans/plan-DATATYPES-FOUNDATION.md)
+
+Foundation matrix: [roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md)
+
 
 

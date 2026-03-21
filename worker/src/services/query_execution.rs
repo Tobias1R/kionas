@@ -2,13 +2,16 @@ use crate::execution::query::QueryNamespace;
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::cast::cast;
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use kionas::planner::{PhysicalExpr, PhysicalLimitSpec, PhysicalSortExpr};
 use std::sync::Arc;
 
@@ -205,6 +208,49 @@ fn evaluate_clause_at_row(
         (FilterValue::Str(rhs), DataType::Utf8) => {
             let lhs = downcast_required::<StringArray>(array, "Utf8")?.value(row_idx);
             Ok(compare_str(lhs, rhs.as_str(), clause.op))
+        }
+        (FilterValue::Str(rhs), DataType::Date32) => {
+            let parsed = parse_date32_filter_literal(rhs).ok_or_else(|| {
+                format!(
+                    "unsupported Date32 filter literal '{}' for column '{}': expected quoted date/datetime",
+                    rhs, clause.column
+                )
+            })?;
+            let lhs = i64::from(downcast_required::<Date32Array>(array, "Date32")?.value(row_idx));
+            Ok(compare_i64(lhs, i64::from(parsed), clause.op))
+        }
+        (FilterValue::Str(rhs), DataType::Date64) => {
+            let parsed = parse_date64_filter_literal(rhs).ok_or_else(|| {
+                format!(
+                    "unsupported Date64 filter literal '{}' for column '{}': expected quoted date/datetime",
+                    rhs, clause.column
+                )
+            })?;
+            let lhs = downcast_required::<Date64Array>(array, "Date64")?.value(row_idx);
+            Ok(compare_i64(lhs, parsed, clause.op))
+        }
+        (FilterValue::Str(rhs), DataType::Timestamp(unit, timezone)) => {
+            if timezone.is_some() {
+                return Err(format!(
+                    "unsupported timestamp filter for column '{}': timezone-bearing timestamps are not supported in this phase",
+                    clause.column
+                ));
+            }
+
+            let parsed = parse_timestamp_filter_literal_for_unit(rhs, unit).ok_or_else(|| {
+                format!(
+                    "unsupported timestamp filter literal '{}' for column '{}': expected quoted ISO-8601 or 'YYYY-MM-DD HH:MM:SS[.fff]'",
+                    rhs, clause.column
+                )
+            })?;
+            let lhs = read_timestamp_value(array, row_idx, unit)?;
+            Ok(compare_i64(lhs, parsed, clause.op))
+        }
+        (FilterValue::Int(_), DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)) => {
+            Err(format!(
+                "unsupported temporal filter literal for column '{}': use quoted date/time literal",
+                clause.column
+            ))
         }
         (_, data_type) => Err(format!(
             "filter type mismatch for column '{}': unsupported type {:?}",
@@ -731,6 +777,80 @@ fn downcast_required<'a, T: 'static>(array: &'a ArrayRef, expected: &str) -> Res
         .ok_or_else(|| format!("failed to downcast array to {}", expected))
 }
 
+fn read_timestamp_value(array: &ArrayRef, row_idx: usize, unit: &TimeUnit) -> Result<i64, String> {
+    match unit {
+        TimeUnit::Second => {
+            Ok(downcast_required::<TimestampSecondArray>(array, "TimestampSecond")?.value(row_idx))
+        }
+        TimeUnit::Millisecond => Ok(downcast_required::<TimestampMillisecondArray>(
+            array,
+            "TimestampMillisecond",
+        )?
+        .value(row_idx)),
+        TimeUnit::Microsecond => Ok(downcast_required::<TimestampMicrosecondArray>(
+            array,
+            "TimestampMicrosecond",
+        )?
+        .value(row_idx)),
+        TimeUnit::Nanosecond => Ok(downcast_required::<TimestampNanosecondArray>(
+            array,
+            "TimestampNanosecond",
+        )?
+        .value(row_idx)),
+    }
+}
+
+fn parse_timestamp_filter_literal_for_unit(raw: &str, unit: &TimeUnit) -> Option<i64> {
+    let nanos = parse_timestamp_literal_to_utc_nanos(raw)?;
+    let unit_value = match unit {
+        TimeUnit::Second => nanos / 1_000_000_000,
+        TimeUnit::Millisecond => nanos / 1_000_000,
+        TimeUnit::Microsecond => nanos / 1_000,
+        TimeUnit::Nanosecond => nanos,
+    };
+    i64::try_from(unit_value).ok()
+}
+
+fn parse_timestamp_literal_to_utc_nanos(raw: &str) -> Option<i128> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return parsed.timestamp_nanos_opt().map(i128::from);
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
+        return parsed.and_utc().timestamp_nanos_opt().map(i128::from);
+    }
+    if let Ok(parsed) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return parsed
+            .and_hms_opt(0, 0, 0)
+            .and_then(|value| value.and_utc().timestamp_nanos_opt())
+            .map(i128::from);
+    }
+    None
+}
+
+fn parse_date32_filter_literal(raw: &str) -> Option<i32> {
+    let parsed_date = if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        date
+    } else if let Ok(datetime) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f") {
+        datetime.date()
+    } else if let Ok(datetime) = DateTime::parse_from_rfc3339(raw) {
+        datetime.date_naive()
+    } else {
+        return None;
+    };
+
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    Some(parsed_date.signed_duration_since(epoch).num_days() as i32)
+}
+
+fn parse_date64_filter_literal(raw: &str) -> Option<i64> {
+    let millis = if let Some(nanos) = parse_timestamp_literal_to_utc_nanos(raw) {
+        nanos / 1_000_000
+    } else {
+        return None;
+    };
+    i64::try_from(millis).ok()
+}
+
 fn compare_i64(lhs: i64, rhs: i64, op: FilterOp) -> bool {
     match op {
         FilterOp::Eq => lhs == rhs,
@@ -776,7 +896,7 @@ mod tests {
         source_table_staging_prefix, validate_upstream_exchange_partition_set,
     };
     use crate::execution::planner::extract_runtime_plan;
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::arrow_writer::ArrowWriter;
@@ -800,6 +920,23 @@ mod tests {
         .expect("test batch must build")
     }
 
+    fn batch_temporal_two_rows() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "occurred_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        )]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMillisecondArray::from(vec![
+                1_704_067_200_000_i64,
+                1_704_153_600_000_i64,
+            ])) as ArrayRef],
+        )
+        .expect("temporal test batch must build")
+    }
+
     #[test]
     fn decodes_written_parquet() {
         let batch = batch_two_rows();
@@ -820,6 +957,25 @@ mod tests {
         let filtered =
             apply_filter_pipeline(&[batch_two_rows()], "id > 1").expect("filter must run");
         assert_eq!(filtered[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn applies_timestamp_filter_with_quoted_literal() {
+        let filtered = apply_filter_pipeline(
+            &[batch_temporal_two_rows()],
+            "occurred_at >= '2024-01-02T00:00:00Z'",
+        )
+        .expect("timestamp filter must run");
+
+        assert_eq!(filtered[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn rejects_unquoted_temporal_filter_literal() {
+        let err =
+            apply_filter_pipeline(&[batch_temporal_two_rows()], "occurred_at >= 1704067200000")
+                .expect_err("unquoted temporal literal must fail");
+        assert!(err.contains("unsupported temporal filter literal"));
     }
 
     #[test]

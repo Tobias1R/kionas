@@ -32,4 +32,6 @@ pub use physical_translate::{
 };
 pub use physical_validate::validate_physical_plan;
 pub use translate::build_logical_plan_from_select_model;
-pub use validate::{validate_constraint_contract, validate_logical_plan};
+pub use validate::{
+    validate_constraint_contract, validate_datatype_contract, validate_logical_plan,
+};

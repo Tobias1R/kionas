@@ -33,3 +33,6 @@ grpc.reflection.v1alpha
 
 _dev
 _dev/*
+
+target-worker-refactor-check
+target-worker-refactor-check/*

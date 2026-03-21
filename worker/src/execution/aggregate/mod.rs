@@ -12,8 +12,12 @@ use crate::execution::aggregate::aggregate_max::{merge_final_max, update_partial
 use crate::execution::aggregate::aggregate_min::{merge_final_min, update_partial_min};
 use crate::execution::aggregate::aggregate_sum::{merge_final_sum, update_partial_sum};
 use crate::services::query_execution::resolve_schema_column_index;
-use arrow::array::{ArrayRef, Float64Array, Int16Array, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    ArrayRef, Date32Array, Date64Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use kionas::planner::{AggregateFunction, PhysicalAggregateSpec, PhysicalExpr};
 use std::collections::HashMap;
@@ -508,11 +512,77 @@ fn stringify_array_value(array: &ArrayRef, row_idx: usize) -> Result<String, Str
             .ok_or_else(|| "failed to downcast Int16 grouping array".to_string())?
             .value(row_idx)
             .to_string()),
+        DataType::Date32 => Ok(format!(
+            "d:{}",
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast Date32 grouping array".to_string())?
+                .value(row_idx)
+        )),
+        DataType::Date64 => Ok(format!(
+            "d:{}",
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| "failed to downcast Date64 grouping array".to_string())?
+                .value(row_idx)
+                .div_euclid(86_400_000)
+        )),
+        DataType::Timestamp(unit, timezone) => {
+            if timezone.is_some() {
+                return Err(
+                    "unsupported grouping data type Timestamp with timezone in this phase"
+                        .to_string(),
+                );
+            }
+
+            let nanos = timestamp_value_as_nanos(array, row_idx, unit)?;
+            Ok(format!("tsn:{}", nanos))
+        }
         _ => Err(format!(
-            "unsupported grouping data type {:?}: only Utf8/Int16/Int32/Int64 are supported",
+            "unsupported grouping data type {:?}: only Utf8/Int16/Int32/Int64/Date32/Date64/Timestamp are supported",
             array.data_type()
         )),
     }
+}
+
+fn timestamp_value_as_nanos(
+    array: &ArrayRef,
+    row_idx: usize,
+    unit: &TimeUnit,
+) -> Result<i128, String> {
+    let raw = match unit {
+        TimeUnit::Second => array
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .ok_or_else(|| "failed to downcast TimestampSecond grouping array".to_string())?
+            .value(row_idx),
+        TimeUnit::Millisecond => array
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| "failed to downcast TimestampMillisecond grouping array".to_string())?
+            .value(row_idx),
+        TimeUnit::Microsecond => array
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| "failed to downcast TimestampMicrosecond grouping array".to_string())?
+            .value(row_idx),
+        TimeUnit::Nanosecond => array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| "failed to downcast TimestampNanosecond grouping array".to_string())?
+            .value(row_idx),
+    };
+
+    let nanos = match unit {
+        TimeUnit::Second => i128::from(raw) * 1_000_000_000,
+        TimeUnit::Millisecond => i128::from(raw) * 1_000_000,
+        TimeUnit::Microsecond => i128::from(raw) * 1_000,
+        TimeUnit::Nanosecond => i128::from(raw),
+    };
+
+    Ok(nanos)
 }
 
 fn numeric_array_value(array: &ArrayRef, row_idx: usize) -> Result<Option<f64>, String> {

@@ -1,6 +1,6 @@
 use crate::state::SharedData;
 use arrow::datatypes::Schema;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
 
@@ -522,12 +523,47 @@ fn parse_metadata_data_type(raw: &str) -> Result<DataType, Status> {
         "Int64" => Ok(DataType::Int64),
         "Boolean" => Ok(DataType::Boolean),
         "Utf8" => Ok(DataType::Utf8),
+        "Date32" => Ok(DataType::Date32),
+        "Date64" => Ok(DataType::Date64),
         "Null" => Ok(DataType::Null),
-        other => Err(Status::failed_precondition(format!(
-            "unsupported metadata column data_type '{}'",
-            other
-        ))),
+        other => parse_timestamp_metadata_data_type(other).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "unsupported metadata column data_type '{}'",
+                other
+            ))
+        }),
     }
+}
+
+fn parse_timestamp_metadata_data_type(raw: &str) -> Option<DataType> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix("Timestamp(")?
+        .strip_suffix(')')?
+        .trim();
+    let (unit_raw, timezone_raw) = inner.split_once(',')?;
+
+    let unit = match unit_raw.trim() {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        _ => return None,
+    };
+
+    let timezone = parse_timestamp_timezone(timezone_raw.trim());
+    Some(DataType::Timestamp(unit, timezone))
+}
+
+fn parse_timestamp_timezone(raw: &str) -> Option<Arc<str>> {
+    if raw == "None" {
+        return None;
+    }
+
+    let value = raw
+        .strip_prefix("Some(\"")
+        .and_then(|v| v.strip_suffix("\")"))?;
+    Some(value.to_string().into())
 }
 
 /// What: Build Arrow schema from result metadata columns.
@@ -1141,5 +1177,23 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(format!("{:?}", schema.field(1).data_type()), "Utf8");
+    }
+
+    #[test]
+    fn builds_schema_from_temporal_metadata_columns() {
+        let metadata = serde_json::json!({
+            "columns": [
+                {"name": "event_day", "data_type": "Date32", "nullable": true},
+                {"name": "event_at", "data_type": "Timestamp(Millisecond, None)", "nullable": false}
+            ]
+        });
+
+        let schema = schema_from_metadata(&metadata).expect("temporal schema should build");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(format!("{:?}", schema.field(0).data_type()), "Date32");
+        assert_eq!(
+            format!("{:?}", schema.field(1).data_type()),
+            "Timestamp(Millisecond, None)"
+        );
     }
 }

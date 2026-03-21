@@ -6,9 +6,11 @@ use kionas::parser::datafusion_sql::sqlparser::ast::{
     ColumnOption, CreateTable as SqlCreateTable, ObjectName,
 };
 use kionas::planner::validate_constraint_contract;
+use kionas::planner::validate_datatype_contract;
 use kionas::sql::constraints::{
     TableConstraintContract, build_constraint_contract_from_create_table,
 };
+use kionas::sql::datatypes::{TableDatatypeContract, build_datatype_contract_from_create_table};
 
 const OUTCOME_PREFIX: &str = "RESULT";
 
@@ -168,6 +170,7 @@ fn build_worker_payload(
     schema_name: &str,
     table_name: &str,
     constraint_contract: &TableConstraintContract,
+    datatype_contract: &TableDatatypeContract,
 ) -> String {
     let create = ast.create_table;
     let mut payload = serde_json::Map::new();
@@ -270,6 +273,11 @@ fn build_worker_payload(
         &mut payload,
         "constraints",
         serde_json::to_value(constraint_contract).unwrap_or(serde_json::Value::Null),
+    );
+    insert_val(
+        &mut payload,
+        "datatypes",
+        serde_json::to_value(datatype_contract).unwrap_or(serde_json::Value::Null),
     );
     insert_val(
         &mut payload,
@@ -610,6 +618,15 @@ pub(crate) async fn handle_create_table(
         );
     }
 
+    let datatype_contract = build_datatype_contract_from_create_table(ast.create_table);
+    if let Err(e) = validate_datatype_contract(&datatype_contract) {
+        return format_outcome(
+            "VALIDATION",
+            "INVALID_DATATYPE_CONTRACT",
+            format!("invalid datatype metadata for CREATE TABLE: {}", e),
+        );
+    }
+
     let (database_name, schema_name, table_name) =
         match extract_table_namespace(&ast.create_table.name) {
             Ok(parts) => parts,
@@ -804,6 +821,7 @@ pub(crate) async fn handle_create_table(
         &schema_name,
         &table_name,
         &constraint_contract,
+        &datatype_contract,
     );
     let worker_result_location = match helpers::run_task_for_input(
         shared_data,

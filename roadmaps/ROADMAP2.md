@@ -115,6 +115,15 @@ Lets discuss a new place for this code. They shouldnt be here in services
 	- worker/src/services/create_table.rs
 [X] DONE
 
+[INTERMISSION Code Cleanup - Server]
+[INTERMISSION Code Cleanup - Server - Tests]
+- move all tests to server/src/tests/
+[INTERMISSION Code Cleanup - Worker - Tests]
+- move all tests to worker/src/tests/
+[INTERMISSION Code Cleanup - Kionas]
+[INTERMISSION Code Cleanup - Kionas - Tests]
+- move all tests to kionas/src/tests/
+
 7. Phase 7: Window foundation
 7.1 Introduce minimal supported window semantics with explicit constraints.
 7.2 Add planner/runtime contracts for partition and frame metadata.

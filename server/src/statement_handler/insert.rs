@@ -19,6 +19,18 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
 
 fn map_insert_dispatch_error(err: &str) -> (&'static str, &'static str) {
     let lower = err.to_ascii_lowercase();
+    if lower.contains("temporal_literal_invalid") {
+        return ("VALIDATION", "TEMPORAL_LITERAL_INVALID");
+    }
+    if lower.contains("datetime_timezone_not_allowed") {
+        return ("VALIDATION", "DATETIME_TIMEZONE_NOT_ALLOWED");
+    }
+    if lower.contains("decimal_coercion_failed") {
+        return ("VALIDATION", "DECIMAL_COERCION_FAILED");
+    }
+    if lower.contains("insert_type_hints_malformed") {
+        return ("VALIDATION", "INSERT_TYPE_HINTS_MALFORMED");
+    }
     if lower.contains("not null constraint violated") {
         return ("VALIDATION", "CONSTRAINT_NOT_NULL_VIOLATION");
     }
@@ -33,6 +45,10 @@ fn map_insert_dispatch_error(err: &str) -> (&'static str, &'static str) {
 
 fn normalize_insert_error_message(code: &str, err: &str) -> String {
     match code {
+        "TEMPORAL_LITERAL_INVALID" => err.to_string(),
+        "DATETIME_TIMEZONE_NOT_ALLOWED" => err.to_string(),
+        "DECIMAL_COERCION_FAILED" => err.to_string(),
+        "INSERT_TYPE_HINTS_MALFORMED" => err.to_string(),
         "CONSTRAINT_NOT_NULL_VIOLATION" => err.to_string(),
         "CONSTRAINT_NOT_NULL_COLUMNS_MISSING" => err.to_string(),
         "TABLE_NOT_FOUND" => {
@@ -114,7 +130,7 @@ fn parse_table_namespace(table_name: &str) -> Option<(String, String, String)> {
 /// - `table`: Canonical table name.
 ///
 /// Output:
-/// - `(table_columns, not_null_columns)` with canonical column names.
+/// - `(table_columns, not_null_columns, column_type_hints)` with canonical column names.
 ///
 /// Details:
 /// - The lookup is strict for known three-part namespaces and returns actionable errors.
@@ -123,7 +139,7 @@ async fn load_table_constraint_columns(
     database: &str,
     schema: &str,
     table: &str,
-) -> Result<(Vec<String>, Vec<String>), String> {
+) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), String> {
     let mut client = MetastoreClient::connect_with_shared(shared_data)
         .await
         .map_err(|e| {
@@ -200,7 +216,16 @@ async fn load_table_constraint_columns(
         .collect::<Vec<_>>();
     required_columns.sort();
     required_columns.dedup();
-    Ok((table_columns, required_columns))
+
+    let mut column_type_hints = HashMap::new();
+    for column in &metadata.columns {
+        let key = normalize_identifier(&column.name);
+        if !key.is_empty() {
+            column_type_hints.insert(key, column.data_type.clone());
+        }
+    }
+
+    Ok((table_columns, required_columns, column_type_hints))
 }
 
 /// What: Handle INSERT by attaching constraint metadata for worker-side enforcement.
@@ -243,8 +268,9 @@ pub(crate) async fn handle_insert_statement(
 
     if let Some((database, schema, table)) = parse_table_namespace(&table_name) {
         match load_table_constraint_columns(shared_data, &database, &schema, &table).await {
-            Ok((table_columns, required_columns)) => {
+            Ok((table_columns, required_columns, column_type_hints)) => {
                 params.insert("constraint_contract_version".to_string(), "1".to_string());
+                params.insert("datatype_contract_version".to_string(), "1".to_string());
                 params.insert(
                     "table_columns_json".to_string(),
                     serde_json::to_string(&table_columns).unwrap_or_else(|_| "[]".to_string()),
@@ -252,6 +278,10 @@ pub(crate) async fn handle_insert_statement(
                 params.insert(
                     "not_null_columns_json".to_string(),
                     serde_json::to_string(&required_columns).unwrap_or_else(|_| "[]".to_string()),
+                );
+                params.insert(
+                    "column_type_hints_json".to_string(),
+                    serde_json::to_string(&column_type_hints).unwrap_or_else(|_| "{}".to_string()),
                 );
             }
             Err(e) => {

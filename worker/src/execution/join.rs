@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Int16Array, Int32Array, Int64Array,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt32Array,
 };
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use kionas::planner::PhysicalJoinSpec;
 
@@ -269,8 +271,71 @@ fn scalar_to_string(array: &dyn Array, row: usize) -> Result<String, String> {
                 .ok_or_else(|| "failed to cast Boolean join key array".to_string())?;
             Ok(arr.value(row).to_string())
         }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to cast Date32 join key array".to_string())?;
+            Ok(format!("d:{}", arr.value(row)))
+        }
+        DataType::Date64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .ok_or_else(|| "failed to cast Date64 join key array".to_string())?;
+            let days = arr.value(row).div_euclid(86_400_000);
+            Ok(format!("d:{}", days))
+        }
+        DataType::Timestamp(unit, timezone) => {
+            if timezone.is_some() {
+                return Err(
+                    "unsupported join key type Timestamp with timezone in this phase".to_string(),
+                );
+            }
+
+            let nanos = timestamp_value_as_nanos(array, row, unit)?;
+            Ok(format!("tsn:{}", nanos))
+        }
         other => Err(format!("unsupported join key type {:?}", other)),
     }
+}
+
+fn timestamp_value_as_nanos(
+    array: &dyn Array,
+    row: usize,
+    unit: &TimeUnit,
+) -> Result<i128, String> {
+    let raw = match unit {
+        TimeUnit::Second => array
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .ok_or_else(|| "failed to cast TimestampSecond join key array".to_string())?
+            .value(row),
+        TimeUnit::Millisecond => array
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or_else(|| "failed to cast TimestampMillisecond join key array".to_string())?
+            .value(row),
+        TimeUnit::Microsecond => array
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .ok_or_else(|| "failed to cast TimestampMicrosecond join key array".to_string())?
+            .value(row),
+        TimeUnit::Nanosecond => array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| "failed to cast TimestampNanosecond join key array".to_string())?
+            .value(row),
+    };
+
+    let nanos = match unit {
+        TimeUnit::Second => i128::from(raw) * 1_000_000_000,
+        TimeUnit::Millisecond => i128::from(raw) * 1_000_000,
+        TimeUnit::Microsecond => i128::from(raw) * 1_000,
+        TimeUnit::Nanosecond => i128::from(raw),
+    };
+
+    Ok(nanos)
 }
 
 fn empty_array_for_type(data_type: &DataType) -> ArrayRef {
@@ -278,6 +343,20 @@ fn empty_array_for_type(data_type: &DataType) -> ArrayRef {
         DataType::Int16 => Arc::new(Int16Array::from(Vec::<i16>::new())),
         DataType::Int32 => Arc::new(Int32Array::from(Vec::<i32>::new())),
         DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())),
+        DataType::Date32 => Arc::new(Date32Array::from(Vec::<i32>::new())),
+        DataType::Date64 => Arc::new(Date64Array::from(Vec::<i64>::new())),
+        DataType::Timestamp(TimeUnit::Second, timezone) => Arc::new(
+            TimestampSecondArray::from(Vec::<i64>::new()).with_timezone_opt(timezone.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => Arc::new(
+            TimestampMillisecondArray::from(Vec::<i64>::new()).with_timezone_opt(timezone.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
+            TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone_opt(timezone.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => Arc::new(
+            TimestampNanosecondArray::from(Vec::<i64>::new()).with_timezone_opt(timezone.clone()),
+        ),
         DataType::Utf8 => Arc::new(StringArray::from(Vec::<String>::new())),
         DataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())),
         _ => Arc::new(StringArray::from(Vec::<String>::new())),
