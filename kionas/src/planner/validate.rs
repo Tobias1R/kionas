@@ -1,5 +1,6 @@
 use crate::planner::error::PlannerError;
 use crate::planner::logical_plan::LogicalPlan;
+use crate::sql::constraints::TableConstraintContract;
 
 /// What: Validate Phase 1 logical plan invariants.
 ///
@@ -53,6 +54,54 @@ pub fn validate_logical_plan(plan: &LogicalPlan) -> Result<(), PlannerError> {
                     "aggregate output name cannot be empty".to_string(),
                 ));
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// What: Validate normalized table-constraint contract invariants.
+///
+/// Inputs:
+/// - `contract`: Constraint contract created from CREATE TABLE semantics.
+///
+/// Output:
+/// - `Ok(())` when constraint contract is coherent.
+/// - `Err(PlannerError)` when duplicate/empty constraint fields are found.
+///
+/// Details:
+/// - Validation is strict to preserve deterministic metadata handoff.
+pub fn validate_constraint_contract(
+    contract: &TableConstraintContract,
+) -> Result<(), PlannerError> {
+    if contract.columns.is_empty() {
+        return Err(PlannerError::InvalidLogicalPlan(
+            "constraint contract must include at least one column".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for column in &contract.columns {
+        let name = column.column.trim();
+        if name.is_empty() {
+            return Err(PlannerError::InvalidLogicalPlan(
+                "constraint contract column name cannot be empty".to_string(),
+            ));
+        }
+
+        let canonical = name.to_ascii_lowercase();
+        if !seen.insert(canonical.clone()) {
+            return Err(PlannerError::InvalidLogicalPlan(format!(
+                "constraint contract has duplicate column entry: {}",
+                canonical
+            )));
+        }
+
+        if column.not_null && column.nullable {
+            return Err(PlannerError::InvalidLogicalPlan(format!(
+                "constraint contract column '{}' cannot be nullable and NOT NULL simultaneously",
+                name
+            )));
         }
     }
 

@@ -3,6 +3,7 @@ pub(crate) mod create_schema;
 pub(crate) mod create_table;
 pub(crate) mod distributed_dag;
 pub(crate) mod helpers;
+pub(crate) mod insert;
 pub(crate) mod query_select;
 pub(crate) mod rbac;
 pub mod use_warehouse;
@@ -10,19 +11,6 @@ pub mod use_warehouse;
 use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
-use std::collections::HashMap;
-
-fn canonicalize_insert_table_name(raw_table_name: &str, default_schema: &str) -> String {
-    let cleaned = raw_table_name.trim().trim_matches('"').trim_matches('`');
-    if cleaned.is_empty() {
-        return cleaned.to_string();
-    }
-    if cleaned.contains('.') {
-        cleaned.to_string()
-    } else {
-        format!("deltalake.{}.{}", default_schema, cleaned)
-    }
-}
 
 /// Discover worker address tied to session
 pub async fn get_worker_addr_for_session(
@@ -115,41 +103,7 @@ pub async fn handle_statement(
 ) -> String {
     match stmt {
         Statement::Insert(insert_stmt) => {
-            // Server phase for INSERT: accept statement and dispatch a worker task.
-            // We send the normalized SQL text as payload and keep operation explicit.
-            let payload = stmt.to_string();
-            let default_schema = {
-                let state = shared_data.lock().await;
-                match state
-                    .session_manager
-                    .get_session(session_id.to_string())
-                    .await
-                {
-                    Some(s) => s.get_use_database(),
-                    None => "default".to_string(),
-                }
-            };
-            let mut params = HashMap::new();
-            let table_name =
-                canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
-            params.insert("table_name".to_string(), table_name);
-
-            match helpers::run_task_for_input_with_params(
-                shared_data,
-                session_id,
-                "insert",
-                payload,
-                params,
-                None,
-                30,
-            )
-            .await
-            {
-                Ok(result_location) => {
-                    format!("Insert dispatched successfully: {}", result_location)
-                }
-                Err(e) => format!("Failed to dispatch insert: {}", e),
-            }
+            insert::handle_insert_statement(shared_data, session_id, stmt, insert_stmt).await
         }
         Statement::Query(_) => {
             let ast = match query_select::select_ast_from_statement(stmt) {

@@ -5,6 +5,10 @@ use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::{
     ColumnOption, CreateTable as SqlCreateTable, ObjectName,
 };
+use kionas::planner::validate_constraint_contract;
+use kionas::sql::constraints::{
+    TableConstraintContract, build_constraint_contract_from_create_table,
+};
 
 const OUTCOME_PREFIX: &str = "RESULT";
 
@@ -163,6 +167,7 @@ fn build_worker_payload(
     database_name: &str,
     schema_name: &str,
     table_name: &str,
+    constraint_contract: &TableConstraintContract,
 ) -> String {
     let create = ast.create_table;
     let mut payload = serde_json::Map::new();
@@ -264,7 +269,7 @@ fn build_worker_payload(
     insert_val(
         &mut payload,
         "constraints",
-        serde_json::Value::String(format!("{:?}", create.constraints)),
+        serde_json::to_value(constraint_contract).unwrap_or(serde_json::Value::Null),
     );
     insert_val(
         &mut payload,
@@ -596,6 +601,15 @@ pub(crate) async fn handle_create_table(
     session_id: &str,
     ast: CreateTableAst<'_>,
 ) -> String {
+    let constraint_contract = build_constraint_contract_from_create_table(ast.create_table);
+    if let Err(e) = validate_constraint_contract(&constraint_contract) {
+        return format_outcome(
+            "VALIDATION",
+            "INVALID_CONSTRAINT_CONTRACT",
+            format!("invalid constraint metadata for CREATE TABLE: {}", e),
+        );
+    }
+
     let (database_name, schema_name, table_name) =
         match extract_table_namespace(&ast.create_table.name) {
             Ok(parts) => parts,
@@ -784,7 +798,13 @@ pub(crate) async fn handle_create_table(
         );
     }
 
-    let worker_payload = build_worker_payload(&ast, &database_name, &schema_name, &table_name);
+    let worker_payload = build_worker_payload(
+        &ast,
+        &database_name,
+        &schema_name,
+        &table_name,
+        &constraint_contract,
+    );
     let worker_result_location = match helpers::run_task_for_input(
         shared_data,
         session_id,

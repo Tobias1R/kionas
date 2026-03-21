@@ -16,5 +16,11 @@ Foundation matrix: [roadmaps/ROADMAP_PHASE_INDEXING_FOUNDATION_MATRIX.md](roadma
 
 ## Road to Constraints
 
+Current roadmap: [roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md](roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md)
+
+Foundation discovery: [roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md](roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md)
+
+Foundation matrix: [roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md)
+
 
 

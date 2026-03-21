@@ -79,3 +79,19 @@ select p.name, sum(o.quantity) as total_quantity from bench.seed1.orders o join 
 -- join group by max
 select c.name, max(o.quantity) as max_quantity from bench.seed1.orders o join bench.seed1.customers c on o.customer_id = c.id group by c.name order by max_quantity desc limit 5;
 select p.name, max(o.quantity) as max_quantity from bench.seed1.orders o join bench.seed1.products p on o.product_id = p.id where p.id = 15  group by p.name order by max_quantity desc limit 5;
+
+
+-- create table not null test
+create table abc.schema1.table3 (id int not null, name string not null, document string not null);
+-- invalid insert
+insert into abc.schema1.table3 values (1, 'Alice', 'Doc1'), (5, 'Eve', null);
+insert into abc.schema1.table3 (id, name, document) values (1, 'Alice', 'Doc1'), (5, 'Eve', 'Doc5');
+
+select * from abc.schema1.table3 order by id;
+
+create table abc.schema1.table4 (id int not null, name string not null, bbb string not null);
+-- invalid insert
+insert into abc.schema1.table4 values (1, 'Alice', 'Doc1'), (5, 'Eve', NULL);
+insert into abc.schema1.table4 (id, name, bbb) values (1, 'Alice', 'Doc1'), (5, 'Eve', 'Doc5');
+
+select * from abc.schema1.table4 order by id;

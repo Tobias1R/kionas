@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-enum InsertScalar {
+pub(crate) enum InsertScalar {
     Int(i64),
     Bool(bool),
     Str(String),
@@ -16,10 +16,10 @@ enum InsertScalar {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedInsertPayload {
-    table_name: String,
-    columns: Vec<String>,
-    rows: Vec<Vec<InsertScalar>>,
+pub(crate) struct ParsedInsertPayload {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<InsertScalar>>,
 }
 
 /// What: Build a Delta table URI from storage config and a SQL table name.
@@ -460,7 +460,9 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_database::execute_create_database_task(&shared, task).await {
+        match crate::transactions::ddl::create_database::execute_create_database_task(&shared, task)
+            .await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -493,7 +495,9 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_schema::execute_create_schema_task(&shared, task).await {
+        match crate::transactions::ddl::create_schema::execute_create_schema_task(&shared, task)
+            .await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -526,7 +530,8 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_table::execute_create_table_task(&shared, task).await {
+        match crate::transactions::ddl::create_table::execute_create_table_task(&shared, task).await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -598,6 +603,27 @@ pub async fn handle_execute_task(
     } else {
         None
     };
+    if operation == "insert" {
+        if let (Some(task), Some(parsed)) = (first_task.as_ref(), parsed_insert.as_ref()) {
+            let required_columns =
+                crate::transactions::constraints::insert_not_null::parse_required_not_null_columns(
+                    task,
+                );
+            if let Err(message) =
+                crate::transactions::constraints::insert_not_null::enforce_not_null_columns(
+                    task,
+                    parsed,
+                    &required_columns,
+                )
+            {
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: message,
+                    result_location: String::new(),
+                };
+            }
+        }
+    }
     let table_name_override = first_task
         .as_ref()
         .and_then(|task| task.params.get("table_name").cloned())

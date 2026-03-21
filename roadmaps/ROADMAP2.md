@@ -95,6 +95,26 @@ Lets discuss a new place for this code. They shouldnt be here in services
 [RICH DATATYPES]
 [GARBAGE COLLECTION]: Introducing the Janitor - a background process for cleaning up old metadata and optimizing storage.
 
+### Current SILK ROAD Artifacts
+- INDEXING: [roadmaps/SILK_ROAD/INDEXING/ROADMAP_INDEXING.md](roadmaps/SILK_ROAD/INDEXING/ROADMAP_INDEXING.md)
+- CONSTRAINTS: [roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md](roadmaps/SILK_ROAD/CONSTRAINTS/ROADMAP_CONSTRAINTS.md)
+- CONSTRAINTS FOUNDATION discovery: [roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md](roadmaps/SILK_ROAD/CONSTRAINTS/discovery/discovery-CONSTRAINTS-FOUNDATION.md)
+- CONSTRAINTS FOUNDATION matrix: [roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_CONSTRAINTS_FOUNDATION_MATRIX.md)
+
+[INTERMISSION Code Cleanup - Worker]
+- Decision: move DDL task handlers from `worker/src/services` to `worker/src/transactions/ddl` to align ownership with transaction execution.
+- Evidence (new module):
+	- [worker/src/transactions/ddl/mod.rs](worker/src/transactions/ddl/mod.rs)
+	- [worker/src/transactions/ddl/create_database.rs](worker/src/transactions/ddl/create_database.rs)
+	- [worker/src/transactions/ddl/create_schema.rs](worker/src/transactions/ddl/create_schema.rs)
+	- [worker/src/transactions/ddl/create_table.rs](worker/src/transactions/ddl/create_table.rs)
+- Evidence (dispatch rewiring): [worker/src/transactions/maestro.rs](worker/src/transactions/maestro.rs)
+- Legacy modules removed from services:
+	- worker/src/services/create_database.rs
+	- worker/src/services/create_schema.rs
+	- worker/src/services/create_table.rs
+[X] DONE
+
 7. Phase 7: Window foundation
 7.1 Introduce minimal supported window semantics with explicit constraints.
 7.2 Add planner/runtime contracts for partition and frame metadata.

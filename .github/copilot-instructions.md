@@ -184,6 +184,6 @@ Status values:
 ## Silk Road Methodology
 - Silk road discovery and implementation files should be created in `roadmaps/SILK_ROAD/` with the following structure:
   - `roadmaps/SILK_ROAD/silkroad.md`: This file will contain the overall Silk Road methodology, including the roadmap to indexing and constraints.
-  - `roadmaps/SILK_ROAD/<ROAD_NAME>/discovery/discovery-<ROAD_NAME>-<PHASE>.md`: This file will capture the discovery findings for the specific road (e.g., indexing, constraints). Must contains high-level summaries of blockers, technical deep dives, and any relevant diagrams or references. 
+  - `roadmaps/SILK_ROAD/<ROAD_NAME>/discovery/discovery-<ROAD_NAME>-<PHASE>.md`: This file will capture the discovery findings for the specific road (e.g., indexing, constraints). Must contains high-level summaries of blockers, technical deep dives, and any relevant diagrams or references. No code is produced in this phase, but the output should be only the discovery findings and the next steps for implementation.
   - Once discovery is completed, we build a roadmap for the ROAD_NAME.  
   - A plan must be created in `roadmaps/SILK_ROAD/<ROAD_NAME>/plans/plan-<ROAD_NAME>-<PHASE>.md` and linked in the discovery file on the next iteration after the discovery is completed.
