@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 datafusion = "52.2.0"
-deltalake = "0.31.0"
+deltalake = "0.31.1"
 s3 = "0.1.22"
 uuid = { version = "1.0", features = ["v4"] }
 tokio.workspace = true

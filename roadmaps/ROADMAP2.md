@@ -88,10 +88,12 @@ Lets discuss a new place for this code. They shouldnt be here in services
 - Closure matrix: [roadmaps/ROADMAP2_PHASE6_MATRIX.md](roadmaps/ROADMAP2_PHASE6_MATRIX.md)
 [X] DONE
 
-[SILK ROAD] 
+## SILK ROAD
+[roadmaps/SILK_ROAD/silkroad.md](roadmaps/SILK_ROAD/silkroad.md)
 [ROAD TO INDEXING]
 [ROAD TO CONSTRAINTS]
-
+[RICH DATATYPES]
+[GARBAGE COLLECTION]: Introducing the Janitor - a background process for cleaning up old metadata and optimizing storage.
 
 7. Phase 7: Window foundation
 7.1 Introduce minimal supported window semantics with explicit constraints.

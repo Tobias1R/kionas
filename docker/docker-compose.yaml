@@ -33,6 +33,7 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
       CONSUL_URL: http://kionas-consul:8500
       REDIS_URL: redis://kionas-redis:6379      
     networks:
@@ -117,6 +118,7 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
       CONSUL_URL: http://kionas-consul:8500
       REDIS_URL: redis://kionas-redis:6379     
     volumes:
@@ -139,6 +141,7 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
       CONSUL_URL: http://kionas-consul:8500
       REDIS_URL: redis://kionas-redis:6379
     volumes:
@@ -160,6 +163,7 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
       FLIGHT_PROXY_PORT: 443
       WORKER_FLIGHT_PORT: 50052
     volumes:
@@ -179,6 +183,7 @@ services:
       RUST_LOG: debug
       RUST_BACKTRACE: full
       KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
       CONSUL_URL: http://kionas-consul:8500
       REDIS_URL: redis://kionas-redis:6379
       # storage endpoint and credentials for worker to access MinIO
