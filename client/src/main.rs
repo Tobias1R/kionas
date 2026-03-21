@@ -506,7 +506,8 @@ fn print_batches_as_table(batches: &[RecordBatch]) -> Result<(), String> {
 /// - `query`: SQL string to execute.
 ///
 /// Output:
-/// - `Ok(())` when query and optional DoGet flow succeed.
+/// - `Ok(true)` when query succeeds from the control plane perspective.
+/// - `Ok(false)` when query is accepted but returns non-success status/error code.
 /// - `Err(message)` on RPC dispatch, metadata, or Flight decode/render failures.
 ///
 /// Details:
@@ -516,10 +517,10 @@ async fn execute_and_render_query(
     session_id: &str,
     token: &str,
     query: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut request = Request::new(warehouse_service::QueryRequest {
@@ -541,6 +542,7 @@ async fn execute_and_render_query(
             "Query failed with status={} error_code={} message={}",
             response.status, response.error_code, response.message
         );
+        return Ok(false);
     } else {
         if let Some(handle) = query_handle_from_response(&response) {
             // println!("Structured query handle: {}", handle);
@@ -549,15 +551,199 @@ async fn execute_and_render_query(
         }
         if response.status == "OK".to_string() {
             println!("Query executed successfully");
+            return Ok(true);
         } else {
             println!(
                 "Query completed with status={} error_code={} message={}",
                 response.status, response.error_code, response.message
             );
+            return Ok(false);
+        }
+    }
+}
+
+/// What: Split SQL script text into statements while respecting quotes and comments.
+///
+/// Inputs:
+/// - `script`: Raw SQL script text that may contain multiple statements.
+///
+/// Output:
+/// - Ordered SQL statements without trailing semicolons.
+///
+/// Details:
+/// - Ignores semicolons inside single quotes, double quotes, line comments, and block comments.
+fn split_sql_statements(script: &str) -> Vec<String> {
+    let chars = script.chars().collect::<Vec<char>>();
+    let mut out = Vec::<String>::new();
+    let mut current = String::new();
+
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        let next = if idx + 1 < chars.len() {
+            Some(chars[idx + 1])
+        } else {
+            None
+        };
+
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                current.push(ch);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            if ch == '-' && next == Some('-') {
+                in_line_comment = true;
+                idx += 2;
+                continue;
+            }
+            if ch == '/' && next == Some('*') {
+                in_block_comment = true;
+                idx += 2;
+                continue;
+            }
+        }
+
+        if ch == '\'' && !in_double_quote {
+            current.push(ch);
+            if in_single_quote {
+                if next == Some('\'') {
+                    current.push('\'');
+                    idx += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            current.push(ch);
+            idx += 1;
+            continue;
+        }
+
+        if ch == ';' && !in_single_quote && !in_double_quote {
+            let stmt = current.trim();
+            if !stmt.is_empty() {
+                out.push(stmt.to_string());
+            }
+            current.clear();
+            idx += 1;
+            continue;
+        }
+
+        current.push(ch);
+        idx += 1;
+    }
+
+    let tail = current.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+
+    out
+}
+
+/// What: Execute a SQL file as an ordered multi-statement script.
+///
+/// Inputs:
+/// - `warehouse_client`: Warehouse gRPC client.
+/// - `session_id`: Active session id.
+/// - `token`: JWT token.
+/// - `query_file`: File path containing SQL statements.
+///
+/// Output:
+/// - `Ok(())` when all statements execute successfully.
+/// - `Err(message)` when one or more statements fail or cannot be executed.
+///
+/// Details:
+/// - Continues executing remaining statements after failures and returns a summary error at the end.
+async fn run_query_file(
+    warehouse_client: &mut WarehouseClient,
+    session_id: &str,
+    token: &str,
+    query_file: &str,
+) -> Result<(), String> {
+    let script = fs::read_to_string(query_file)
+        .map_err(|e| format!("failed to read query file '{}': {}", query_file, e))?;
+    let statements = split_sql_statements(&script);
+
+    if statements.is_empty() {
+        return Err(format!(
+            "query file '{}' contains no executable statements",
+            query_file
+        ));
+    }
+
+    println!(
+        "Running {} SQL statements from file: {}",
+        statements.len(),
+        query_file
+    );
+
+    let mut success_count = 0usize;
+    let mut failed_indices = Vec::<usize>::new();
+
+    for (index, statement) in statements.iter().enumerate() {
+        let ordinal = index + 1;
+        println!("\\n--- Statement {}/{} ---", ordinal, statements.len());
+        println!("{}", statement);
+
+        match execute_and_render_query(warehouse_client, session_id, token, statement).await {
+            Ok(true) => {
+                success_count += 1;
+                println!("statement {}: SUCCESS", ordinal);
+            }
+            Ok(false) => {
+                failed_indices.push(ordinal);
+                println!("statement {}: FAILED (non-success status)", ordinal);
+            }
+            Err(e) => {
+                failed_indices.push(ordinal);
+                println!("statement {}: ERROR ({})", ordinal, e);
+            }
         }
     }
 
-    Ok(())
+    println!(
+        "\\nExecution summary: total={} success={} failed={}",
+        statements.len(),
+        success_count,
+        failed_indices.len()
+    );
+
+    if failed_indices.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed statements at indexes: {:?}",
+            failed_indices
+        ))
+    }
 }
 
 /// What: Run interactive query loop.
@@ -618,8 +804,10 @@ struct Args {
     username: Option<String>,
     #[arg(short, long)]
     password: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "query_file")]
     query: Option<String>,
+    #[arg(long, conflicts_with = "query")]
+    query_file: Option<String>,
     #[arg(long)]
     check_handle: Option<String>,
     #[arg(long)]
@@ -674,10 +862,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut warehouse_client = WarehouseClient::new(channel);
 
     if let Some(query) = args.query.as_deref() {
-        if let Err(e) =
-            execute_and_render_query(&mut warehouse_client, &session_id, &token, query).await
+        if let Err(e) = execute_and_render_query(&mut warehouse_client, &session_id, &token, query)
+            .await
+            .map(|_| ())
         {
             println!("query error: {}", e);
+        }
+        return Ok(());
+    }
+
+    if let Some(query_file) = args.query_file.as_deref() {
+        if let Err(e) = run_query_file(&mut warehouse_client, &session_id, &token, query_file).await
+        {
+            println!("query-file error: {}", e);
         }
         return Ok(());
     }

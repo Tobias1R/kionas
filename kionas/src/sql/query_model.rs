@@ -110,6 +110,7 @@ pub struct QueryJoinSpec {
 /// - `projection`: Projection expressions.
 /// - `selection`: Optional filter expression.
 /// - `order_by`: Optional ORDER BY directives.
+/// - `group_by`: Optional GROUP BY directives.
 /// - `sql`: Canonical SQL text representation.
 ///
 /// Output:
@@ -123,6 +124,7 @@ pub struct SelectQueryModel {
     pub projection: Vec<String>,
     pub selection: Option<String>,
     pub joins: Vec<QueryJoinSpec>,
+    pub group_by: Vec<String>,
     pub order_by: Vec<SortSpec>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -349,6 +351,31 @@ fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
         .collect::<Vec<_>>()
 }
 
+fn parse_group_by_from_sql(sql: &str) -> Vec<String> {
+    let (_, after_group_by) = match split_once_case_insensitive(sql, "group by") {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+
+    let mut group_clause = after_group_by.trim();
+    for stopper in [" order by ", " limit ", " offset ", " fetch ", " having "] {
+        if let Some((head, _)) = split_once_case_insensitive(group_clause, stopper) {
+            group_clause = head.trim();
+        }
+    }
+
+    if group_clause.is_empty() {
+        return Vec::new();
+    }
+
+    group_clause
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+}
+
 /// What: Parse a SQL numeric clause token as non-negative integer.
 ///
 /// Inputs:
@@ -569,6 +596,7 @@ pub fn build_select_query_dispatch_envelope(
             .as_ref()
             .map(std::string::ToString::to_string),
         joins: parse_join_specs(&from.joins, default_database, default_schema)?,
+        group_by: parse_group_by_from_sql(canonical_sql.as_str()),
         order_by: parse_order_by_from_sql(canonical_sql.as_str()),
         limit,
         offset,
@@ -606,6 +634,7 @@ pub fn build_select_query_dispatch_envelope(
         "projection": model.projection,
         "selection": model.selection,
         "joins": model.joins,
+        "group_by": model.group_by,
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,

@@ -3,9 +3,45 @@ use crate::planner::distributed_validate::validate_distributed_physical_plan;
 use crate::planner::error::PlannerError;
 use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::LogicalPlan;
+use crate::planner::physical_plan::PhysicalExpr;
 use crate::planner::physical_plan::{
-    PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+    PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
 };
+
+fn normalize_identifier(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn projection_output_name(expr: &str) -> String {
+    let lower = expr.to_ascii_lowercase();
+    if let Some(index) = lower.rfind(" as ") {
+        return normalize_identifier(&expr[index + 4..]);
+    }
+
+    if let Some((prefix, function)) = [
+        ("count(", "count"),
+        ("sum(", "sum"),
+        ("min(", "min"),
+        ("max(", "max"),
+        ("avg(", "avg"),
+    ]
+    .iter()
+    .find(|(prefix, _)| lower.starts_with(*prefix) && lower.ends_with(')'))
+    {
+        let arg = expr[prefix.len()..expr.len() - 1].trim();
+        if arg == "*" {
+            return (*function).to_string();
+        }
+        return format!("{}_{}", function, normalize_identifier(arg));
+    }
+
+    normalize_identifier(expr)
+}
 
 /// What: Build a Phase 2 physical plan from a validated logical plan.
 ///
@@ -42,12 +78,54 @@ pub fn build_physical_plan_from_logical_plan(
         });
     }
 
-    let projection_exprs = plan
-        .projection
-        .expressions
-        .iter()
-        .map(PhysicalExpr::from)
-        .collect::<Vec<_>>();
+    if !plan.aggregates.is_empty() {
+        let grouping_exprs = plan
+            .grouping_keys
+            .iter()
+            .map(PhysicalExpr::from)
+            .collect::<Vec<_>>();
+        let aggregates = plan
+            .aggregates
+            .iter()
+            .map(|aggregate| crate::planner::PhysicalAggregateExpr {
+                function: aggregate.function.clone(),
+                input: aggregate.input.as_ref().map(PhysicalExpr::from),
+                output_name: aggregate.output_name.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let aggregate_spec = crate::planner::PhysicalAggregateSpec {
+            grouping_exprs,
+            aggregates,
+        };
+        operators.push(PhysicalOperator::AggregatePartial {
+            spec: aggregate_spec.clone(),
+        });
+        operators.push(PhysicalOperator::AggregateFinal {
+            spec: aggregate_spec,
+        });
+    }
+
+    let projection_exprs = if plan.aggregates.is_empty() {
+        plan.projection
+            .expressions
+            .iter()
+            .map(PhysicalExpr::from)
+            .collect::<Vec<_>>()
+    } else {
+        plan.projection
+            .expressions
+            .iter()
+            .map(|expr| match expr {
+                crate::planner::LogicalExpr::Raw { sql } => PhysicalExpr::ColumnRef {
+                    name: projection_output_name(sql),
+                },
+                crate::planner::LogicalExpr::Column { name } => PhysicalExpr::ColumnRef {
+                    name: projection_output_name(name),
+                },
+            })
+            .collect::<Vec<_>>()
+    };
     operators.push(PhysicalOperator::Projection {
         expressions: projection_exprs,
     });
@@ -134,6 +212,8 @@ mod tests {
                 },
             }),
             joins: Vec::new(),
+            grouping_keys: Vec::new(),
+            aggregates: Vec::new(),
             order_by: vec![LogicalSortExpr {
                 expression: LogicalExpr::Raw {
                     sql: "id".to_string(),
@@ -188,6 +268,8 @@ mod tests {
             },
             selection: None,
             joins: Vec::new(),
+            grouping_keys: Vec::new(),
+            aggregates: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -227,6 +309,8 @@ mod tests {
                     right: "orders.user_id".to_string(),
                 }],
             }],
+            grouping_keys: Vec::new(),
+            aggregates: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -239,6 +323,55 @@ mod tests {
                 .operators
                 .iter()
                 .any(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+        );
+    }
+
+    #[test]
+    fn emits_aggregate_partial_and_final_operators() {
+        let plan = LogicalPlan {
+            relation: LogicalRelation {
+                database: "sales".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+            },
+            projection: LogicalProjection {
+                expressions: vec![
+                    LogicalExpr::Raw {
+                        sql: "country".to_string(),
+                    },
+                    LogicalExpr::Raw {
+                        sql: "COUNT(*)".to_string(),
+                    },
+                ],
+            },
+            selection: None,
+            joins: Vec::new(),
+            grouping_keys: vec![LogicalExpr::Raw {
+                sql: "country".to_string(),
+            }],
+            aggregates: vec![crate::planner::LogicalAggregateExpr {
+                function: crate::planner::AggregateFunction::Count,
+                input: None,
+                output_name: "count".to_string(),
+            }],
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            sql: "SELECT country, COUNT(*) FROM sales.public.users GROUP BY country".to_string(),
+        };
+
+        let physical = build_physical_plan_from_logical_plan(&plan).expect("physical plan");
+        assert!(
+            physical
+                .operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+        );
+        assert!(
+            physical
+                .operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
         );
     }
 }

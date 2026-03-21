@@ -40,6 +40,22 @@ pub fn validate_logical_plan(plan: &LogicalPlan) -> Result<(), PlannerError> {
         }
     }
 
+    if !plan.grouping_keys.is_empty() && plan.aggregates.is_empty() {
+        return Err(PlannerError::InvalidLogicalPlan(
+            "GROUP BY requires at least one aggregate expression in projection".to_string(),
+        ));
+    }
+
+    if !plan.aggregates.is_empty() {
+        for aggregate in &plan.aggregates {
+            if aggregate.output_name.trim().is_empty() {
+                return Err(PlannerError::InvalidLogicalPlan(
+                    "aggregate output name cannot be empty".to_string(),
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -62,6 +78,8 @@ mod tests {
             },
             selection: None,
             joins: Vec::new(),
+            grouping_keys: Vec::new(),
+            aggregates: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,

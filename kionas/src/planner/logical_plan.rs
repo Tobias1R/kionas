@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::planner::aggregate_spec::LogicalAggregateExpr;
 use crate::planner::join_spec::LogicalJoinSpec;
 
 /// What: Logical expression for Phase 1 minimal SELECT support.
@@ -76,6 +77,8 @@ pub struct LogicalSortExpr {
 /// - `projection`: Projection expression node.
 /// - `selection`: Optional filter node.
 /// - `joins`: Optional join directives.
+/// - `grouping_keys`: Optional GROUP BY key expressions.
+/// - `aggregates`: Optional aggregate expressions parsed from projection.
 /// - `order_by`: Optional ordering directives.
 /// - `limit`: Optional row-count limit.
 /// - `offset`: Optional row offset applied before limit.
@@ -89,6 +92,8 @@ pub struct LogicalPlan {
     pub projection: LogicalProjection,
     pub selection: Option<LogicalSelection>,
     pub joins: Vec<LogicalJoinSpec>,
+    pub grouping_keys: Vec<LogicalExpr>,
+    pub aggregates: Vec<LogicalAggregateExpr>,
     pub order_by: Vec<LogicalSortExpr>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,

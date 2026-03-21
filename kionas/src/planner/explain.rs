@@ -54,6 +54,36 @@ fn render_operator_diagnostic(operator: &PhysicalOperator) -> String {
                 keys
             )
         }
+        PhysicalOperator::AggregatePartial { spec } => {
+            let keys = spec
+                .grouping_exprs
+                .iter()
+                .map(render_physical_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let aggregates = spec
+                .aggregates
+                .iter()
+                .map(|aggregate| format!("{:?}:{}", aggregate.function, aggregate.output_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("AggregatePartial(keys=[{}], aggs=[{}])", keys, aggregates)
+        }
+        PhysicalOperator::AggregateFinal { spec } => {
+            let keys = spec
+                .grouping_exprs
+                .iter()
+                .map(render_physical_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let aggregates = spec
+                .aggregates
+                .iter()
+                .map(|aggregate| format!("{:?}:{}", aggregate.function, aggregate.output_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("AggregateFinal(keys=[{}], aggs=[{}])", keys, aggregates)
+        }
         _ => operator.canonical_name().to_string(),
     }
 }
@@ -73,13 +103,15 @@ pub fn explain_logical_plan(plan: &LogicalPlan) -> String {
     };
 
     format!(
-        "LogicalPlan relation={}.{}.{} projection_count={} selection={} join_count={}",
+        "LogicalPlan relation={}.{}.{} projection_count={} selection={} join_count={} group_count={} aggregate_count={}",
         plan.relation.database,
         plan.relation.schema,
         plan.relation.table,
         plan.projection.expressions.len(),
         selection,
-        plan.joins.len()
+        plan.joins.len(),
+        plan.grouping_keys.len(),
+        plan.aggregates.len()
     )
 }
 
@@ -169,6 +201,8 @@ mod tests {
                 },
             }),
             joins: Vec::new(),
+            grouping_keys: Vec::new(),
+            aggregates: Vec::new(),
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -198,6 +232,18 @@ mod tests {
                         sql: "id".to_string(),
                     }],
                 },
+                PhysicalOperator::AggregatePartial {
+                    spec: crate::planner::PhysicalAggregateSpec {
+                        grouping_exprs: vec![PhysicalExpr::Raw {
+                            sql: "country".to_string(),
+                        }],
+                        aggregates: vec![crate::planner::PhysicalAggregateExpr {
+                            function: crate::planner::AggregateFunction::Count,
+                            input: None,
+                            output_name: "count".to_string(),
+                        }],
+                    },
+                },
                 PhysicalOperator::Sort {
                     keys: vec![PhysicalSortExpr {
                         expression: PhysicalExpr::Raw {
@@ -222,7 +268,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "PhysicalPlan operators=5 pipeline=TableScan->Projection->Sort(id DESC)->Limit(count=5, offset=2)->Materialize sql=\"SELECT id FROM sales.public.users\""
+            "PhysicalPlan operators=6 pipeline=TableScan->Projection->AggregatePartial(keys=[country], aggs=[Count:count])->Sort(id DESC)->Limit(count=5, offset=2)->Materialize sql=\"SELECT id FROM sales.public.users\""
         );
         assert!(json.contains("\"operators\""));
         assert!(json.contains("\"Sort\""));

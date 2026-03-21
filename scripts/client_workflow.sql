@@ -51,3 +51,9 @@ insert into abc.schema1.table2 values (1, 'Doc1'), (2, 'Doc2'), (3, 'Doc3'), (4,
 select t1.id, t1.name, t2.document from abc.schema1.table1 t1 join abc.schema1.table2 t2 on t1.id = t2.id where t1.id > 1 order by t1.id limit 6;
 
 select t1.c1, t1.c2, t2.table2_c2 from abc.schema1.table1 t1 join abc.schema1.table2 t2 on t1.c1 = t2.c1 order by t1.c1;
+
+-- group by and aggregate
+select c1, count(*) from abc.schema1.table1 group by c1 order by c1;
+
+-- group by min, max, avg
+select c1, min(c2), max(c2), avg(c2) from abc.schema1.table1 group by c1 order by c1;

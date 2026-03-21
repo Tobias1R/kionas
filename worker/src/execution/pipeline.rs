@@ -1,3 +1,6 @@
+use crate::execution::aggregate::{
+    apply_aggregate_final_pipeline, apply_aggregate_partial_pipeline,
+};
 use crate::execution::artifacts::{persist_query_artifacts, persist_stage_exchange_artifacts};
 use crate::execution::join::apply_hash_join_pipeline;
 use crate::execution::planner::StageExecutionContext;
@@ -15,7 +18,7 @@ use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// What: Execute validated query payload on the worker and materialize deterministic artifacts.
 ///
@@ -68,7 +71,15 @@ pub(crate) async fn execute_query_task(
 
     let runtime_plan = extract_runtime_plan(task)?;
     let stage_context = stage_execution_context(task);
+    let relation_columns_by_key = parse_relation_columns_map(task);
+    let source_relation_key = relation_key(namespace);
     let mut batches = load_input_batches(shared, session_id, namespace, &stage_context).await?;
+
+    if stage_context.upstream_stage_ids.is_empty()
+        && let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str())
+    {
+        batches = apply_relation_column_names(&batches, columns)?;
+    }
 
     if let Some(sql) = runtime_plan.filter_sql.as_deref() {
         batches = apply_filter_pipeline(&batches, sql)?;
@@ -81,8 +92,20 @@ pub(crate) async fn execute_query_task(
             table: join_spec.right_relation.table.clone(),
         };
         let right_prefix = source_table_staging_prefix(&right_namespace);
-        let right_batches = load_scan_batches(shared, &right_prefix).await?;
+        let mut right_batches = load_scan_batches(shared, &right_prefix).await?;
+        let right_relation_key = relation_key(&right_namespace);
+        if let Some(columns) = relation_columns_by_key.get(right_relation_key.as_str()) {
+            right_batches = apply_relation_column_names(&right_batches, columns)?;
+        }
         batches = apply_hash_join_pipeline(&batches, &right_batches, join_spec)?;
+    }
+
+    if let Some(aggregate_partial_spec) = runtime_plan.aggregate_partial_spec.as_ref() {
+        batches = apply_aggregate_partial_pipeline(&batches, aggregate_partial_spec)?;
+    }
+
+    if let Some(aggregate_final_spec) = runtime_plan.aggregate_final_spec.as_ref() {
+        batches = apply_aggregate_final_pipeline(&batches, aggregate_final_spec)?;
     }
 
     if !runtime_plan.projection_exprs.is_empty() {
@@ -127,6 +150,65 @@ pub(crate) async fn execute_query_task(
     } else {
         Ok(())
     }
+}
+
+fn relation_key(namespace: &QueryNamespace) -> String {
+    format!(
+        "{}.{}.{}",
+        namespace.database.to_ascii_lowercase(),
+        namespace.schema.to_ascii_lowercase(),
+        namespace.table.to_ascii_lowercase()
+    )
+}
+
+fn parse_relation_columns_map(task: &worker_service::Task) -> HashMap<String, Vec<String>> {
+    task.params
+        .get("relation_columns_json")
+        .and_then(|value| serde_json::from_str::<HashMap<String, Vec<String>>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn apply_relation_column_names(
+    batches: &[RecordBatch],
+    relation_columns: &[String],
+) -> Result<Vec<RecordBatch>, String> {
+    if relation_columns.is_empty() {
+        return Ok(batches.to_vec());
+    }
+
+    let mut renamed = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_columns() != relation_columns.len() {
+            return Err(format!(
+                "relation column mapping mismatch: expected {} columns from metastore, batch has {}",
+                relation_columns.len(),
+                batch.num_columns()
+            ));
+        }
+
+        let fields = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_name(relation_columns[index].clone())
+            })
+            .collect::<Vec<_>>();
+
+        let renamed_batch = RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+            batch.columns().to_vec(),
+        )
+        .map_err(|e| format!("failed to apply relation column mapping: {}", e))?;
+
+        renamed.push(renamed_batch);
+    }
+
+    Ok(renamed)
 }
 
 /// What: Parse exchange partition index from a stage artifact key.

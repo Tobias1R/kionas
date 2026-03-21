@@ -1,3 +1,4 @@
+use crate::planner::aggregate_spec::PhysicalAggregateSpec;
 use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::{LogicalExpr, LogicalRelation};
 use serde::{Deserialize, Serialize};
@@ -63,8 +64,8 @@ pub enum PhysicalOperator {
 
     HashJoin { spec: PhysicalJoinSpec },
     NestedLoopJoin,
-    AggregatePartial,
-    AggregateFinal,
+    AggregatePartial { spec: PhysicalAggregateSpec },
+    AggregateFinal { spec: PhysicalAggregateSpec },
     Sort { keys: Vec<PhysicalSortExpr> },
     Limit { spec: PhysicalLimitSpec },
     ExchangeShuffle { keys: Vec<String> },
@@ -90,8 +91,8 @@ impl PhysicalOperator {
             PhysicalOperator::Materialize => "Materialize",
             PhysicalOperator::HashJoin { .. } => "HashJoin",
             PhysicalOperator::NestedLoopJoin => "NestedLoopJoin",
-            PhysicalOperator::AggregatePartial => "AggregatePartial",
-            PhysicalOperator::AggregateFinal => "AggregateFinal",
+            PhysicalOperator::AggregatePartial { .. } => "AggregatePartial",
+            PhysicalOperator::AggregateFinal { .. } => "AggregateFinal",
             PhysicalOperator::Sort { .. } => "Sort",
             PhysicalOperator::Limit { .. } => "Limit",
             PhysicalOperator::ExchangeShuffle { .. } => "ExchangeShuffle",

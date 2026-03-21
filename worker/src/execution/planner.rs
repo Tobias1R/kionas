@@ -1,7 +1,7 @@
 use crate::services::worker_service_server::worker_service;
 use kionas::planner::{
-    PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
-    PhysicalSortExpr,
+    PhysicalAggregateSpec, PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator,
+    PhysicalPlan, PhysicalSortExpr,
 };
 use std::collections::HashMap;
 
@@ -17,6 +17,8 @@ use std::collections::HashMap;
 pub(crate) struct RuntimePlan {
     pub(crate) filter_sql: Option<String>,
     pub(crate) join_spec: Option<PhysicalJoinSpec>,
+    pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
+    pub(crate) aggregate_final_spec: Option<PhysicalAggregateSpec>,
     pub(crate) projection_exprs: Vec<PhysicalExpr>,
     pub(crate) sort_exprs: Vec<PhysicalSortExpr>,
     pub(crate) limit_spec: Option<PhysicalLimitSpec>,
@@ -45,6 +47,8 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
 
     let mut filter_sql = None;
     let mut join_spec = None;
+    let mut aggregate_partial_spec = None;
+    let mut aggregate_final_spec = None;
     let mut projection_exprs = Vec::new();
     let mut sort_exprs = Vec::new();
     let mut limit_spec = None;
@@ -62,6 +66,12 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
             }
             PhysicalOperator::HashJoin { spec } => {
                 join_spec = Some(spec);
+            }
+            PhysicalOperator::AggregatePartial { spec } => {
+                aggregate_partial_spec = Some(spec);
+            }
+            PhysicalOperator::AggregateFinal { spec } => {
+                aggregate_final_spec = Some(spec);
             }
             PhysicalOperator::Projection { expressions } => {
                 projection_exprs = expressions;
@@ -87,6 +97,8 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
     Ok(RuntimePlan {
         filter_sql,
         join_spec,
+        aggregate_partial_spec,
+        aggregate_final_spec,
         projection_exprs,
         sort_exprs,
         limit_spec,

@@ -5,7 +5,7 @@
 mod auth;
 mod auth_setup;
 mod consul;
-mod core;
+//mod core;
 mod handlers;
 mod server;
 mod services;

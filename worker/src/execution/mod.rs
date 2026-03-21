@@ -1,3 +1,4 @@
+pub(crate) mod aggregate;
 pub(crate) mod artifacts;
 pub(crate) mod join;
 pub(crate) mod pipeline;

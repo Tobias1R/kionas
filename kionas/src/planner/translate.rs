@@ -3,7 +3,147 @@ use crate::planner::join_spec::{JoinKeyPair, JoinType, LogicalJoinSpec};
 use crate::planner::logical_plan::{
     LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };
+use crate::planner::{AggregateFunction, LogicalAggregateExpr};
 use crate::sql::query_model::SelectQueryModel;
+
+fn normalize_identifier(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn parse_projection_alias(expr: &str) -> (String, Option<String>) {
+    let lower = expr.to_ascii_lowercase();
+    if let Some(index) = lower.rfind(" as ") {
+        let lhs = expr[..index].trim().to_string();
+        let rhs = expr[index + 4..].trim();
+        if !rhs.is_empty() {
+            return (lhs, Some(normalize_identifier(rhs)));
+        }
+    }
+
+    (expr.trim().to_string(), None)
+}
+
+fn is_simple_identifier_reference(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.contains('(')
+        || trimmed.contains(')')
+        || trimmed.contains('+')
+        || trimmed.contains('-')
+        || trimmed.contains('*')
+        || trimmed.contains('/')
+        || trimmed.contains(',')
+        || trimmed.contains(':')
+        || trimmed.contains(' ')
+    {
+        return false;
+    }
+
+    let parts = trimmed.split('.').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 2 {
+        return false;
+    }
+
+    parts.into_iter().all(|segment| {
+        let raw = segment
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches('[')
+            .trim_matches(']');
+
+        !raw.is_empty()
+            && raw
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+fn parse_aggregate_expr_from_projection(expr: &str) -> Option<(AggregateFunction, Option<String>)> {
+    let (base_expr, _) = parse_projection_alias(expr);
+    let trimmed = base_expr.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for (name, function) in [
+        ("count", AggregateFunction::Count),
+        ("sum", AggregateFunction::Sum),
+        ("min", AggregateFunction::Min),
+        ("max", AggregateFunction::Max),
+        ("avg", AggregateFunction::Avg),
+    ] {
+        let prefix = format!("{}(", name);
+        if lower.starts_with(prefix.as_str()) && lower.ends_with(')') {
+            let raw_arg = trimmed[prefix.len()..trimmed.len() - 1].trim();
+            if matches!(function, AggregateFunction::Count) && raw_arg == "*" {
+                return Some((function, None));
+            }
+
+            if is_simple_identifier_reference(raw_arg) {
+                return Some((function, Some(raw_arg.to_string())));
+            }
+
+            return None;
+        }
+    }
+
+    None
+}
+
+fn parse_projection_aggregates(
+    projection: &[String],
+) -> Result<Vec<LogicalAggregateExpr>, PlannerError> {
+    let mut aggregates = Vec::new();
+
+    for expr in projection {
+        if let Some((function, input)) = parse_aggregate_expr_from_projection(expr) {
+            let (_, alias) = parse_projection_alias(expr);
+            let output_name = if let Some(alias) = alias {
+                alias
+            } else {
+                match (&function, input.as_deref()) {
+                    (AggregateFunction::Count, None) => "count".to_string(),
+                    (AggregateFunction::Count, Some(column)) => {
+                        format!("count_{}", normalize_identifier(column))
+                    }
+                    (AggregateFunction::Sum, Some(column)) => {
+                        format!("sum_{}", normalize_identifier(column))
+                    }
+                    (AggregateFunction::Min, Some(column)) => {
+                        format!("min_{}", normalize_identifier(column))
+                    }
+                    (AggregateFunction::Max, Some(column)) => {
+                        format!("max_{}", normalize_identifier(column))
+                    }
+                    (AggregateFunction::Avg, Some(column)) => {
+                        format!("avg_{}", normalize_identifier(column))
+                    }
+                    _ => {
+                        return Err(PlannerError::InvalidLogicalPlan(format!(
+                            "unsupported aggregate expression '{}'",
+                            expr
+                        )));
+                    }
+                }
+            };
+
+            aggregates.push(LogicalAggregateExpr {
+                function,
+                input: input.map(|column| LogicalExpr::Raw { sql: column }),
+                output_name,
+            });
+        }
+    }
+
+    Ok(aggregates)
+}
 
 /// What: Build a Phase 1 logical plan from the shared select query model.
 ///
@@ -24,6 +164,12 @@ pub fn build_logical_plan_from_select_model(
         .iter()
         .map(|expr| LogicalExpr::Raw { sql: expr.clone() })
         .collect::<Vec<_>>();
+    let grouping_keys = model
+        .group_by
+        .iter()
+        .map(|expr| LogicalExpr::Raw { sql: expr.clone() })
+        .collect::<Vec<_>>();
+    let aggregates = parse_projection_aggregates(&model.projection)?;
 
     let plan = LogicalPlan {
         relation: LogicalRelation {
@@ -61,6 +207,8 @@ pub fn build_logical_plan_from_select_model(
                     .collect::<Vec<_>>(),
             })
             .collect::<Vec<_>>(),
+        grouping_keys,
+        aggregates,
         order_by: model
             .order_by
             .iter()
@@ -100,6 +248,7 @@ mod tests {
             projection: vec!["id".to_string(), "name".to_string()],
             selection: Some("active = true".to_string()),
             joins: Vec::new(),
+            group_by: Vec::new(),
             order_by: vec![SortSpec {
                 expression: "id".to_string(),
                 ascending: true,

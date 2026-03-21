@@ -133,6 +133,13 @@ If you add or change config keys:
 - We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files.
 - Each roadmap phase should have a clear scope, mandatory criteria for completion, optional hardening items, and a signoff decision process.
 - The roadmap should be updated iteratively as we progress through phases, ensuring that all relevant files and documentation are maintained in sync with the current state of the project.
+- Each phase is composed by:
+  - **DISCOVERY**:
+    - From now on we are going to persist our discovery findings in roadmaps/<ROADMAP_NAME>/discovery/discovery-phaseX.md files, and link them in the discovery section of the roadmap.
+  - **IMPLEMENTATION**:
+    - save planning in roadmaps/<ROADMAP_NAME>/plans/plan-phaseX.md files, and link them in the implementation section of the roadmap.
+  - **COMPLETION MATRIX**:
+    - For each phase, create a ROADMAP_PHASEX_MATRIX.md file with the structure defined in the template below. This file will be used to track the completion of mandatory criteria and optional hardening items for the phase, along with evidence references and notes.
 
 ## Roadmap Phase Signoff Matrix Requirements
 For each roadmap phase, create a corresponding `ROADMAP_PHASEX_MATRIX.md` file with the following structure:

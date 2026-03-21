@@ -1,14 +1,17 @@
+use crate::services::metastore_client::MetastoreClient;
+use crate::services::metastore_client::metastore_service as ms;
 use crate::services::request_context::RequestContext;
 use crate::statement_handler::distributed_dag;
 use crate::statement_handler::helpers;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
-use kionas::planner::PhysicalPlan;
+use kionas::planner::{PhysicalOperator, PhysicalPlan};
 use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
     build_select_query_dispatch_envelope, validation_code_for_query_error,
 };
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const OUTCOME_PREFIX: &str = "RESULT";
@@ -44,6 +47,116 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
         code,
         message.into()
     )
+}
+
+/// What: Build a stable relation key used by worker-side relation column mapping.
+///
+/// Inputs:
+/// - `database`: Canonical database name.
+/// - `schema`: Canonical schema name.
+/// - `table`: Canonical table name.
+///
+/// Output:
+/// - Lowercase key in `<database>.<schema>.<table>` form.
+fn relation_key(database: &str, schema: &str, table: &str) -> String {
+    format!(
+        "{}.{}.{}",
+        database.to_ascii_lowercase(),
+        schema.to_ascii_lowercase(),
+        table.to_ascii_lowercase()
+    )
+}
+
+/// What: Read canonical table columns from metastore for one relation namespace.
+///
+/// Inputs:
+/// - `shared_data`: Shared server state used to open metastore client.
+/// - `database`: Canonical database name.
+/// - `schema`: Canonical schema name.
+/// - `table`: Canonical table name.
+///
+/// Output:
+/// - Ordered canonical column names when metadata is available.
+async fn load_relation_columns(
+    shared_data: &SharedData,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    let mut client = MetastoreClient::connect_with_shared(shared_data)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to connect to metastore for relation metadata: {}",
+                e
+            )
+        })?;
+
+    let response = client
+        .execute(ms::MetastoreRequest {
+            action: Some(ms::metastore_request::Action::GetTable(
+                ms::GetTableRequest {
+                    database_name: database.to_string(),
+                    schema_name: schema.to_string(),
+                    table_name: table.to_string(),
+                    location: String::new(),
+                },
+            )),
+        })
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to fetch table metadata from metastore for {}.{}.{}: {}",
+                database, schema, table, e
+            )
+        })?;
+
+    let table_result = response.result.ok_or_else(|| {
+        format!(
+            "metastore returned empty get_table result for {}.{}.{}",
+            database, schema, table
+        )
+    })?;
+
+    let get_table_response = match table_result {
+        ms::metastore_response::Result::GetTableResponse(value) => value,
+        _ => {
+            return Err(format!(
+                "metastore returned unexpected response for get_table {}.{}.{}",
+                database, schema, table
+            ));
+        }
+    };
+
+    if !get_table_response.success {
+        return Err(format!(
+            "metastore get_table failed for {}.{}.{}: {}",
+            database, schema, table, get_table_response.message
+        ));
+    }
+
+    let metadata = get_table_response.metadata.ok_or_else(|| {
+        format!(
+            "metastore get_table missing metadata for {}.{}.{}",
+            database, schema, table
+        )
+    })?;
+
+    let columns = metadata
+        .columns
+        .iter()
+        .map(|column| column.name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+
+    if columns.is_empty() {
+        return Err(format!(
+            "metastore get_table returned empty columns for {}.{}.{}",
+            database, schema, table
+        ));
+    }
+
+    Ok(columns)
 }
 
 /// What: Handle SELECT query statements for server-side AST preparation.
@@ -153,6 +266,56 @@ pub(crate) async fn handle_select_query(
                     }
                 };
 
+            let mut relation_set = BTreeSet::<(String, String, String)>::new();
+            relation_set.insert((database.clone(), schema.clone(), table.clone()));
+            for operator in &physical_plan.operators {
+                if let PhysicalOperator::HashJoin { spec } = operator {
+                    relation_set.insert((
+                        spec.right_relation.database.clone(),
+                        spec.right_relation.schema.clone(),
+                        spec.right_relation.table.clone(),
+                    ));
+                }
+            }
+
+            let mut relation_columns = BTreeMap::<String, Vec<String>>::new();
+            for (relation_db, relation_schema, relation_table) in relation_set {
+                match load_relation_columns(
+                    shared_data,
+                    relation_db.as_str(),
+                    relation_schema.as_str(),
+                    relation_table.as_str(),
+                )
+                .await
+                {
+                    Ok(columns) => {
+                        relation_columns.insert(
+                            relation_key(
+                                relation_db.as_str(),
+                                relation_schema.as_str(),
+                                relation_table.as_str(),
+                            ),
+                            columns,
+                        );
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "query_select relation metadata unavailable for {}.{}.{}: {}",
+                            relation_db,
+                            relation_schema,
+                            relation_table,
+                            err
+                        );
+                    }
+                }
+            }
+
+            let relation_columns_json = if relation_columns.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&relation_columns).ok()
+            };
+
             let query_run_id = Uuid::new_v4().to_string();
 
             for group in &mut stage_groups {
@@ -169,6 +332,11 @@ pub(crate) async fn handle_select_query(
                 group
                     .params
                     .insert("query_run_id".to_string(), query_run_id.clone());
+                if let Some(mapping_json) = relation_columns_json.as_ref() {
+                    group
+                        .params
+                        .insert("relation_columns_json".to_string(), mapping_json.clone());
+                }
             }
 
             let auth_scope = format!("select:{}.{}.{}", database, schema, table);

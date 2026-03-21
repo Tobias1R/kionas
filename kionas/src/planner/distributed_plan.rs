@@ -84,6 +84,61 @@ pub struct DistributedPhysicalPlan {
 /// Details:
 /// - This compatibility bridge allows phased rollout without changing current execution behavior.
 pub fn distributed_from_physical_plan(plan: &PhysicalPlan) -> DistributedPhysicalPlan {
+    if let Some(final_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+    {
+        let mut stage0_ops = plan.operators[..final_index].to_vec();
+        if !matches!(stage0_ops.last(), Some(PhysicalOperator::Materialize)) {
+            stage0_ops.push(PhysicalOperator::Materialize);
+        }
+
+        let mut stage1_ops = plan.operators[final_index..].to_vec();
+        if !matches!(stage1_ops.last(), Some(PhysicalOperator::Materialize)) {
+            stage1_ops.push(PhysicalOperator::Materialize);
+        }
+
+        let stage0_partition = stage0_ops
+            .iter()
+            .find_map(|op| match op {
+                PhysicalOperator::AggregatePartial { spec } => Some(PartitionSpec::Hash {
+                    keys: spec
+                        .grouping_exprs
+                        .iter()
+                        .map(|expr| match expr {
+                            crate::planner::physical_plan::PhysicalExpr::ColumnRef { name } => {
+                                name.clone()
+                            }
+                            crate::planner::physical_plan::PhysicalExpr::Raw { sql } => sql.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+                _ => None,
+            })
+            .unwrap_or(PartitionSpec::Single);
+
+        return DistributedPhysicalPlan {
+            stages: vec![
+                DistributedStage {
+                    stage_id: 0,
+                    operators: stage0_ops,
+                    partition_spec: stage0_partition,
+                },
+                DistributedStage {
+                    stage_id: 1,
+                    operators: stage1_ops,
+                    partition_spec: PartitionSpec::Single,
+                },
+            ],
+            dependencies: vec![StageDependency {
+                from_stage_id: 0,
+                to_stage_id: 1,
+            }],
+            sql: plan.sql.clone(),
+        };
+    }
+
     if let Some(join_index) = plan
         .operators
         .iter()
@@ -141,6 +196,9 @@ pub fn distributed_from_physical_plan(plan: &PhysicalPlan) -> DistributedPhysica
 #[cfg(test)]
 mod tests {
     use super::distributed_from_physical_plan;
+    use crate::planner::aggregate_spec::{
+        AggregateFunction, PhysicalAggregateExpr, PhysicalAggregateSpec,
+    };
     use crate::planner::join_spec::PhysicalJoinSpec;
     use crate::planner::logical_plan::LogicalRelation;
     use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
@@ -211,6 +269,58 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT users.id FROM sales.public.users INNER JOIN sales.public.orders ON users.id = orders.user_id".to_string(),
+        };
+
+        let distributed = distributed_from_physical_plan(&plan);
+        assert_eq!(distributed.stages.len(), 2);
+        assert_eq!(distributed.dependencies.len(), 1);
+        assert_eq!(distributed.dependencies[0].from_stage_id, 0);
+        assert_eq!(distributed.dependencies[0].to_stage_id, 1);
+    }
+
+    #[test]
+    fn splits_aggregate_pipeline_into_two_stages() {
+        let plan = PhysicalPlan {
+            operators: vec![
+                PhysicalOperator::TableScan {
+                    relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "users".to_string(),
+                    },
+                },
+                PhysicalOperator::AggregatePartial {
+                    spec: PhysicalAggregateSpec {
+                        grouping_exprs: vec![PhysicalExpr::Raw {
+                            sql: "country".to_string(),
+                        }],
+                        aggregates: vec![PhysicalAggregateExpr {
+                            function: AggregateFunction::Count,
+                            input: None,
+                            output_name: "count".to_string(),
+                        }],
+                    },
+                },
+                PhysicalOperator::AggregateFinal {
+                    spec: PhysicalAggregateSpec {
+                        grouping_exprs: vec![PhysicalExpr::Raw {
+                            sql: "country".to_string(),
+                        }],
+                        aggregates: vec![PhysicalAggregateExpr {
+                            function: AggregateFunction::Count,
+                            input: None,
+                            output_name: "count".to_string(),
+                        }],
+                    },
+                },
+                PhysicalOperator::Projection {
+                    expressions: vec![PhysicalExpr::Raw {
+                        sql: "count".to_string(),
+                    }],
+                },
+                PhysicalOperator::Materialize,
+            ],
+            sql: "SELECT country, COUNT(*) FROM sales.public.users GROUP BY country".to_string(),
         };
 
         let distributed = distributed_from_physical_plan(&plan);

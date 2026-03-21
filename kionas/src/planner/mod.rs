@@ -1,3 +1,4 @@
+pub mod aggregate_spec;
 pub mod distributed_plan;
 pub mod distributed_validate;
 pub mod error;
@@ -10,6 +11,9 @@ pub mod physical_validate;
 pub mod translate;
 pub mod validate;
 
+pub use aggregate_spec::{
+    AggregateFunction, LogicalAggregateExpr, PhysicalAggregateExpr, PhysicalAggregateSpec,
+};
 pub use distributed_plan::{
     DistributedPhysicalPlan, DistributedStage, PartitionSpec, StageDependency,
     distributed_from_physical_plan,

@@ -523,7 +523,7 @@ fn normalize_projection_identifier(raw: &str) -> String {
         .to_string()
 }
 
-fn resolve_schema_column_index(schema: &Schema, requested: &str) -> Option<usize> {
+pub(crate) fn resolve_schema_column_index(schema: &Schema, requested: &str) -> Option<usize> {
     let requested = requested.trim();
     if requested.is_empty() {
         return None;

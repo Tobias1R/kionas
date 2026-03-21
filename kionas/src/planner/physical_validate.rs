@@ -106,6 +106,80 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         ));
     }
 
+    let aggregate_partial_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+        .count();
+    if aggregate_partial_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one aggregate partial operator".to_string(),
+        ));
+    }
+
+    let aggregate_final_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+        .count();
+    if aggregate_final_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one aggregate final operator".to_string(),
+        ));
+    }
+
+    if aggregate_partial_count != aggregate_final_count {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "aggregate partial/final operators must appear together".to_string(),
+        ));
+    }
+
+    if let Some(partial_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+    {
+        let final_index = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+            .ok_or_else(|| {
+                PlannerError::InvalidPhysicalPipeline(
+                    "aggregate final operator is required when aggregate partial is present"
+                        .to_string(),
+                )
+            })?;
+
+        if partial_index >= final_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear before aggregate final".to_string(),
+            ));
+        }
+
+        if final_index >= projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate final must appear before projection".to_string(),
+            ));
+        }
+
+        if partial_index == 0 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear after table scan".to_string(),
+            ));
+        }
+
+        if let Some(hash_join_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+            && partial_index < hash_join_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear after hash join".to_string(),
+            ));
+        }
+    }
+
     if let Some(join_index) = plan
         .operators
         .iter()
@@ -215,15 +289,22 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
                     "NestedLoopJoin".to_string(),
                 ));
             }
-            PhysicalOperator::AggregatePartial => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "AggregatePartial".to_string(),
-                ));
-            }
-            PhysicalOperator::AggregateFinal => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "AggregateFinal".to_string(),
-                ));
+            PhysicalOperator::AggregatePartial { spec }
+            | PhysicalOperator::AggregateFinal { spec } => {
+                if spec.aggregates.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "aggregate operator must include at least one aggregate expression"
+                            .to_string(),
+                    ));
+                }
+
+                for aggregate in &spec.aggregates {
+                    if aggregate.output_name.trim().is_empty() {
+                        return Err(PlannerError::InvalidPhysicalPipeline(
+                            "aggregate output name cannot be empty".to_string(),
+                        ));
+                    }
+                }
             }
             PhysicalOperator::ExchangeShuffle { .. } => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
@@ -296,14 +377,6 @@ mod tests {
             (
                 PhysicalOperator::NestedLoopJoin,
                 "NestedLoopJoin".to_string(),
-            ),
-            (
-                PhysicalOperator::AggregatePartial,
-                "AggregatePartial".to_string(),
-            ),
-            (
-                PhysicalOperator::AggregateFinal,
-                "AggregateFinal".to_string(),
             ),
             (
                 PhysicalOperator::ExchangeShuffle {
@@ -450,6 +523,27 @@ mod tests {
         );
 
         validate_physical_plan(&plan).expect("limit should be accepted in this phase");
+    }
+
+    #[test]
+    fn accepts_aggregate_partial_and_final_before_projection() {
+        let mut plan = base_valid_plan();
+        let spec = crate::planner::PhysicalAggregateSpec {
+            grouping_exprs: vec![PhysicalExpr::Raw {
+                sql: "country".to_string(),
+            }],
+            aggregates: vec![crate::planner::PhysicalAggregateExpr {
+                function: crate::planner::AggregateFunction::Count,
+                input: None,
+                output_name: "count".to_string(),
+            }],
+        };
+        plan.operators
+            .insert(1, PhysicalOperator::AggregatePartial { spec: spec.clone() });
+        plan.operators
+            .insert(2, PhysicalOperator::AggregateFinal { spec });
+
+        validate_physical_plan(&plan).expect("aggregate operators should be accepted");
     }
 
     #[test]
