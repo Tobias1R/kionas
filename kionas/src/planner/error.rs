@@ -15,6 +15,7 @@ pub enum PlannerError {
     InvalidDistributedPlan(String),
     UnsupportedPhysicalOperator(String),
     UnsupportedPredicate(String),
+    TypeCoercionViolation(String),
 }
 
 impl std::fmt::Display for PlannerError {
@@ -43,6 +44,9 @@ impl std::fmt::Display for PlannerError {
             }
             PlannerError::UnsupportedPredicate(message) => {
                 write!(f, "predicate is not supported in this phase: {}", message)
+            }
+            PlannerError::TypeCoercionViolation(message) => {
+                write!(f, "type coercion violation: {}", message)
             }
         }
     }

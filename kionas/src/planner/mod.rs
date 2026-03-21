@@ -3,6 +3,7 @@ pub mod distributed_plan;
 pub mod distributed_validate;
 pub mod error;
 pub mod explain;
+pub mod filter_type_checker;
 pub mod join_spec;
 pub mod logical_plan;
 pub mod physical_plan;

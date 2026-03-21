@@ -157,6 +157,7 @@ pub fn build_physical_plan_from_logical_plan(
     let physical = PhysicalPlan {
         operators,
         sql: plan.sql.clone(),
+        schema_metadata: None,
     };
 
     super::physical_validate::validate_physical_plan(&physical)?;

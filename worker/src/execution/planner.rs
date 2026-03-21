@@ -3,6 +3,7 @@ use kionas::planner::{
     PhysicalAggregateSpec, PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator,
     PhysicalPlan, PhysicalSortExpr,
 };
+use kionas::sql::datatypes::ColumnDatatypeSpec;
 use std::collections::HashMap;
 
 /// What: Executable subset extracted from validated physical operators.
@@ -10,12 +11,14 @@ use std::collections::HashMap;
 /// Inputs:
 /// - `filter_sql`: Optional raw SQL predicate for simple conjunction filtering.
 /// - `projection_exprs`: Ordered projection expressions from payload.
+/// - `schema_metadata`: Optional column type contract for Phase 9b type validation.
 ///
 /// Output:
 /// - Runtime projection/filter directives for the local worker pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimePlan {
     pub(crate) filter_sql: Option<String>,
+    pub(crate) schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
     pub(crate) join_spec: Option<PhysicalJoinSpec>,
     pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
     pub(crate) aggregate_final_spec: Option<PhysicalAggregateSpec>,
@@ -134,11 +137,29 @@ fn parse_pruning_eligibility(pruning_hints_json: Option<&str>) -> (bool, Option<
 /// What: Parse and extract executable runtime operators from validated physical plan payload.
 ///
 /// Inputs:
-/// - `task`: Query task containing canonical payload JSON.
+/// - `task`: Query task containing canonical payload JSON with physical plan data.
 ///
 /// Output:
-/// - Runtime plan that includes optional filter SQL and projection expressions.
+/// - Runtime plan that includes optional filter SQL, schema metadata, and other operator specs.
+///
+/// Details:
+/// - Schema metadata is extracted for Phase 9b type coercion validation.
+/// - If schema_metadata absent, filter execution skips type checking (interim behavior).
 pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, String> {
+    let payload: serde_json::Value =
+        serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
+
+    // Extract schema_metadata if present in payload (Phase 9b support)
+    let schema_metadata = if let Some(metadata_value) = payload.get("schema_metadata") {
+        match serde_json::from_value::<HashMap<String, ColumnDatatypeSpec>>(metadata_value.clone())
+        {
+            Ok(map) if !map.is_empty() => Some(map),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     let operators = extract_runtime_operators(task)?;
 
     let mut filter_sql = None;
@@ -192,6 +213,7 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
 
     Ok(RuntimePlan {
         filter_sql,
+        schema_metadata,
         join_spec,
         aggregate_partial_spec,
         aggregate_final_spec,

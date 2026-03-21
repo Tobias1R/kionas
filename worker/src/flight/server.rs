@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::state::SharedData;
 use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field, TimeUnit};

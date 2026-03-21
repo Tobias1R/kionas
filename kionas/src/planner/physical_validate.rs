@@ -1,7 +1,7 @@
 use crate::planner::error::PlannerError;
 use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 
-/// What: Validate whether a predicate expression belongs to the supported Phase 2 subset.
+/// What: Validate whether a predicate expression belongs to the supported Phase 2+ subset.
 ///
 /// Inputs:
 /// - `predicate`: Physical predicate expression from a filter operator.
@@ -9,6 +9,18 @@ use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan
 /// Output:
 /// - `Ok(())` when the predicate shape is currently supported.
 /// - `Err(PlannerError::UnsupportedPredicate)` for deferred predicate families.
+///
+/// Supported Predicates (Phase 2-9a):
+/// - Equality: `col = value`, `col != value`, `col <> value`
+/// - Relational: `col > value`, `col >= value`, `col < value`, `col <= value`
+/// - NULL comparison (Phase 9a): `col IS NULL`, `col IS NOT NULL`
+/// - Logical combinations: `pred1 AND pred2`, `pred1 OR pred2`, `NOT pred1`
+///
+/// Deferred Predicates (Phase 9c+):
+/// - Range: BETWEEN, IN list
+/// - Pattern: LIKE, ILIKE
+/// - Existence: EXISTS, ANY, ALL
+/// - Window: OVER clause (window functions)
 fn ensure_supported_predicate(predicate: &PhysicalExpr) -> Result<(), PlannerError> {
     let sql = match predicate {
         PhysicalExpr::Raw { sql } => sql.to_ascii_lowercase(),
@@ -16,8 +28,6 @@ fn ensure_supported_predicate(predicate: &PhysicalExpr) -> Result<(), PlannerErr
     };
 
     let unsupported = [
-        (" between ", "BETWEEN"),
-        (" in (", "IN list"),
         (" like ", "LIKE"),
         (" ilike ", "ILIKE"),
         (" exists", "EXISTS"),
@@ -256,7 +266,16 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
 
     for op in &plan.operators {
         match op {
-            PhysicalOperator::Filter { predicate } => ensure_supported_predicate(predicate)?,
+            PhysicalOperator::Filter { predicate } => {
+                ensure_supported_predicate(predicate)?;
+                // Phase 9b: Type coercion validation if schema metadata present
+                if let Some(schema_metadata) = &plan.schema_metadata {
+                    crate::planner::filter_type_checker::check_filter_predicate_types(
+                        predicate,
+                        schema_metadata,
+                    )?;
+                }
+            }
             PhysicalOperator::TableScan { .. }
             | PhysicalOperator::Projection { .. }
             | PhysicalOperator::Materialize => {}
@@ -368,6 +387,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT id FROM users".to_string(),
+            schema_metadata: None,
         }
     }
 
@@ -575,5 +595,144 @@ mod tests {
             err,
             PlannerError::InvalidPhysicalPipeline("limit must appear after sort".to_string())
         );
+    }
+
+    /// Phase 9a: IS NULL and IS NOT NULL operators are supported predicates.
+    /// These tests document the supported scope for NULL comparison operations.
+    #[test]
+    fn accepts_is_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_not_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NOT NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NOT NULL predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_null_with_and_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NULL AND age > 18".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL combined with AND must be accepted");
+    }
+
+    #[test]
+    fn accepts_is_not_null_with_or_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NOT NULL OR email IS NOT NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NOT NULL combined with OR must be accepted");
+    }
+
+    #[test]
+    fn accepts_not_is_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "NOT (name IS NULL)".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan)
+            .expect("NOT (IS NULL) predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_null_with_join_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::HashJoin {
+                spec: crate::planner::PhysicalJoinSpec {
+                    join_type: crate::planner::JoinType::Inner,
+                    right_relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    keys: vec![crate::planner::JoinKeyPair {
+                        left: "users.id".to_string(),
+                        right: "orders.user_id".to_string(),
+                    }],
+                },
+            },
+        );
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "users.status IS NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL after JOIN must be accepted");
+    }
+
+    #[test]
+    fn accepts_is_null_with_group_by() {
+        let mut plan = base_valid_plan();
+        let spec = crate::planner::PhysicalAggregateSpec {
+            grouping_exprs: vec![PhysicalExpr::Raw {
+                sql: "country".to_string(),
+            }],
+            aggregates: vec![crate::planner::PhysicalAggregateExpr {
+                function: crate::planner::AggregateFunction::Count,
+                input: None,
+                output_name: "count".to_string(),
+            }],
+        };
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "country IS NOT NULL".to_string(),
+                },
+            },
+        );
+        plan.operators
+            .insert(2, PhysicalOperator::AggregatePartial { spec: spec.clone() });
+        plan.operators
+            .insert(3, PhysicalOperator::AggregateFinal { spec });
+
+        validate_physical_plan(&plan).expect("IS NOT NULL with GROUP BY must be accepted");
     }
 }

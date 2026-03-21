@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 use sysinfo::{CpuExt, ProcessExt, System, SystemExt};
 
-const DEFAULT_REDIS_URL: &str = "redis://redis:6379/2";
+const DEFAULT_REDIS_URL: &str = "redis://kionas-redis:6379/2";
 const DASHBOARD_TTL_SECONDS: u64 = 120;
 const FRESHNESS_TARGET_SECONDS: u64 = 15;
 const DATA_VERSION: u32 = 1;
@@ -126,6 +126,7 @@ pub(crate) fn start(shared_data: SharedData) {
             }
         };
 
+        log::info!("Janitor loop started");
         publish_all_domains(&shared_data, &redis_pool).await;
         let mut interval = tokio::time::interval(Duration::from_secs(FRESHNESS_TARGET_SECONDS));
         loop {
@@ -147,11 +148,13 @@ pub(crate) fn start(shared_data: SharedData) {
 /// - Uses one shared Redis pool with multiplexed connections.
 /// - Errors are logged and converted into partial-failure envelopes per domain.
 async fn publish_all_domains(shared_data: &SharedData, redis_pool: &RedisPool) {
+    log::debug!("Janitor publish cycle started");
     publish_server_stats(shared_data, redis_pool).await;
     publish_sessions(shared_data, redis_pool).await;
     publish_tokens(shared_data, redis_pool).await;
     publish_workers(shared_data, redis_pool).await;
     publish_consul_summary(shared_data, redis_pool).await;
+    log::debug!("Janitor publish cycle completed");
 }
 
 /// What: Build the Redis pool used for dashboard snapshot publication.
@@ -175,6 +178,12 @@ fn redis_pool() -> Result<RedisPool, String> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_REDIS_POOL_SIZE);
+
+    log::info!(
+        "Janitor redis config resolved: url='{}', pool_size={}",
+        redis_url,
+        pool_size
+    );
 
     let manager = RedisConnectionManager { redis_url };
     deadpool::managed::Pool::builder(manager)
@@ -647,5 +656,12 @@ async fn publish_envelope<T: Serialize>(
     connection
         .set_ex::<&str, String, ()>(key, body, DASHBOARD_TTL_SECONDS)
         .await
-        .map_err(|error| format!("redis set_ex failed for {key}: {error}"))
+        .map_err(|error| format!("redis set_ex failed for {key}: {error}"))?;
+
+    log::debug!(
+        "Janitor published redis key '{}' with ttl={}s",
+        key,
+        DASHBOARD_TTL_SECONDS
+    );
+    Ok(())
 }

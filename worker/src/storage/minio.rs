@@ -222,7 +222,18 @@ impl MinioProvider {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+                .map_err(|e| {
+                    let code = e
+                        .as_service_error()
+                        .and_then(|se| se.code())
+                        .unwrap_or("unknown");
+                    let msg = format!(
+                        "s3 list_objects_v2 failed (bucket='{}', prefix='{}', code='{}'): {:?}",
+                        self.bucket, prefix, code, e
+                    );
+                    log::error!("{}", msg);
+                    Box::new(std::io::Error::other(msg)) as Box<dyn std::error::Error + Send + Sync>
+                })?;
             let contents = resp.contents();
             for c in contents.iter() {
                 if let Some(k) = c.key() {

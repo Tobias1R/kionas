@@ -1,7 +1,9 @@
 use crate::planner::aggregate_spec::PhysicalAggregateSpec;
 use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::{LogicalExpr, LogicalRelation};
+use crate::sql::datatypes::ColumnDatatypeSpec;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// What: Phase 2 physical expression model carried by physical operators.
 ///
@@ -109,13 +111,21 @@ impl PhysicalOperator {
 /// Inputs:
 /// - `operators`: Ordered operator pipeline.
 /// - `sql`: Canonical SQL string used for explain and diagnostics.
+/// - `schema_metadata`: Optional table column type contract for type coercion enforcement (Phase 9b+).
 ///
 /// Output:
 /// - Deterministic physical plan representation for query payload emission.
+///
+/// Details:
+/// - schema_metadata is optional for backward compatibility with existing queries.
+/// - When present, populated with ColumnDatatypeSpec entries mapping column names to type info.
+/// - Used by Filter validator and worker runtime for strict type coercion policies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PhysicalPlan {
     pub operators: Vec<PhysicalOperator>,
     pub sql: String,
+    #[serde(default)]
+    pub schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
 }
 
 impl From<&LogicalExpr> for PhysicalExpr {

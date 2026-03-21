@@ -222,6 +222,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT id FROM sales.public.users".to_string(),
+            schema_metadata: None,
         };
 
         let distributed = distributed_from_physical_plan(&plan);
@@ -269,6 +270,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT users.id FROM sales.public.users INNER JOIN sales.public.orders ON users.id = orders.user_id".to_string(),
+            schema_metadata: None,
         };
 
         let distributed = distributed_from_physical_plan(&plan);
@@ -321,6 +323,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT country, COUNT(*) FROM sales.public.users GROUP BY country".to_string(),
+            schema_metadata: None,
         };
 
         let distributed = distributed_from_physical_plan(&plan);

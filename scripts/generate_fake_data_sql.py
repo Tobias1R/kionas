@@ -135,15 +135,40 @@ def build_sql(
     products = build_products(row_count, rng)
     orders = build_orders(row_count, rng)
 
+    customers_dict = {
+        "id": "INT",
+        "name": "STRING",
+        "email": "STRING",
+        "city": "STRING",
+    }
+    
+    products_dict = {
+        "id": "INT",
+        "name": "STRING",
+        "category": "STRING",
+        "price_cents": "INT",
+    }
+    orders_dict = {
+        "id": "INT",
+        "customer_id": "INT",
+        "product_id": "INT",
+        "quantity": "INT",
+        "note": "STRING",
+    }
+
+    fields_customers = ", ".join(f"{col} {dtype}" for col, dtype in customers_dict.items())
+    fields_products = ", ".join(f"{col} {dtype}" for col, dtype in products_dict.items())
+    fields_orders = ", ".join(f"{col} {dtype}" for col, dtype in orders_dict.items())
+
     lines = [
         f"use warehouse {warehouse};",
         "",
         f"create database {database};",
         f"create schema {database}.{schema};",
         "",
-        f"create table {database}.{schema}.customers (id int, name string, email string, city string);",
-        f"create table {database}.{schema}.products (id int, name string, category string, price_cents int);",
-        f"create table {database}.{schema}.orders (id int, customer_id int, product_id int, quantity int, note string);",
+        f"create table {database}.{schema}.customers ({fields_customers});",
+        f"create table {database}.{schema}.products ({fields_products});",
+        f"create table {database}.{schema}.orders ({fields_orders});",
         "",
         f"-- generated rows per table: {row_count}",
         f"-- insert batch size: {batch_size}",
@@ -151,23 +176,28 @@ def build_sql(
         "",
     ]
 
+    insert_fields_customers = ", ".join(customers_dict.keys())
+    insert_fields_products = ", ".join(products_dict.keys())
+    insert_fields_orders = ", ".join(orders_dict.keys())
+
+
     for chunk in batched(customers, batch_size):
         lines.append(
-            f"insert into {database}.{schema}.customers values " + ", ".join(chunk) + ";"
+            f"insert into {database}.{schema}.customers ({insert_fields_customers}) values " + ", ".join(chunk) + ";"
         )
 
     lines.append("")
 
     for chunk in batched(products, batch_size):
         lines.append(
-            f"insert into {database}.{schema}.products values " + ", ".join(chunk) + ";"
+            f"insert into {database}.{schema}.products ({insert_fields_products}) values " + ", ".join(chunk) + ";"
         )
 
     lines.append("")
 
     for chunk in batched(orders, batch_size):
         lines.append(
-            f"insert into {database}.{schema}.orders values " + ", ".join(chunk) + ";"
+            f"insert into {database}.{schema}.orders ({insert_fields_orders}) values " + ", ".join(chunk) + ";"
         )
 
     lines.extend(
@@ -209,13 +239,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rows",
         type=int,
-        default=1000,
+        default=100000,
         help="Rows to generate per table.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=200,
+        default=2000,
         help="Number of rows per INSERT statement.",
     )
     parser.add_argument(

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+const SESSION_KEY_PREFIX: &str = "kionas:session";
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -103,21 +105,41 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    fn session_key(id: &str) -> String {
+        format!("{}:{}", SESSION_KEY_PREFIX, id)
+    }
+
+    fn session_key_pattern() -> String {
+        format!("{}:*", SESSION_KEY_PREFIX)
+    }
+
+    fn extract_id_from_key(key: &str) -> String {
+        key.strip_prefix(&format!("{}:", SESSION_KEY_PREFIX))
+            .unwrap_or(key)
+            .to_string()
+    }
+
     pub fn new() -> Self {
+        let redis_url = std::env::var("REDIS_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "redis://kionas-redis:6379/0".to_string());
+
         Self {
-            provider: SessionProvider::new("redis://redis:6379/0"),
+            provider: SessionProvider::new(&redis_url),
         }
     }
 
     pub async fn add_session(&self, session: Session) {
         println!("Add session: {:?}", session);
-        let key = session.get_id();
+        let key = Self::session_key(&session.get_id());
         let value = serde_json::to_string(&session).unwrap();
         self.provider.set(&key, &value).await.unwrap();
     }
 
     pub async fn get_session(&self, id: String) -> Option<Session> {
-        let value = self.provider.get(&id).await.unwrap();
+        let key = Self::session_key(&id);
+        let value = self.provider.get(&key).await.unwrap();
         match serde_json::from_str::<Session>(&value) {
             Ok(session) => Some(session),
             Err(_) => None,
@@ -125,7 +147,8 @@ impl SessionManager {
     }
 
     pub async fn remove_session(&self, id: String) {
-        self.provider.del(&id).await.unwrap();
+        let key = Self::session_key(&id);
+        self.provider.del(&key).await.unwrap();
     }
 
     pub async fn authenticate_session(&self, id: String, auth_token: String) -> bool {
@@ -137,7 +160,7 @@ impl SessionManager {
 
     // update session
     pub async fn update_session(&self, id: String, session: &mut Session) {
-        let key = id;
+        let key = Self::session_key(&id);
         let value = serde_json::to_string(&session).unwrap();
         self.provider.set(&key, &value).await.unwrap();
     }
@@ -145,15 +168,31 @@ impl SessionManager {
     // get token session
     pub async fn get_token_session(&self, token: String) -> Option<Session> {
         let mut sessions = HashMap::new();
-        let keys = self.provider.keys("*").await.unwrap();
+        let key_pattern = Self::session_key_pattern();
+        let keys = match self.provider.keys(&key_pattern).await {
+            Ok(keys) => keys,
+            Err(err) => {
+                log::warn!("failed to list session keys from redis: {err}");
+                return None;
+            }
+        };
         for key in keys {
-            let value = self.provider.get(&key).await.unwrap();
+            let value = match self.provider.get(&key).await {
+                Ok(value) => value,
+                Err(err) => {
+                    log::warn!("failed to load session key '{key}' from redis: {err}");
+                    continue;
+                }
+            };
             match serde_json::from_str::<Session>(&value) {
                 Ok(session) => {
                     let session = Arc::new(Mutex::new(session));
-                    sessions.insert(key, session);
+                    let session_id = Self::extract_id_from_key(&key);
+                    sessions.insert(session_id, session);
                 }
-                Err(_) => {}
+                Err(err) => {
+                    log::warn!("failed to deserialize session payload for key '{key}': {err}");
+                }
             }
         }
         for (_key, session) in sessions {
@@ -168,12 +207,29 @@ impl SessionManager {
     // list sessions
     pub async fn list_sessions(&self) -> Vec<Session> {
         let mut sessions = Vec::new();
-        let keys = self.provider.keys("*").await.unwrap();
+        let key_pattern = Self::session_key_pattern();
+        let keys = match self.provider.keys(&key_pattern).await {
+            Ok(keys) => keys,
+            Err(err) => {
+                log::warn!("failed to list sessions from redis: {err}");
+                return sessions;
+            }
+        };
+
         for key in keys {
-            let value = self.provider.get(&key).await.unwrap();
+            let value = match self.provider.get(&key).await {
+                Ok(value) => value,
+                Err(err) => {
+                    log::warn!("failed to read session key '{key}' from redis: {err}");
+                    continue;
+                }
+            };
+
             match serde_json::from_str::<Session>(&value) {
                 Ok(session) => sessions.push(session),
-                Err(_) => {}
+                Err(err) => {
+                    log::warn!("failed to deserialize session for key '{key}': {err}");
+                }
             }
         }
         sessions

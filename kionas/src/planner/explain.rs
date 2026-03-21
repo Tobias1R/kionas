@@ -261,6 +261,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT id FROM sales.public.users".to_string(),
+            schema_metadata: None,
         };
 
         let text = explain_physical_plan(&plan);

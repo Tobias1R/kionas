@@ -66,7 +66,8 @@ fn decodes_written_parquet() {
 
 #[test]
 fn applies_simple_int_filter() {
-    let filtered = apply_filter_pipeline(&[batch_two_rows()], "id > 1").expect("filter must run");
+    let filtered =
+        apply_filter_pipeline(&[batch_two_rows()], "id > 1", None).expect("filter must run");
     assert_eq!(filtered[0].num_rows(), 1);
 }
 
@@ -75,6 +76,7 @@ fn applies_timestamp_filter_with_quoted_literal() {
     let filtered = apply_filter_pipeline(
         &[batch_temporal_two_rows()],
         "occurred_at >= '2024-01-02T00:00:00Z'",
+        None,
     )
     .expect("timestamp filter must run");
 
@@ -83,8 +85,12 @@ fn applies_timestamp_filter_with_quoted_literal() {
 
 #[test]
 fn rejects_unquoted_temporal_filter_literal() {
-    let err = apply_filter_pipeline(&[batch_temporal_two_rows()], "occurred_at >= 1704067200000")
-        .expect_err("unquoted temporal literal must fail");
+    let err = apply_filter_pipeline(
+        &[batch_temporal_two_rows()],
+        "occurred_at >= 1704067200000",
+        None,
+    )
+    .expect_err("unquoted temporal literal must fail");
     assert!(err.contains("unsupported temporal filter literal"));
 }
 
@@ -177,7 +183,7 @@ fn rejects_unsupported_projection_expression() {
 
 #[test]
 fn rejects_unsupported_filter_column_expression() {
-    let err = apply_filter_pipeline(&[batch_two_rows()], "lower(name) = 'a'")
+    let err = apply_filter_pipeline(&[batch_two_rows()], "lower(name) = 'a'", None)
         .expect_err("complex filter lhs must be rejected");
     assert!(err.contains("unsupported filter column expression"));
 }

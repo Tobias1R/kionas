@@ -63,6 +63,8 @@ select id, name, email from bench.seed1.customers order by id limit 5;
 select * from bench.seed1.products order by id limit 15;
 select * from bench.seed1.orders order by id limit 5;
 
+
+
 -- group by
 select customer_id, count(*) as order_count from bench.seed1.orders group by customer_id order by order_count desc limit 5;
 select c3, sum(c4) as total_quantity from bench.seed1.orders group by c2 order by c4 desc limit 5;

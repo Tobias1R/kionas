@@ -20,6 +20,9 @@ enum FilterValue {
     Int(i64),
     Bool(bool),
     Str(String),
+    IntList(Vec<i64>),    // Phase 9c: IN with int list
+    StrList(Vec<String>), // Phase 9c: IN with string list
+    BoolList(Vec<bool>),  // Phase 9c: IN with bool list
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +33,11 @@ enum FilterOp {
     Ge,
     Lt,
     Le,
+    Between,    // Phase 9c: col BETWEEN lower AND upper
+    NotBetween, // Phase 9c: col NOT BETWEEN lower AND upper
+    In,         // Phase 9c: col IN (val1, val2, ...)
+    IsNull,     // Phase 9a: col IS NULL
+    IsNotNull,  // Phase 9a: col IS NOT NULL
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +45,8 @@ struct FilterClause {
     column: String,
     op: FilterOp,
     value: FilterValue,
+    // Phase 9c: Additional operand for BETWEEN (stores upper bound)
+    value2: Option<FilterValue>,
 }
 
 /// What: Execute validated query payload on the worker and materialize deterministic artifacts.
@@ -69,18 +79,283 @@ pub(crate) async fn execute_query_task(
     .await
 }
 
+/// What: Pre-validate filter predicate column types against schema before filter execution.
+///
+/// Inputs:
+/// - `filter_sql`: Raw SQL predicate string.
+/// - `schema_metadata`: Column type contract from physical plan.
+///
+/// Output:
+/// - Ok() if all predicates satisfy strict type coercion policy.
+/// - Err(...) if predicate references non-existent columns or violates type contract.
+///
+/// Details:
+/// - Phase 9b Step 6: Worker-side runtime type validation complements planner validation.
+/// - Phase 9b Step 8: Enhanced error messages with remediation suggestions and taxonomy
+/// - Enforces DecimalCoercionPolicy::Strict: operand type must match column type exactly.
+/// - NULL semantics: NULL operands are rejected here (NULL is not a type); IS NULL handled separately.
+/// - Supported patterns: IS NULL, IS NOT NULL, NOT (IS NULL), comparison operators (=, !=, <, >, <=, >=).
+/// - Error taxonomy:
+///   1. MissingColumn: Column not found in schema
+///   2. TypeMismatch: Operand type incompatible with column canonical_type
+///   3. UnsupportedLiteral: Literal value format not recognized
+fn validate_filter_predicates_types(
+    filter_sql: &str,
+    schema: &std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>,
+) -> Result<(), String> {
+    // Split by AND to get individual clauses
+    let clauses = split_case_insensitive(filter_sql, "AND");
+
+    for clause in clauses {
+        let trimmed = clause.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Check for IS NULL / IS NOT NULL / NOT (IS NULL) patterns (no type validation needed)
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.ends_with("is null") || lower.ends_with("is not null") {
+            // Extract column name before IS
+            let parts: Vec<&str> = lower.split_whitespace().collect();
+            if !parts.is_empty() {
+                let col_name = parts[0];
+                if !schema.contains_key(col_name) {
+                    return Err(format_type_error(
+                        "MissingColumn",
+                        col_name,
+                        "(any type)",
+                        "",
+                        "",
+                    ));
+                }
+            }
+            continue; // IS NULL patterns don't require type validation
+        }
+
+        if lower.starts_with("not") && lower.contains("is null") {
+            // Pattern: NOT (column IS NULL)
+            let inner = trimmed
+                .trim_start_matches("NOT")
+                .trim_start_matches("(")
+                .trim_end_matches(")")
+                .trim();
+            let parts: Vec<&str> = inner.split_whitespace().collect();
+            if !parts.is_empty() {
+                let col_name = parts[0];
+                if !schema.contains_key(col_name) {
+                    return Err(format_type_error(
+                        "MissingColumn",
+                        col_name,
+                        "(any type)",
+                        "",
+                        "",
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Comparison operators: validate type compatibility
+        // Try to parse as a filter clause (column op literal)
+        match parse_single_clause(trimmed) {
+            Ok((column, _op, literal)) => {
+                // Column must exist in schema
+                let col_spec = schema.get(&column).ok_or_else(|| {
+                    format_type_error("MissingColumn", &column, "(any type)", "", "")
+                })?;
+
+                // Get operand type from literal
+                let operand_type = infer_filter_literal_type(literal)
+                    .map_err(|_| format_type_error("UnsupportedLiteral", "", "", literal, ""))?;
+
+                // Check type compatibility with column canonical type
+                validate_type_compatibility(
+                    &column,
+                    &col_spec.canonical_type,
+                    &operand_type,
+                    literal,
+                )?;
+            }
+            Err(_) => {
+                // If parse fails, schema column existence validation is best-effort
+                let first_token = trimmed.split_whitespace().next().unwrap_or("");
+                if !first_token.starts_with('(')
+                    && !first_token.is_empty()
+                    && !schema.contains_key(first_token)
+                {
+                    return Err(format_type_error(
+                        "MissingColumn",
+                        first_token,
+                        "(any type)",
+                        "",
+                        "",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// What: Infer the type of a filter literal value.
+///
+/// Inputs:
+/// - `literal`: Raw literal string from filter predicate.
+///
+/// Output:
+/// - Type identifier: "bool", "int", "string"
+fn infer_filter_literal_type(literal: &str) -> Result<String, String> {
+    let trimmed = literal.trim();
+
+    if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
+        return Ok("bool".to_string());
+    }
+
+    if trimmed.parse::<i64>().is_ok() {
+        return Ok("int".to_string());
+    }
+
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        return Ok("string".to_string());
+    }
+
+    Err(format!(
+        "unsupported filter literal '{}': inferred type unknown",
+        trimmed
+    ))
+}
+
+/// What: Generate descriptive error message for type coercion violations with remediation suggestions.
+///
+/// Inputs:
+/// - `scenario`: Type of error (MissingColumn, TypeMismatch, UnsupportedLiteral)
+/// - `column`: Column name (may be empty for unsupported literal errors)
+/// - `column_type`: Expected column type specification
+/// - `operand_value`: Actual value in the filter predicate
+/// - `operand_type`: Actual inferred type from operand
+///
+/// Output:
+/// - Formatted error message with context and remediation guidance
+///
+/// Details:
+/// - Phase 9b Step 8 error taxonomy implementation
+/// - Error taxonomy scenarios:
+///   1. MissingColumn: Column not found in schema (remediation: check column name spelling)
+///   2. TypeMismatch: Operand type incompatible with column type (remediation: use CAST or adjust schema)
+///   3. UnsupportedLiteral: Literal value format not recognized (remediation: use quoted string or valid boolean/number)
+fn format_type_error(
+    scenario: &str,
+    column: &str,
+    column_type: &str,
+    operand_value: &str,
+    operand_type: &str,
+) -> String {
+    match scenario {
+        "MissingColumn" => {
+            format!(
+                "type coercion violation: column '{}' not found in schema. \
+                remediations: [verify column name spelling, check schema definition]",
+                column
+            )
+        }
+        "TypeMismatch" => {
+            format!(
+                "type coercion violation: column '{}' expects type '{}' but got value '{}' of type '{}'. \
+                remediations: [use CAST('{}' AS {}), update schema definition, adjust query predicate]",
+                column, column_type, operand_value, operand_type, operand_value, column_type
+            )
+        }
+        "UnsupportedLiteral" => {
+            format!(
+                "type coercion violation: unsupported filter literal '{}' (inferred type unknown). \
+                remediations: [quote string literals with single quotes, use 'true'/'false' for booleans, use unquoted numbers for integers]",
+                operand_value
+            )
+        }
+        _ => {
+            format!(
+                "type coercion violation: type mismatch for column '{}' (expected '{}', got '{}' of type '{}')",
+                column, column_type, operand_value, operand_type
+            )
+        }
+    }
+}
+
+/// What: Validate that operand type is compatible with column type under strict coercion policy.
+///
+/// Inputs:
+/// - `column`: Column name for error messages.
+/// - `column_type`: Canonical column type from schema.
+/// - `operand_type`: Inferred type from filter literal.
+/// - `operand_value`: Original value string for error messages.
+///
+/// Output:
+/// - Ok() if types compatible, Err(...) if violation with remediation suggestions.
+///
+/// Details:
+/// - Strict policy: operand type must match column type exactly (no implicit coercions).
+/// - Phase 9b Step 8: Enhanced error messages with remediation suggestions
+/// - Coercion compatibility:
+///   - int → matches int/int32/int16 columns
+///   - bool → matches bool columns
+///   - string → matches string/varchar columns
+///   - Others: strict mismatch
+fn validate_type_compatibility(
+    column: &str,
+    column_type: &str,
+    operand_type: &str,
+    operand_value: &str,
+) -> Result<(), String> {
+    let col_lower = column_type.to_ascii_lowercase();
+    let op_lower = operand_type.to_ascii_lowercase();
+
+    // Check compatibility matrix
+    let compatible = match op_lower.as_str() {
+        "int" => col_lower.contains("int"), // Matches int, int64, int32, int16
+        "bool" => col_lower == "bool",
+        "string" => col_lower.contains("string") || col_lower.contains("varchar"),
+        _ => false,
+    };
+
+    if !compatible {
+        return Err(format_type_error(
+            "TypeMismatch",
+            column,
+            column_type,
+            operand_value,
+            operand_type,
+        ));
+    }
+
+    Ok(())
+}
+
 /// What: Apply a simple conjunction filter pipeline to all input batches.
 ///
 /// Inputs:
 /// - `input`: Source batches.
 /// - `filter_sql`: Raw SQL predicate containing simple `AND` clauses.
+/// - `schema_metadata`: Optional column type contract for Phase 9b type validation.
 ///
 /// Output:
 /// - Filtered batches preserving input order.
-pub(crate) fn apply_filter_pipeline(
+///
+/// Details:
+/// - If schema_metadata provided, pre-validates types before filter evaluation.
+/// - If schema_metadata absent, skips type checking (Phase 9b interim behavior).
+pub fn apply_filter_pipeline(
     input: &[RecordBatch],
     filter_sql: &str,
+    schema_metadata: Option<
+        &std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>,
+    >,
 ) -> Result<Vec<RecordBatch>, String> {
+    // Phase 9b type validation: pre-check column types if schema_metadata present
+    if let Some(schema) = schema_metadata {
+        validate_filter_predicates_types(filter_sql, schema)?;
+    }
+
     let clauses = parse_filter_clauses(filter_sql)?;
     let mut out = Vec::with_capacity(input.len());
 
@@ -94,6 +369,109 @@ pub(crate) fn apply_filter_pipeline(
     Ok(out)
 }
 
+/// What: Split filter SQL by AND, respecting BETWEEN...AND and NOT BETWEEN...AND boundaries.
+fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut current_pos = 0;
+    let lower = filter_sql.to_ascii_lowercase();
+    let bytes = filter_sql.as_bytes();
+
+    while current_pos < filter_sql.len() {
+        // Check for NOT BETWEEN or BETWEEN pattern
+        let remaining_lower = &lower[current_pos..];
+        
+        // Try to find BETWEEN keyword
+        let between_pos = if let Some(pos) = remaining_lower.find(" between ") {
+            Some(current_pos + pos)
+        } else {
+            None
+        };
+
+        // Check if there's a NOT before BETWEEN
+        let mut clause_start = current_pos;
+        if let Some(b_pos) = between_pos {
+            // Check backwards from BETWEEN to find column start
+            let mut col_end = b_pos;
+            while col_end > clause_start && lower.as_bytes()[col_end - 1].is_ascii_whitespace() {
+                col_end -= 1;
+            }
+            
+            // Scan back for "NOT"
+            if col_end >= 4 && lower[col_end - 3..col_end].eq_ignore_ascii_case("not") {
+                // Could be NOT BETWEEN, find actual column start
+                let mut not_start = col_end - 3;
+                while not_start > clause_start && lower.as_bytes()[not_start - 1].is_ascii_whitespace() {
+                    not_start -= 1;
+                }
+                // Scan back to find column name or AND boundary
+                while not_start > clause_start
+                    && (lower.as_bytes()[not_start - 1].is_ascii_alphanumeric()
+                        || lower.as_bytes()[not_start - 1] == b'_')
+                {
+                    not_start -= 1;
+                }
+                
+                // Check if there's an AND before this position
+                let prefix = &lower[clause_start..not_start];
+                if let Some(and_pos) = prefix.rfind(" and ") {
+                    let clause = filter_sql[clause_start..clause_start + and_pos].trim().to_string();
+                    if !clause.is_empty() {
+                        clauses.push(clause);
+                    }
+                    clause_start = clause_start + and_pos + " and ".len();
+                }
+            }
+        }
+
+        // Now find the next AND that is NOT inside BETWEEN...AND
+        let mut next_and_pos = None;
+        let mut search_pos = clause_start;
+        
+        while search_pos < filter_sql.len() {
+            let remaining = &lower[search_pos..];
+            
+            // Find next AND
+            if let Some(and_idx) = remaining.find(" and ") {
+                let and_pos = search_pos + and_idx;
+                
+                // Check if this AND is inside a BETWEEN clause
+                let clause_section = &lower[clause_start..and_pos];
+                let between_count = clause_section.matches(" between ").count();
+                
+                // If there's an odd number of BETWEENs, we're inside one
+                if between_count % 2 == 0 {
+                    // This AND is outside BETWEEN
+                    next_and_pos = Some(and_pos);
+                    break;
+                } else {
+                    // This AND is inside BETWEEN, skip it and continue
+                    search_pos = and_pos + " and ".len();
+                }
+            } else {
+                // No more AND found
+                break;
+            }
+        }
+
+        if let Some(and_pos) = next_and_pos {
+            let clause = filter_sql[clause_start..and_pos].trim().to_string();
+            if !clause.is_empty() {
+                clauses.push(clause);
+            }
+            current_pos = and_pos + " and ".len();
+        } else {
+            // No more ANDs, take the rest
+            let clause = filter_sql[clause_start..].trim().to_string();
+            if !clause.is_empty() {
+                clauses.push(clause);
+            }
+            break;
+        }
+    }
+
+    clauses
+}
+
 /// What: Parse a restricted SQL predicate subset into executable clauses.
 ///
 /// Inputs:
@@ -101,6 +479,7 @@ pub(crate) fn apply_filter_pipeline(
 ///
 /// Output:
 /// - Ordered filter clauses combined with logical `AND`.
+/// - Phase 9c: Supports BETWEEN and IN predicates in addition to comparison operators
 fn parse_filter_clauses(filter_sql: &str) -> Result<Vec<FilterClause>, String> {
     if filter_sql.trim().is_empty() {
         return Err("filter predicate is empty".to_string());
@@ -114,18 +493,66 @@ fn parse_filter_clauses(filter_sql: &str) -> Result<Vec<FilterClause>, String> {
         return Err("filter predicate with OR is not supported in this phase".to_string());
     }
 
+    // Phase 9c: Use BETWEEN-aware AND split to preserve BETWEEN...AND boundaries
+    let raw_clauses = split_and_respecting_between(filter_sql);
+
     let mut clauses = Vec::new();
-    for raw_clause in split_case_insensitive(filter_sql, "AND") {
-        let clause = raw_clause.trim();
+    for clause in raw_clauses {
+        let clause = clause.trim();
         if clause.is_empty() {
             continue;
         }
 
+        let lower_clause = clause.to_ascii_lowercase();
+
+        // Phase 9a: Check for IS NULL / IS NOT NULL (must check before BETWEEN/IN)
+        if lower_clause.ends_with(" is not null") {
+            let column = extract_column_from_is_null_clause(clause, "IS NOT NULL")?;
+            clauses.push(FilterClause {
+                column,
+                op: FilterOp::IsNotNull,
+                value: FilterValue::Str("".to_string()),
+                value2: None,
+            });
+            continue;
+        }
+
+        if lower_clause.ends_with(" is null") {
+            let column = extract_column_from_is_null_clause(clause, "IS NULL")?;
+            clauses.push(FilterClause {
+                column,
+                op: FilterOp::IsNull,
+                value: FilterValue::Str("".to_string()),
+                value2: None,
+            });
+            continue;
+        }
+
+        // Phase 9c: Check for NOT BETWEEN pattern (must check before BETWEEN)
+        if lower_clause.contains(" not between ") {
+            clauses.push(parse_not_between_clause(clause)?);
+            continue;
+        }
+
+        // Phase 9c: Check for BETWEEN pattern
+        if lower_clause.contains(" between ") {
+            clauses.push(parse_between_clause(clause)?);
+            continue;
+        }
+
+        // Phase 9c: Check for IN pattern
+        if lower_clause.contains(" in (") {
+            clauses.push(parse_in_clause(clause)?);
+            continue;
+        }
+
+        // Standard comparison operators (Phase 9a/9b)
         let (column, op, literal) = parse_single_clause(clause)?;
         clauses.push(FilterClause {
             column,
             op,
             value: parse_filter_value(literal)?,
+            value2: None,
         });
     }
 
@@ -179,15 +606,62 @@ fn build_filter_mask(
 ///
 /// Output:
 /// - `true` when the row satisfies the clause.
+/// - Phase 9c: Handles BETWEEN and IN operators with type dispatch
 fn evaluate_clause_at_row(
     array: &ArrayRef,
     row_idx: usize,
     clause: &FilterClause,
 ) -> Result<bool, String> {
+    // Phase 9a: Handle IS NULL / IS NOT NULL before checking for null values
+    match clause.op {
+        FilterOp::IsNull => {
+            return Ok(array.is_null(row_idx));
+        }
+        FilterOp::IsNotNull => {
+            return Ok(!array.is_null(row_idx));
+        }
+        _ => {}
+    }
+
+    // For other operators, null values fail the predicate
     if array.is_null(row_idx) {
         return Ok(false);
     }
 
+    // Phase 9c: BETWEEN, NOT BETWEEN, and IN operators require special handling
+    match clause.op {
+        FilterOp::Between => {
+            if let Some(upper_value) = &clause.value2 {
+                return evaluate_between_at_row(
+                    array,
+                    row_idx,
+                    &clause.column,
+                    &clause.value,
+                    upper_value,
+                );
+            }
+            return Err("invalid BETWEEN: missing upper bound".to_string());
+        }
+        FilterOp::NotBetween => {
+            if let Some(upper_value) = &clause.value2 {
+                let result = evaluate_between_at_row(
+                    array,
+                    row_idx,
+                    &clause.column,
+                    &clause.value,
+                    upper_value,
+                )?;
+                return Ok(!result); // Negate BETWEEN result
+            }
+            return Err("invalid NOT BETWEEN: missing upper bound".to_string());
+        }
+        FilterOp::In => {
+            return evaluate_in_at_row(array, row_idx, &clause.column, &clause.value);
+        }
+        _ => {}
+    }
+
+    // Standard comparison operators (Phase 9a/9b)
     match (&clause.value, array.data_type()) {
         (FilterValue::Int(rhs), DataType::Int64) => {
             let lhs = downcast_required::<Int64Array>(array, "Int64")?.value(row_idx);
@@ -702,9 +1176,9 @@ fn is_identifier_segment(segment: &str) -> bool {
 
 fn parse_single_clause(input: &str) -> Result<(String, FilterOp, &str), String> {
     const OPS: [(&str, FilterOp); 6] = [
+        ("!=", FilterOp::Ne), // Check compound operators FIRST before single-char
         (">=", FilterOp::Ge),
         ("<=", FilterOp::Le),
-        ("!=", FilterOp::Ne),
         ("=", FilterOp::Eq),
         (">", FilterOp::Gt),
         ("<", FilterOp::Lt),
@@ -733,6 +1207,232 @@ fn parse_single_clause(input: &str) -> Result<(String, FilterOp, &str), String> 
     ))
 }
 
+/// What: Extract column name from IS NULL / IS NOT NULL clause.
+///
+/// Inputs:
+/// - `clause`: Raw clause string (e.g., "column_name IS NULL").
+/// - `keyword`: The keyword to strip ("IS NULL" or "IS NOT NULL").
+///
+/// Output:
+/// - Column name, normalized.
+fn extract_column_from_is_null_clause(clause: &str, keyword: &str) -> Result<String, String> {
+    let lower_clause = clause.to_ascii_lowercase();
+    let lower_keyword = keyword.to_ascii_lowercase();
+
+    if let Some(pos) = lower_clause.rfind(&lower_keyword) {
+        let column_part = clause[..pos].trim();
+        if !column_part.is_empty() && is_simple_identifier_reference(column_part) {
+            return Ok(normalize_projection_identifier(column_part));
+        }
+    }
+
+    Err(format!(
+        "invalid {} predicate '{}': expected 'column_name {}'",
+        keyword, clause, keyword
+    ))
+}
+
+/// What: Parse BETWEEN predicate: "column BETWEEN lower AND upper"
+///
+/// Inputs:
+/// - `clause`: Raw BETWEEN predicate string.
+///
+/// Output:
+/// - FilterClause with op=Between, value=lower bound, value2=upper bound
+fn parse_between_clause(clause: &str) -> Result<FilterClause, String> {
+    let lower_case = clause.to_ascii_lowercase();
+
+    // Locate BETWEEN keyword (UTF-8 safe: find the substring then extract positions)
+    if let Some(between_idx) = lower_case.find(" between ") {
+        let column_part = clause[..between_idx].trim();
+
+        // Everything after "BETWEEN " - use string operations instead of hardcoded byte offsets
+        let after_between_idx = between_idx + " between ".len();
+        let after_between = &clause[after_between_idx..];
+        let after_between_lower = after_between.to_ascii_lowercase();
+
+        // Find AND keyword that separates lower and upper bounds
+        if let Some(and_idx) = after_between_lower.find(" and ") {
+            let lower_part = after_between[..and_idx].trim();
+            let upper_part = after_between[and_idx + " and ".len()..].trim();
+
+            let column = normalize_projection_identifier(column_part);
+            let lower_value = parse_filter_value(lower_part)?;
+            let upper_value = parse_filter_value(upper_part)?;
+
+            return Ok(FilterClause {
+                column,
+                op: FilterOp::Between,
+                value: lower_value,
+                value2: Some(upper_value),
+            });
+        }
+    }
+
+    Err(format!(
+        "invalid BETWEEN predicate '{}': expected format 'column BETWEEN lower AND upper'",
+        clause
+    ))
+}
+
+/// What: Parse NOT BETWEEN predicate: "column NOT BETWEEN lower AND upper"
+///
+/// Inputs:
+/// - `clause`: Raw NOT BETWEEN predicate string.
+///
+/// Output:
+/// - FilterClause with op=NotBetween, value=lower bound, value2=upper bound
+fn parse_not_between_clause(clause: &str) -> Result<FilterClause, String> {
+    let lower_case = clause.to_ascii_lowercase();
+
+    // Locate NOT BETWEEN keyword
+    if let Some(not_between_idx) = lower_case.find(" not between ") {
+        let column_part = clause[..not_between_idx].trim();
+
+        // Everything after "NOT BETWEEN " 
+        let after_not_between_idx = not_between_idx + " not between ".len();
+        let after_not_between = &clause[after_not_between_idx..];
+        let after_not_between_lower = after_not_between.to_ascii_lowercase();
+
+        // Find AND keyword that separates lower and upper bounds
+        if let Some(and_idx) = after_not_between_lower.find(" and ") {
+            let lower_part = after_not_between[..and_idx].trim();
+            let upper_part = after_not_between[and_idx + " and ".len()..].trim();
+
+            let column = normalize_projection_identifier(column_part);
+            let lower_value = parse_filter_value(lower_part)?;
+            let upper_value = parse_filter_value(upper_part)?;
+
+            return Ok(FilterClause {
+                column,
+                op: FilterOp::NotBetween,
+                value: lower_value,
+                value2: Some(upper_value),
+            });
+        }
+    }
+
+    Err(format!(
+        "invalid NOT BETWEEN predicate '{}': expected format 'column NOT BETWEEN lower AND upper'",
+        clause
+    ))
+}
+
+/// What: Parse IN predicate: "column IN (val1, val2, ...)"
+///
+/// Inputs:
+/// - `clause`: Raw IN predicate string.
+///
+/// Output:
+/// - FilterClause with op=In, value=homogeneous list (IntList, StrList, or BoolList)
+fn parse_in_clause(clause: &str) -> Result<FilterClause, String> {
+    let lower_case = clause.to_ascii_lowercase();
+
+    // Pattern: "column IN (val1, val2, ...)"
+    if let Some(in_pos) = lower_case.find(" in (") {
+        let column_part = clause[..in_pos].trim();
+        let list_start = in_pos + 5; // " in (" is 5 chars
+        let after_in = &clause[list_start..];
+
+        // Find closing parenthesis
+        if let Some(close_paren) = after_in.rfind(')') {
+            let values_str = &after_in[..close_paren];
+            let column = normalize_projection_identifier(column_part);
+
+            // Parse value list, inferring type from first value
+            let values: Vec<&str> = values_str.split(',').map(|v| v.trim()).collect();
+
+            if values.is_empty() {
+                return Err(format!(
+                    "invalid IN predicate '{}': value list is empty",
+                    clause
+                ));
+            }
+
+            // Infer type from first value
+            let first_value = parse_filter_value(values[0])?;
+
+            // Parse all values and ensure homogeneity
+            match &first_value {
+                FilterValue::Int(_) => {
+                    let mut int_list = Vec::new();
+                    for val_str in &values {
+                        let parsed = parse_filter_value(val_str)?;
+                        match parsed {
+                            FilterValue::Int(i) => int_list.push(i),
+                            _ => {
+                                return Err(format!(
+                                    "invalid IN predicate '{}': mixed types in list",
+                                    clause
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(FilterClause {
+                        column,
+                        op: FilterOp::In,
+                        value: FilterValue::IntList(int_list),
+                        value2: None,
+                    });
+                }
+                FilterValue::Str(_) => {
+                    let mut str_list = Vec::new();
+                    for val_str in &values {
+                        let parsed = parse_filter_value(val_str)?;
+                        match parsed {
+                            FilterValue::Str(s) => str_list.push(s),
+                            _ => {
+                                return Err(format!(
+                                    "invalid IN predicate '{}': mixed types in list",
+                                    clause
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(FilterClause {
+                        column,
+                        op: FilterOp::In,
+                        value: FilterValue::StrList(str_list),
+                        value2: None,
+                    });
+                }
+                FilterValue::Bool(_) => {
+                    let mut bool_list = Vec::new();
+                    for val_str in &values {
+                        let parsed = parse_filter_value(val_str)?;
+                        match parsed {
+                            FilterValue::Bool(b) => bool_list.push(b),
+                            _ => {
+                                return Err(format!(
+                                    "invalid IN predicate '{}': mixed types in list",
+                                    clause
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(FilterClause {
+                        column,
+                        op: FilterOp::In,
+                        value: FilterValue::BoolList(bool_list),
+                        value2: None,
+                    });
+                }
+                _ => {
+                    return Err(format!(
+                        "invalid IN predicate '{}': unsupported list type",
+                        clause
+                    ));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "invalid IN predicate '{}': expected format 'column IN (val1, val2, ...)'",
+        clause
+    ))
+}
+
 fn parse_filter_value(raw: &str) -> Result<FilterValue, String> {
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("true") {
@@ -746,7 +1446,8 @@ fn parse_filter_value(raw: &str) -> Result<FilterValue, String> {
     }
 
     if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
-        return Ok(FilterValue::Str(trimmed[1..trimmed.len() - 1].to_string()));
+        let inner = trimmed[1..trimmed.len() - 1].trim().to_string();
+        return Ok(FilterValue::Str(inner));
     }
 
     Err(format!(
@@ -851,6 +1552,110 @@ fn parse_date64_filter_literal(raw: &str) -> Option<i64> {
     i64::try_from(millis).ok()
 }
 
+/// What: Evaluate BETWEEN predicate for a single row.
+///
+/// Inputs:
+/// - `array`: Column array to check
+/// - `row_idx`: Row index
+/// - `column`: Column name (for error messages)
+/// - `lower`: Lower bound FilterValue
+/// - `upper`: Upper bound FilterValue
+///
+/// Output:
+/// - `true` if lower <= value <= upper (both inclusive)
+fn evaluate_between_at_row(
+    array: &ArrayRef,
+    row_idx: usize,
+    column: &str,
+    lower: &FilterValue,
+    upper: &FilterValue,
+) -> Result<bool, String> {
+    match (lower, upper, array.data_type()) {
+        (FilterValue::Int(lower_val), FilterValue::Int(upper_val), DataType::Int64) => {
+            let lhs = downcast_required::<Int64Array>(array, "Int64")?.value(row_idx);
+            Ok(lhs >= *lower_val && lhs <= *upper_val)
+        }
+        (FilterValue::Int(lower_val), FilterValue::Int(upper_val), DataType::Int32) => {
+            let lhs = i64::from(downcast_required::<Int32Array>(array, "Int32")?.value(row_idx));
+            Ok(lhs >= *lower_val && lhs <= *upper_val)
+        }
+        (FilterValue::Int(lower_val), FilterValue::Int(upper_val), DataType::Int16) => {
+            let lhs = i64::from(downcast_required::<Int16Array>(array, "Int16")?.value(row_idx));
+            Ok(lhs >= *lower_val && lhs <= *upper_val)
+        }
+        (FilterValue::Str(lower_str), FilterValue::Str(upper_str), DataType::Utf8) => {
+            let lhs = downcast_required::<StringArray>(array, "Utf8")?.value(row_idx);
+            Ok(lhs >= lower_str.as_str() && lhs <= upper_str.as_str())
+        }
+        (FilterValue::Str(lower_str), FilterValue::Str(upper_str), DataType::Date32) => {
+            let lower_parsed = parse_date32_filter_literal(lower_str).ok_or_else(|| {
+                format!(
+                    "invalid Date32 lower bound '{}' for BETWEEN in column '{}'",
+                    lower_str, column
+                )
+            })?;
+            let upper_parsed = parse_date32_filter_literal(upper_str).ok_or_else(|| {
+                format!(
+                    "invalid Date32 upper bound '{}' for BETWEEN in column '{}'",
+                    upper_str, column
+                )
+            })?;
+            let lhs = i64::from(downcast_required::<Date32Array>(array, "Date32")?.value(row_idx));
+            Ok(lhs >= i64::from(lower_parsed) && lhs <= i64::from(upper_parsed))
+        }
+        _ => Err(format!(
+            "unsupported type combination for BETWEEN in column '{}': {:?}",
+            column,
+            array.data_type()
+        )),
+    }
+}
+
+/// What: Evaluate IN predicate for a single row.
+///
+/// Inputs:
+/// - `array`: Column array to check
+/// - `row_idx`: Row index
+/// - `column`: Column name (for error messages)
+/// - `value`: FilterValue containing the list (IntList, StrList, or BoolList)
+///
+/// Output:
+/// - `true` if column value is in the list
+fn evaluate_in_at_row(
+    array: &ArrayRef,
+    row_idx: usize,
+    column: &str,
+    value: &FilterValue,
+) -> Result<bool, String> {
+    match (value, array.data_type()) {
+        (FilterValue::IntList(list), DataType::Int64) => {
+            let lhs = downcast_required::<Int64Array>(array, "Int64")?.value(row_idx);
+            Ok(list.contains(&lhs))
+        }
+        (FilterValue::IntList(list), DataType::Int32) => {
+            let lhs = i64::from(downcast_required::<Int32Array>(array, "Int32")?.value(row_idx));
+            Ok(list.contains(&lhs))
+        }
+        (FilterValue::IntList(list), DataType::Int16) => {
+            let lhs = i64::from(downcast_required::<Int16Array>(array, "Int16")?.value(row_idx));
+            Ok(list.contains(&lhs))
+        }
+        (FilterValue::StrList(list), DataType::Utf8) => {
+            let lhs = downcast_required::<StringArray>(array, "Utf8")?.value(row_idx);
+            Ok(list.iter().any(|s| s.as_str() == lhs))
+        }
+        (FilterValue::BoolList(list), DataType::Boolean) => {
+            let lhs = downcast_required::<BooleanArray>(array, "Boolean")?.value(row_idx);
+            Ok(list.contains(&lhs))
+        }
+        _ => Err(format!(
+            "unsupported type for IN in column '{}': {:?}",
+            column,
+            array.data_type()
+        )),
+    }
+}
+
 fn compare_i64(lhs: i64, rhs: i64, op: FilterOp) -> bool {
     match op {
         FilterOp::Eq => lhs == rhs,
@@ -859,6 +1664,7 @@ fn compare_i64(lhs: i64, rhs: i64, op: FilterOp) -> bool {
         FilterOp::Ge => lhs >= rhs,
         FilterOp::Lt => lhs < rhs,
         FilterOp::Le => lhs <= rhs,
+        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 
@@ -870,6 +1676,7 @@ fn compare_bool(lhs: bool, rhs: bool, op: FilterOp) -> bool {
         FilterOp::Ge => lhs == rhs || (lhs && !rhs),
         FilterOp::Lt => !lhs && rhs,
         FilterOp::Le => lhs == rhs || (!lhs && rhs),
+        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 
@@ -881,6 +1688,7 @@ fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
         FilterOp::Ge => lhs >= rhs,
         FilterOp::Lt => lhs < rhs,
         FilterOp::Le => lhs <= rhs,
+        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 

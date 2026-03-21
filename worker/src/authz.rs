@@ -349,6 +349,7 @@ impl WorkerAuthorizer {
     ///
     /// Output:
     /// - Verified ticket claims.
+    #[allow(dead_code)]
     pub(crate) fn verify_signed_flight_ticket(
         &self,
         ticket: &str,

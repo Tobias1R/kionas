@@ -632,7 +632,7 @@ pub(crate) async fn execute_query_task(
     }
 
     if let Some(sql) = runtime_plan.filter_sql.as_deref() {
-        batches = apply_filter_pipeline(&batches, sql)?;
+        batches = apply_filter_pipeline(&batches, sql, runtime_plan.schema_metadata.as_ref())?;
     }
 
     if let Some(join_spec) = runtime_plan.join_spec.as_ref() {

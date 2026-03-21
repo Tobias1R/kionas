@@ -175,19 +175,103 @@ Lets discuss a new place for this code. They shouldnt be here in services
 
 
 
-7. Phase 7: Window foundation
+~~7. Phase 7: Window foundation [Already introduced with GROUP] ABANDONED
 7.1 Introduce minimal supported window semantics with explicit constraints.
 7.2 Add planner/runtime contracts for partition and frame metadata.
-7.3 Add observability hooks for window execution diagnostics.
+7.3 Add observability hooks for window execution diagnostics.~~
 
-8. Phase 8: QUALIFY
+8. Phase 8: QUALIFY - Deferred
 8.1 Add QUALIFY evaluation on top of window outputs.
 8.2 Ensure stable filtering semantics and actionable validation errors.
 8.3 Add explainability for post-window filtering behavior.
 
-9. Phase 9: Query part II
+9. Phase 9: Query part II - NULL semantics and type coercion
 9.1 Expand supported query semantics iteratively behind capability gates.
 9.2 Keep backward compatibility on response and handle contracts.
+9.3 Address silent correctness bugs through schema-driven type coercion policies.
+
+### Phase 9 Discovery
+- Identified 8 candidate improvements: IS/IS NOT, Type Coercion, BETWEEN/IN, Scalar Functions, CASE, Outer Joins, Subqueries, Window Functions.
+- Decision: Implement 3 core predicates sequentially (IS/IS NOT → Type Coercion → BETWEEN/IN).
+- Type coercion blocker example: string column accepts numeric literal 555 without error/coercion (source of silent correctness bugs).
+- Discovery document: [roadmaps/ROADMAP2/discovery/](roadmaps/ROADMAP2/discovery/) (pending consolidation)
+
+### Phase 9a: IS/IS NOT Operator (COMPLETE ✅)
+- Added IS NULL and IS NOT NULL predicate support across parser/planner/worker.
+- Created 15 integration test cases documenting NULL semantics in single-table, JOIN, GROUP BY, ORDER BY contexts.
+- Enhanced validator with 8 new tests showing IS/IS NOT acceptance phase-gated.
+- Evidence: [worker/src/tests/execution_is_operator_tests.rs](worker/src/tests/execution_is_operator_tests.rs)
+- Closure matrix: [roadmaps/ROADMAP2_PHASE9a_MATRIX.md](roadmaps/ROADMAP2_PHASE9a_MATRIX.md) (to be created on phase signoff)
+
+### Phase 9b: Type Coercion Enforcement (COMPLETE ✅)
+
+**9b Step 4-5: Schema Metadata & Validator (COMPLETE ✅)**
+- Extended PhysicalPlan struct with optional `schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>` field.
+- Updated all PhysicalPlan constructions (5 locations) to include schema_metadata initialization.
+- Created new module: [kionas/src/planner/filter_type_checker.rs](kionas/src/planner/filter_type_checker.rs) (150+ lines)
+  - Main validator: `check_filter_predicate_types(predicate, column_types) -> Result<(), PlannerError>`
+  - Recognizes Phase 9a patterns: IS NULL, IS NOT NULL, NOT (IS NULL)
+  - Recognizes Phase 9b patterns: Comparison operators (=, <, >, <=, >=, !=)
+  - Validates column existence against table schema
+- Added new error variant: `TypeCoercionViolation(String)` in [kionas/src/planner/error.rs](kionas/src/planner/error.rs)
+- Enhanced error messages with remediation guidance (format_planner_type_error function)
+- Integrated type checking into `validate_physical_plan()` with graceful fallback when schema_metadata absent.
+- 9 comprehensive test cases covering all predicate patterns and error paths (all passing).
+- Serialization compatible with existing JSON payloads via `#[serde(default)]`.
+- Quality gates: fmt ✓, check ✓, clippy ✓
+
+**9b Step 6-8: Worker Runtime, Tests & Error Taxonomy (COMPLETE ✅)**
+- Enhanced validate_filter_predicates_types() function (worker/src/services/query_execution.rs)
+  - Type inference helper: infer_filter_literal_type()
+  - Type compatibility validation: validate_type_compatibility() with Strict policy
+  - Pre-validates Filter operands before SQL evaluation
+  - Integrated into apply_filter_pipeline() with optional schema_metadata parameter
+- Created comprehensive test suite: [worker/tests/execution_type_coercion_tests.rs](worker/tests/execution_type_coercion_tests.rs)
+  - 18+ test cases (positive, negative, edge)
+  - Type-matching and type-mismatching scenarios
+  - Error message validation with remediation suggestions
+- Error taxonomy with scenario-based remediation:
+  - format_type_error() in worker (MissingColumn, TypeMismatch, UnsupportedLiteral)
+  - format_planner_type_error() in planner (same scenarios with context)
+  - Actionable remediation suggestions: CAST usage, schema adjustment, query correction
+- Quality gates: fmt ✓, check ✓, clippy ✓
+- **Closure matrix**: [roadmaps/ROADMAP2_PHASE9b_MATRIX.md](roadmaps/ROADMAP2_PHASE9b_MATRIX.md) (COMPLETE ✅)
+
+### Phase 9c: BETWEEN/IN Predicates (DISCOVERY COMPLETE ✅)
+- **Discovery document**: [roadmaps/ROADMAP2/discovery/discovery-phase9c.md](roadmaps/ROADMAP2/discovery/discovery-phase9c.md)
+- **Scope**: BETWEEN and IN predicate support with Type Coercion foundation (Phase 9b)
+- **Blockers**: None (all Phase 9b dependencies complete)
+- **Implementation plan**: 4 steps, 16-22 hours total
+  - Step 1: Planner support (BETWEEN/IN recognition, type validation) (COMPLETE ✅)
+  - Step 2: Worker execution (BETWEEN/IN evaluation, NULL semantics)
+  - Step 3: Error taxonomy (bounds validation, list homogeneity)
+  - Step 4: Integration testing (vertical slice validation)
+- **NULL semantics**: Documented for BETWEEN and IN per standard SQL
+- **Type safety**: Strict policy enforced; implicit coercions deferred
+
+**9c Step 1: Planner Support (COMPLETE ✅)**
+- Extended validate_raw_sql_predicate() in [kionas/src/planner/filter_type_checker.rs](kionas/src/planner/filter_type_checker.rs) to recognize BETWEEN and IN patterns
+- Added helper functions:
+  - `infer_operand_type(literal: &str) -> Option<String>`: Infers bool/int/string type from literal syntax
+  - `validate_between_predicate(sql, column_types) -> Result<>`: Validates BETWEEN syntax and type homogeneity of bounds
+  - `validate_in_predicate(sql, column_types) -> Result<>`: Validates IN syntax and type homogeneity of list values
+- Pattern recognition: Case-insensitive BETWEEN and IN keyword detection with proper parsing
+- Type validation: Enforces Strict policy; bounds/values must be type-compatible with column and homogeneous with each other
+- 14+ comprehensive test cases covering positive/negative scenarios:
+  - Accept BETWEEN with matching bound types (int, string)
+  - Accept IN with homogeneous value lists
+  - Reject BETWEEN/IN with missing columns
+  - Reject BETWEEN/IN with heterogeneous types (int vs string in list)
+  - Reject BETWEEN with invalid literal bounds
+  - Edge cases: empty IN lists, case-insensitive keywords, multiple spaces
+- Quality gates: fmt ✓, check ✓, clippy ✓
+- Plan document: [roadmaps/ROADMAP2/plans/plan-phase9c.md](roadmaps/ROADMAP2/plans/plan-phase9c.md)
+
+### Implementation Notes
+- Backward compatible: Phase 9a predicates remain supported; Phase 9b adds type validation layer.
+- Breaking change: Phase 9b will reject previously valid queries with type mismatches once server-side metadata population wired (Phase 9.5).
+- Deferred to Phase 9.5: Server-side schema metadata population (bridges PhysicalPlan creation and worker invocation).
+- Complex predicates (functions, WHERE id + 1 > 5) deferred to Phase 10.
 
 10. Phase 10: Query part III
 10.1 Complete remaining targeted query semantics for this roadmap line.
