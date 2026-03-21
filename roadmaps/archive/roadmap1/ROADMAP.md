@@ -1,4 +1,4 @@
-## Plan: Distributed Query Engine Roadmap
+## Plan: Distributed Query Engine Roadmap [X] ABANDONED. Please refer to ROADMAP2.md for the new roadmap structure and content.
 
 Build from the current working query-dispatch foundation into a full distributed query engine in staged, verifiable milestones: SQL AST intake is already live, operation=query dispatch is live, worker query handle stub is live, and structured query handle delivery is live. Next phases introduce logical planning, physical planning, Flight data plane, auth hardening, and coordinated distributed execution so more developers can contribute in parallel without architecture churn.
 
