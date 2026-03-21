@@ -8,6 +8,7 @@ members = [
     "tool",
     "metastore",
     "flight_proxy",
+    "ui_backend",
 ]
 
 [workspace.dependencies]

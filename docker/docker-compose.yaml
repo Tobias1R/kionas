@@ -197,8 +197,30 @@ services:
       - ..:/workspace:cached
     depends_on:
       - warehouse
-      
     command: ["bash", "-c", "while true; do sleep 1000; done" ]
+  # UI backend container
+  ui-backend:
+    image: docker-devcontainer
+    hostname: kionas-ui-backend
+    container_name: kionas-ui-backend
+    networks:
+      - warehouse_network
+    ports:
+      - 8081:8081
+    environment:
+      RUST_LOG: debug
+      RUST_BACKTRACE: full
+      KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
+      REDIS_URL: redis://kionas-redis:6379
+      UI_BACKEND_BIND: 0.0.0.0
+      UI_BACKEND_PORT: 8081
+    volumes:
+      - ..:/workspace:cached
+    depends_on:
+      - redis
+    command: ["bash", "-c", "cd /workspace; cargo run -p ui_backend"]
+    
 
   
 

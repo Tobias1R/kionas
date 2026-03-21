@@ -20,9 +20,9 @@ Planned.
 4. Define error taxonomy and fallback behavior for unavailable upstream domains.
 
 ### Phase B: UI backend endpoints
-1. Implement endpoint for aggregated dashboard snapshot.
-2. Add bounded timeouts and partial-response handling when one upstream source fails.
-3. Add lightweight health endpoint for frontend bootstrap checks.
+1. Implement a single read-only key endpoint for frontend polling: `GET /dashboard/key?name=<alias>`.
+2. Support allowlisted aliases (`server_stats`, `sessions`, `tokens`, `workers`, `consul_cluster_summary`) mapped to Redis dashboard keys.
+3. Return pass-through JSON payload when key exists and typed HTTP errors for invalid alias, missing key, and Redis failures.
 4. Keep all routes read-only in this phase.
 
 ### Phase C: Web dashboard
