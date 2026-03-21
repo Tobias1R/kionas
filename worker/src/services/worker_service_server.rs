@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use crate::state::SharedData;
 use std::sync::Arc;
 

@@ -116,10 +116,55 @@ Lets discuss a new place for this code. They shouldnt be here in services
 [X] DONE
 
 [INTERMISSION Code Cleanup - Server]
-[INTERMISSION Code Cleanup - Server - Tests]
+- src/core seems to be dead code. Confirm and remove if so.
+- Move statement-specific handlers from `server/src/statement_handler` to more focused modules (e.g. `server/src/statement_handler/ddl`, `server/src/statement_handler/dml`).
 - move all tests to server/src/tests/
+
+### Intermission Cleanup Resolution (Server)
+- Decision: remove dead `server/src/core`, group statement handlers by ownership, and move inline tests into `server/src/tests`.
+- Evidence (grouped handler modules):
+	- [server/src/statement_handler/ddl/mod.rs](server/src/statement_handler/ddl/mod.rs)
+	- [server/src/statement_handler/dml/mod.rs](server/src/statement_handler/dml/mod.rs)
+	- [server/src/statement_handler/query/mod.rs](server/src/statement_handler/query/mod.rs)
+	- [server/src/statement_handler/shared/mod.rs](server/src/statement_handler/shared/mod.rs)
+	- [server/src/statement_handler/utility/mod.rs](server/src/statement_handler/utility/mod.rs)
+- Evidence (dispatch rewiring): [server/src/statement_handler/mod.rs](server/src/statement_handler/mod.rs)
+- Evidence (tests moved):
+	- [server/src/tests/tasks_mod_tests.rs](server/src/tests/tasks_mod_tests.rs)
+	- [server/src/tests/services_warehouse_service_server_tests.rs](server/src/tests/services_warehouse_service_server_tests.rs)
+	- [server/src/tests/statement_handler_shared_distributed_dag_tests.rs](server/src/tests/statement_handler_shared_distributed_dag_tests.rs)
+	- [server/src/tests/statement_handler_query_select_tests.rs](server/src/tests/statement_handler_query_select_tests.rs)
+- Closure matrix: [roadmaps/ROADMAP2_INTERMISSION_SERVER_CLEANUP_MATRIX.md](roadmaps/ROADMAP2_INTERMISSION_SERVER_CLEANUP_MATRIX.md)
+[X] DONE
+
 [INTERMISSION Code Cleanup - Worker - Tests]
 - move all tests to worker/src/tests/
+
+### Intermission Cleanup Resolution (Worker - Tests)
+- Decision: relocate inline worker test modules into `worker/src/tests` with path-based test module wiring.
+- Evidence (tests moved):
+	- [worker/src/tests/authz_tests.rs](worker/src/tests/authz_tests.rs)
+	- [worker/src/tests/storage_exchange_tests.rs](worker/src/tests/storage_exchange_tests.rs)
+	- [worker/src/tests/execution_query_tests.rs](worker/src/tests/execution_query_tests.rs)
+	- [worker/src/tests/execution_pipeline_tests.rs](worker/src/tests/execution_pipeline_tests.rs)
+	- [worker/src/tests/execution_aggregate_mod_tests.rs](worker/src/tests/execution_aggregate_mod_tests.rs)
+	- [worker/src/tests/flight_server_tests.rs](worker/src/tests/flight_server_tests.rs)
+	- [worker/src/tests/services_query_execution_tests.rs](worker/src/tests/services_query_execution_tests.rs)
+	- [worker/src/tests/transactions_maestro_uri_tests.rs](worker/src/tests/transactions_maestro_uri_tests.rs)
+	- [worker/src/tests/transactions_maestro_insert_tests.rs](worker/src/tests/transactions_maestro_insert_tests.rs)
+- Evidence (source rewiring):
+	- [worker/src/authz.rs](worker/src/authz.rs)
+	- [worker/src/storage/exchange.rs](worker/src/storage/exchange.rs)
+	- [worker/src/execution/query.rs](worker/src/execution/query.rs)
+	- [worker/src/execution/pipeline.rs](worker/src/execution/pipeline.rs)
+	- [worker/src/execution/aggregate/mod.rs](worker/src/execution/aggregate/mod.rs)
+	- [worker/src/flight/server.rs](worker/src/flight/server.rs)
+	- [worker/src/services/query_execution.rs](worker/src/services/query_execution.rs)
+	- [worker/src/transactions/maestro.rs](worker/src/transactions/maestro.rs)
+- Validation note: quality gates passed with strict linting and compile checks (`cargo fmt --all`, `cargo check -p worker`, `cargo clippy -p worker --all-targets --all-features -- -D warnings`) after resolving dependency-side clippy blockers.
+- Closure matrix: [roadmaps/ROADMAP2_INTERMISSION_WORKER_TESTS_CLEANUP_MATRIX.md](roadmaps/ROADMAP2_INTERMISSION_WORKER_TESTS_CLEANUP_MATRIX.md)
+[X] DONE
+
 [INTERMISSION Code Cleanup - Kionas]
 [INTERMISSION Code Cleanup - Kionas - Tests]
 - move all tests to kionas/src/tests/

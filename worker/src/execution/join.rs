@@ -108,7 +108,7 @@ pub(crate) fn apply_hash_join_pipeline(
             .any(|left_field| left_field.name() == right_field.name())
         {
             right_field = Field::new(
-                &format!("{}_{}", spec.right_relation.table, right_field.name()),
+                format!("{}_{}", spec.right_relation.table, right_field.name()),
                 right_field.data_type().clone(),
                 right_field.is_nullable(),
             );
@@ -156,7 +156,7 @@ fn build_empty_join_batch(
             .any(|left_field| left_field.name() == next.name())
         {
             next = Field::new(
-                &format!("{}_{}", spec.right_relation.table, next.name()),
+                format!("{}_{}", spec.right_relation.table, next.name()),
                 next.data_type().clone(),
                 next.is_nullable(),
             );

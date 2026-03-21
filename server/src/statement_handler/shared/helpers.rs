@@ -257,7 +257,7 @@ pub async fn run_task_for_input_with_params(
 pub async fn run_stage_groups_for_input(
     shared_data: &SharedData,
     session_id: &str,
-    stage_groups: &[crate::statement_handler::distributed_dag::StageTaskGroup],
+    stage_groups: &[crate::statement_handler::shared::distributed_dag::StageTaskGroup],
     auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -268,8 +268,10 @@ pub async fn run_stage_groups_for_input(
         )));
     }
 
-    let mut groups_by_stage =
-        HashMap::<u32, Vec<crate::statement_handler::distributed_dag::StageTaskGroup>>::new();
+    let mut groups_by_stage = HashMap::<
+        u32,
+        Vec<crate::statement_handler::shared::distributed_dag::StageTaskGroup>,
+    >::new();
     let mut deps_by_stage = HashMap::<u32, Vec<u32>>::new();
     for group in stage_groups {
         groups_by_stage

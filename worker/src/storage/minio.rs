@@ -167,7 +167,7 @@ impl MinioProvider {
             Err(e) => {
                 // Log full debug information from the SDK error to aid diagnosis
                 log::error!("S3 put_object failed for {}/{}: {:?}", self.bucket, key, e);
-                return Err(Box::new(e));
+                Err(Box::new(e))
             }
         }
     }

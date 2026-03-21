@@ -16,7 +16,6 @@ pub mod interops_service {
 use kionas::config;
 use kionas::get_local_hostname;
 use kionas::utils::resolve_hostname;
-use log;
 use std::env;
 use std::error::Error;
 

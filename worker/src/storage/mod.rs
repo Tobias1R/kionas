@@ -8,6 +8,7 @@ pub mod minio;
 
 pub mod deltalake;
 pub mod exchange;
+#[allow(dead_code)]
 pub mod mock;
 pub mod object_store_adapter;
 pub mod object_store_pool;
@@ -35,6 +36,7 @@ pub trait StorageProvider: Send + Sync {
 }
 
 /// Put a serializable object as JSON into the provider.
+#[allow(dead_code)]
 pub async fn put_json<T: serde::Serialize>(
     provider: &Arc<dyn StorageProvider>,
     key: &str,
@@ -45,6 +47,7 @@ pub async fn put_json<T: serde::Serialize>(
 }
 
 /// Get and deserialize JSON from provider. Returns Ok(None) if the key does not exist.
+#[allow(dead_code)]
 pub async fn get_json<T: DeserializeOwned>(
     provider: &Arc<dyn StorageProvider>,
     key: &str,
@@ -71,7 +74,7 @@ pub async fn build_provider_from_cluster(
             {
                 let cfg = minio::MinioConfig::from_value(storage)?;
                 let prov = minio::MinioProvider::new(cfg).await?;
-                return Ok(Arc::new(prov));
+                Ok(Arc::new(prov))
             }
             #[cfg(not(feature = "storage-minio"))]
             {

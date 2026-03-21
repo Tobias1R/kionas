@@ -3,6 +3,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
 
 /// Spawn a background task that connects to `master` and sends a TaskUpdate.
 /// This mirrors the previous inline logic but centralizes it for reuse.
+#[allow(dead_code)]
 pub fn notify_task_update_in_background(
     master: String,
     ca_cert_path: Option<String>,

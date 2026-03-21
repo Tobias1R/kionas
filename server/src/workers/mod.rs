@@ -49,7 +49,7 @@ pub async fn acquire_channel_with_heartbeat(
 pub async fn send_task_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::TaskRequest,
-    auth_ctx: Option<&crate::statement_handler::helpers::DispatchAuthContext>,
+    auth_ctx: Option<&crate::statement_handler::shared::helpers::DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<
     crate::services::worker_service_client::worker_service::TaskResponse,

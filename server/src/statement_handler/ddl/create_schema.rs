@@ -1,6 +1,6 @@
 use crate::services::metastore_client::MetastoreClient;
 use crate::services::metastore_client::metastore_service as ms;
-use crate::statement_handler::helpers;
+use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::{Expr, ObjectName, SchemaName, SqlOption};
 

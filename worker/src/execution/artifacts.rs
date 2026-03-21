@@ -36,6 +36,7 @@ pub(crate) struct QueryArtifactMetadata {
 ///
 /// Output:
 /// - `Ok(())` when parquet artifact and metadata sidecar are written.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_stage_exchange_artifacts(
     shared: &SharedData,
     session_id: &str,

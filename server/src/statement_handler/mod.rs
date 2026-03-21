@@ -1,12 +1,8 @@
-pub(crate) mod create_database;
-pub(crate) mod create_schema;
-pub(crate) mod create_table;
-pub(crate) mod distributed_dag;
-pub(crate) mod helpers;
-pub(crate) mod insert;
-pub(crate) mod query_select;
-pub(crate) mod rbac;
-pub mod use_warehouse;
+pub(crate) mod ddl;
+pub(crate) mod dml;
+pub(crate) mod query;
+pub(crate) mod shared;
+pub(crate) mod utility;
 
 use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
@@ -103,16 +99,16 @@ pub async fn handle_statement(
 ) -> String {
     match stmt {
         Statement::Insert(insert_stmt) => {
-            insert::handle_insert_statement(shared_data, session_id, stmt, insert_stmt).await
+            dml::insert::handle_insert_statement(shared_data, session_id, stmt, insert_stmt).await
         }
         Statement::Query(_) => {
-            let ast = match query_select::select_ast_from_statement(stmt) {
+            let ast = match query::select::select_ast_from_statement(stmt) {
                 Ok(parsed_ast) => parsed_ast,
                 Err(e) => {
                     return format!("RESULT|VALIDATION|INVALID_QUERY_STATEMENT|{}", e);
                 }
             };
-            query_select::handle_select_query(shared_data, session_id, ctx, ast).await
+            query::select::handle_select_query(shared_data, session_id, ctx, ast).await
         }
         Statement::CreateSchema {
             schema_name,
@@ -122,10 +118,10 @@ pub async fn handle_statement(
             default_collate_spec,
             clone,
         } => {
-            create_schema::handle_create_schema(
+            ddl::create_schema::handle_create_schema(
                 shared_data,
                 session_id,
-                create_schema::CreateSchemaAst {
+                ddl::create_schema::CreateSchemaAst {
                     schema_name,
                     if_not_exists: *if_not_exists,
                     with: with.as_ref(),
@@ -137,10 +133,10 @@ pub async fn handle_statement(
             .await
         }
         Statement::CreateTable(create_table) => {
-            create_table::handle_create_table(
+            ddl::create_table::handle_create_table(
                 shared_data,
                 session_id,
-                create_table::CreateTableAst { create_table },
+                ddl::create_table::CreateTableAst { create_table },
             )
             .await
         }
@@ -168,10 +164,10 @@ pub async fn handle_statement(
             with_contacts,
             ..
         } => {
-            create_database::handle_create_database(
+            ddl::create_database::handle_create_database(
                 shared_data,
                 session_id,
-                create_database::CreateDatabaseAst {
+                ddl::create_database::CreateDatabaseAst {
                     db_name,
                     if_not_exists: *if_not_exists,
                     location: location.as_ref(),
@@ -211,7 +207,8 @@ pub async fn maybe_handle_direct_command(
     session_id: &str,
     shared_data: &SharedData,
 ) -> Option<String> {
-    if let Some(msg) = rbac::maybe_handle_rbac_direct_command(query, session_id, shared_data).await
+    if let Some(msg) =
+        utility::rbac::maybe_handle_rbac_direct_command(query, session_id, shared_data).await
     {
         return Some(msg);
     }
@@ -219,7 +216,7 @@ pub async fn maybe_handle_direct_command(
     let q_trim = query.trim();
     let q_lower = q_trim.to_lowercase();
     if q_lower.starts_with("use warehouse") {
-        match use_warehouse::handle_use_warehouse(q_trim, session_id, shared_data).await {
+        match utility::use_warehouse::handle_use_warehouse(q_trim, session_id, shared_data).await {
             Ok(msg) => return Some(msg),
             Err(e) => return Some(format!("ERROR: {}", e)),
         }

@@ -46,13 +46,12 @@ impl Manager for ObjectStoreManager {
         async move { object_store_from_config(&storage).await }
     }
 
-    fn recycle(
+    async fn recycle(
         &self,
         _obj: &mut Self::Type,
         _metrics: &Metrics,
-    ) -> impl std::future::Future<Output = Result<(), deadpool::managed::RecycleError<Self::Error>>> + Send
-    {
+    ) -> Result<(), deadpool::managed::RecycleError<Self::Error>> {
         // ObjectStore clients are stateless handles around pooled HTTP clients.
-        async move { Ok(()) }
+        Ok(())
     }
 }

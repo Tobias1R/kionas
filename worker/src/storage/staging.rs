@@ -23,7 +23,7 @@ pub async fn stage_tx(
         let task_id = t
             .get("task_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("task missing task_id"))?;
+            .ok_or_else(|| "task missing task_id".to_string())?;
         let key = format!("{}{}.json", base_key_prefix, task_id);
         let bytes = serde_json::to_vec_pretty(t)?;
         provider.put_object(&key, bytes).await.map_err(|e| {

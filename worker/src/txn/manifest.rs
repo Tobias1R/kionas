@@ -1,4 +1,4 @@
-/// Manifest types and key helpers for staging/final prefixes.
+//! Manifest types and key helpers for staging/final prefixes.
 
 /// Build full staging prefix: "staging/{staging_prefix}/{tx_id}/"
 pub fn staging_prefix_key(staging_prefix: &str, tx_id: &str) -> String {

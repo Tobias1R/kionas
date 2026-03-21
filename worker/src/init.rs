@@ -28,14 +28,16 @@ pub async fn init_worker(
         .services
         .interops
         .ok_or("missing services.interops in AppConfig")?;
-    let mut wi = kionas::consul::WorkerInfo::default();
-    wi.worker_id = worker_id.to_string();
-    wi.consul_url = cfg.consul_host.clone();
-    wi.tls_cert_path = interops.tls_cert.clone();
-    wi.tls_key_path = interops.tls_key.clone();
-    wi.ca_cert_path = interops.ca_cert.clone();
-    wi.interops_port = interops.port;
-    wi.interops_host = interops.host.clone();
+    let _wi = kionas::consul::WorkerInfo {
+        worker_id: worker_id.to_string(),
+        consul_url: cfg.consul_host.clone(),
+        server_url: cluster_info.master.clone(),
+        tls_cert_path: interops.tls_cert.clone(),
+        tls_key_path: interops.tls_key.clone(),
+        ca_cert_path: interops.ca_cert.clone(),
+        interops_port: interops.port,
+        interops_host: interops.host.clone(),
+    };
     // derive server_url (master) from cluster_info.master if available
     //let host = cluster_info.master.as_str();
 
@@ -83,9 +85,9 @@ pub async fn init_worker(
         host: local_hostname.clone(),
         port: worker_port as u32,
         server_url: master_addr.clone().to_string(),
-        tls_cert_path: tls_cert_path,
-        tls_key_path: tls_key_path,
-        ca_cert_path: ca_cert_path,
+        tls_cert_path,
+        tls_key_path,
+        ca_cert_path,
     };
     let _shared_data = state::SharedData::new(worker_info.clone(), cluster_info.clone());
 

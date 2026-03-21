@@ -85,32 +85,8 @@ fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Optio
 }
 
 #[cfg(test)]
-mod tests {
-    use super::derive_table_uri_from_storage;
-    use serde_json::json;
-
-    #[test]
-    fn derive_insert_uri_uses_canonical_three_part_layout() {
-        let storage = json!({ "bucket": "warehouse" });
-        let uri = derive_table_uri_from_storage(&storage, "testdb_4.testschema_2.testtable_2")
-            .expect("uri must be derived");
-        assert_eq!(
-            uri,
-            "s3://warehouse/databases/testdb_4/schemas/testschema_2/tables/testtable_2"
-        );
-    }
-
-    #[test]
-    fn derive_insert_uri_normalizes_quoted_three_part_layout() {
-        let storage = json!({ "bucket": "warehouse" });
-        let uri = derive_table_uri_from_storage(&storage, "\"TestDB\".\"Schema\".\"Table\"")
-            .expect("uri must be derived");
-        assert_eq!(
-            uri,
-            "s3://warehouse/databases/testdb/schemas/schema/tables/table"
-        );
-    }
-}
+#[path = "../tests/transactions_maestro_uri_tests.rs"]
+mod uri_tests;
 
 /// What: Parse an INSERT SQL payload into table metadata and row values.
 ///
@@ -974,25 +950,25 @@ pub async fn handle_execute_task(
     } else {
         HashMap::new()
     };
-    if operation == "insert" {
-        if let (Some(task), Some(parsed)) = (first_task.as_ref(), parsed_insert.as_ref()) {
-            let required_columns =
-                crate::transactions::constraints::insert_not_null::parse_required_not_null_columns(
-                    task,
-                );
-            if let Err(message) =
-                crate::transactions::constraints::insert_not_null::enforce_not_null_columns(
-                    task,
-                    parsed,
-                    &required_columns,
-                )
-            {
-                return crate::services::worker_service_server::worker_service::TaskResponse {
-                    status: "error".to_string(),
-                    error: message,
-                    result_location: String::new(),
-                };
-            }
+    if operation == "insert"
+        && let (Some(task), Some(parsed)) = (first_task.as_ref(), parsed_insert.as_ref())
+    {
+        let required_columns =
+            crate::transactions::constraints::insert_not_null::parse_required_not_null_columns(
+                task,
+            );
+        if let Err(message) =
+            crate::transactions::constraints::insert_not_null::enforce_not_null_columns(
+                task,
+                parsed,
+                &required_columns,
+            )
+        {
+            return crate::services::worker_service_server::worker_service::TaskResponse {
+                status: "error".to_string(),
+                error: message,
+                result_location: String::new(),
+            };
         }
     }
     let table_name_override = first_task
@@ -1163,53 +1139,5 @@ pub async fn handle_execute_task(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        normalize_decimal_literal, parse_datetime_literal, parse_insert_column_type_hints,
-    };
-    use crate::services::worker_service_server::worker_service;
-    use std::collections::HashMap;
-
-    fn task_with_params(params: HashMap<String, String>) -> worker_service::Task {
-        worker_service::Task {
-            task_id: "t1".to_string(),
-            operation: "insert".to_string(),
-            input: String::new(),
-            output: String::new(),
-            params,
-        }
-    }
-
-    #[test]
-    fn rejects_datetime_literal_with_timezone_offset() {
-        let err = parse_datetime_literal("'2024-01-01T00:00:00+02:00'")
-            .expect_err("datetime timezone offsets must be rejected");
-        assert!(err.contains("DATETIME_TIMEZONE_NOT_ALLOWED"));
-    }
-
-    #[test]
-    fn normalizes_decimal_literal_with_scale_padding() {
-        let normalized = normalize_decimal_literal("'10.5'", Some((6, 3)))
-            .expect("decimal coercion should normalize value");
-        assert_eq!(normalized, "10.500");
-    }
-
-    #[test]
-    fn rejects_decimal_literal_exceeding_precision() {
-        let err = normalize_decimal_literal("'1234.56'", Some((5, 2)))
-            .expect_err("precision overflow should fail");
-        assert!(err.contains("DECIMAL_COERCION_FAILED"));
-        assert!(err.contains("exceeds precision"));
-    }
-
-    #[test]
-    fn rejects_missing_type_hints_in_contract_mode() {
-        let mut params = HashMap::new();
-        params.insert("datatype_contract_version".to_string(), "1".to_string());
-        let task = task_with_params(params);
-
-        let err = parse_insert_column_type_hints(&task)
-            .expect_err("contract mode should require type hints payload");
-        assert!(err.contains("INSERT_TYPE_HINTS_MALFORMED"));
-    }
-}
+#[path = "../tests/transactions_maestro_insert_tests.rs"]
+mod insert_tests;
