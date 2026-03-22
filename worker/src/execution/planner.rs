@@ -567,34 +567,84 @@ fn extract_runtime_operators(task: &worker_service::Task) -> Result<Vec<Physical
 /// - `task`: Query task metadata and params.
 ///
 /// Output:
-/// - Stage execution context with deterministic defaults.
-pub(crate) fn stage_execution_context(task: &worker_service::Task) -> StageExecutionContext {
-    let stage_id = task
-        .params
-        .get("stage_id")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+/// - Stage execution context with deterministic defaults or contextual validation failure.
+pub(crate) fn stage_execution_context(
+    task: &worker_service::Task,
+) -> Result<StageExecutionContext, String> {
+    let is_staged_task = task.params.contains_key("stage_id")
+        || task.params.contains_key("partition_index")
+        || task.params.contains_key("partition_count")
+        || task.params.contains_key("upstream_stage_ids");
+
+    let stage_id = if is_staged_task {
+        task.params
+            .get("stage_id")
+            .ok_or_else(|| {
+                format!(
+                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id missing for task_id={}",
+                    task.task_id
+                )
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                format!(
+                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id invalid for task_id={}",
+                    task.task_id
+                )
+            })?
+    } else {
+        0
+    };
     let upstream_stage_ids = task
         .params
         .get("upstream_stage_ids")
         .and_then(|value| serde_json::from_str::<Vec<u32>>(value).ok())
         .unwrap_or_default();
-    let partition_count = task
-        .params
-        .get("partition_count")
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
+    let partition_count = if is_staged_task {
+        task.params
+            .get("partition_count")
+            .ok_or_else(|| {
+                format!(
+                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: partition_count missing for task_id={} stage_id={}",
+                    task.task_id, stage_id
+                )
+            })?
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                format!(
+                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: partition_count invalid for task_id={} stage_id={}",
+                    task.task_id, stage_id
+                )
+            })?
+    } else {
+        1
+    };
     let upstream_partition_counts = task
         .params
         .get("upstream_partition_counts")
         .and_then(|value| serde_json::from_str::<HashMap<u32, u32>>(value).ok())
         .unwrap_or_default();
-    let partition_index = task
-        .params
-        .get("partition_index")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
+    let partition_index = if is_staged_task {
+        task.params
+            .get("partition_index")
+            .ok_or_else(|| {
+                format!(
+                    "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING: partition_index missing for task_id={} stage_id={}",
+                    task.task_id, stage_id
+                )
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                format!(
+                    "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING: partition_index invalid for task_id={} stage_id={}",
+                    task.task_id, stage_id
+                )
+            })?
+    } else {
+        0
+    };
     let query_run_id = task
         .params
         .get("query_run_id")
@@ -623,7 +673,7 @@ pub(crate) fn stage_execution_context(task: &worker_service::Task) -> StageExecu
         ..scan_hints
     };
 
-    StageExecutionContext {
+    Ok(StageExecutionContext {
         stage_id,
         upstream_stage_ids,
         upstream_partition_counts,
@@ -631,5 +681,5 @@ pub(crate) fn stage_execution_context(task: &worker_service::Task) -> StageExecu
         partition_index,
         query_run_id,
         scan_hints,
-    }
+    })
 }

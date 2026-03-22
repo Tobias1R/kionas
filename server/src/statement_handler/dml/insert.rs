@@ -19,47 +19,110 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
     )
 }
 
+fn parse_structured_outcome(err: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = err.splitn(4, '|');
+    let prefix = parts.next()?;
+    if prefix != OUTCOME_PREFIX {
+        return None;
+    }
+    let category = parts.next()?;
+    let code = parts.next()?;
+    let message = parts.next().unwrap_or_default();
+    Some((category, code, message))
+}
+
 fn map_insert_dispatch_error(err: &str) -> (&'static str, &'static str) {
+    if let Some((category, _code, _message)) = parse_structured_outcome(err)
+        && matches!(
+            category,
+            "VALIDATION" | "CONSTRAINT" | "EXECUTION" | "INFRA"
+        )
+    {
+        return match category {
+            "VALIDATION" => ("VALIDATION", "VALIDATION_INSERT_DISPATCH_FAILED"),
+            "CONSTRAINT" => ("CONSTRAINT", "CONSTRAINT_INSERT_DISPATCH_FAILED"),
+            "EXECUTION" => ("EXECUTION", "EXECUTION_INSERT_DISPATCH_FAILED"),
+            _ => ("INFRA", "INFRA_INSERT_DISPATCH_FAILED"),
+        };
+    }
+
+    let rules: [(&str, &str, &str); 8] = [
+        (
+            "temporal_literal_invalid",
+            "VALIDATION",
+            "VALIDATION_TEMPORAL_LITERAL_INVALID",
+        ),
+        (
+            "datetime_timezone_not_allowed",
+            "VALIDATION",
+            "VALIDATION_DATETIME_TIMEZONE_NOT_ALLOWED",
+        ),
+        (
+            "decimal_coercion_failed",
+            "VALIDATION",
+            "VALIDATION_DECIMAL_COERCION_FAILED",
+        ),
+        (
+            "insert_type_hints_malformed",
+            "VALIDATION",
+            "VALIDATION_INSERT_TYPE_HINTS_MALFORMED",
+        ),
+        (
+            "not null constraint violated",
+            "CONSTRAINT",
+            "CONSTRAINT_NOT_NULL_VIOLATION",
+        ),
+        (
+            "missing not null column",
+            "CONSTRAINT",
+            "CONSTRAINT_NOT_NULL_COLUMNS_MISSING",
+        ),
+        (
+            "table not found",
+            "VALIDATION",
+            "VALIDATION_TABLE_NOT_FOUND",
+        ),
+        (
+            "register_object_store",
+            "INFRA",
+            "INFRA_INSERT_OBJECT_STORE_UNAVAILABLE",
+        ),
+    ];
+
     let lower = err.to_ascii_lowercase();
-    if lower.contains("temporal_literal_invalid") {
-        return ("VALIDATION", "TEMPORAL_LITERAL_INVALID");
+    for (needle, category, code) in rules {
+        if lower.contains(needle) {
+            return (category, code);
+        }
     }
-    if lower.contains("datetime_timezone_not_allowed") {
-        return ("VALIDATION", "DATETIME_TIMEZONE_NOT_ALLOWED");
-    }
-    if lower.contains("decimal_coercion_failed") {
-        return ("VALIDATION", "DECIMAL_COERCION_FAILED");
-    }
-    if lower.contains("insert_type_hints_malformed") {
-        return ("VALIDATION", "INSERT_TYPE_HINTS_MALFORMED");
-    }
-    if lower.contains("not null constraint violated") {
-        return ("VALIDATION", "CONSTRAINT_NOT_NULL_VIOLATION");
-    }
-    if lower.contains("missing not null column") {
-        return ("VALIDATION", "CONSTRAINT_NOT_NULL_COLUMNS_MISSING");
-    }
-    if lower.contains("table not found") {
-        return ("VALIDATION", "TABLE_NOT_FOUND");
-    }
-    ("INFRA", "INSERT_DISPATCH_FAILED")
+
+    ("INFRA", "INFRA_INSERT_DISPATCH_FAILED")
 }
 
 fn normalize_insert_error_message(code: &str, err: &str) -> String {
     match code {
-        "TEMPORAL_LITERAL_INVALID" => err.to_string(),
-        "DATETIME_TIMEZONE_NOT_ALLOWED" => err.to_string(),
-        "DECIMAL_COERCION_FAILED" => err.to_string(),
-        "INSERT_TYPE_HINTS_MALFORMED" => err.to_string(),
-        "CONSTRAINT_NOT_NULL_VIOLATION" => err.to_string(),
-        "CONSTRAINT_NOT_NULL_COLUMNS_MISSING" => err.to_string(),
-        "TABLE_NOT_FOUND" => {
+        "VALIDATION_TEMPORAL_LITERAL_INVALID"
+        | "VALIDATION_DATETIME_TIMEZONE_NOT_ALLOWED"
+        | "VALIDATION_DECIMAL_COERCION_FAILED"
+        | "VALIDATION_INSERT_TYPE_HINTS_MALFORMED"
+        | "CONSTRAINT_NOT_NULL_VIOLATION"
+        | "CONSTRAINT_NOT_NULL_COLUMNS_MISSING"
+        | "INFRA_INSERT_OBJECT_STORE_UNAVAILABLE" => err.to_string(),
+        "VALIDATION_TABLE_NOT_FOUND" => {
             if let Some(idx) = err.to_ascii_lowercase().find("table not found") {
                 return err[idx..].to_string();
             }
             "table not found".to_string()
         }
-        "INSERT_DISPATCH_FAILED" => format!("insert dispatch failed: {}", err),
+        "VALIDATION_INSERT_DISPATCH_FAILED"
+        | "CONSTRAINT_INSERT_DISPATCH_FAILED"
+        | "EXECUTION_INSERT_DISPATCH_FAILED"
+        | "INFRA_INSERT_DISPATCH_FAILED" => {
+            if let Some((_category, _code, message)) = parse_structured_outcome(err) {
+                return message.to_string();
+            }
+            format!("insert dispatch failed: {}", err)
+        }
         _ => err.to_string(),
     }
 }
@@ -344,3 +407,7 @@ pub(crate) async fn handle_insert_statement(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/statement_handler_dml_insert_tests.rs"]
+mod tests;

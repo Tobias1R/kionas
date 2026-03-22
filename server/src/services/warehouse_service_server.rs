@@ -36,13 +36,8 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
     let mut parts = result.splitn(4, '|');
     let prefix = parts.next().unwrap_or_default();
     if prefix != "RESULT" {
-        if result.starts_with("Failed")
-            || result.starts_with("Domain validation failed")
-            || result.starts_with("Unsupported")
-        {
-            resp.status = "ERROR".to_string();
-            resp.error_code = "INFRA_GENERIC".to_string();
-        }
+        resp.status = "ERROR".to_string();
+        resp.error_code = "INFRA_GENERIC".to_string();
         resp.message = result.to_string();
         return;
     }
@@ -64,13 +59,17 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
             resp.status = "OK".to_string();
             resp.error_code = "0".to_string();
         }
-        "VALIDATION" => {
+        "VALIDATION" | "CONSTRAINT" | "EXECUTION" | "INFRA" => {
             resp.status = "ERROR".to_string();
-            resp.error_code = format!("BUSINESS_{}", code);
+            if code.starts_with(category) {
+                resp.error_code = code.to_string();
+            } else {
+                resp.error_code = format!("{}_{}", category, code);
+            }
         }
         _ => {
             resp.status = "ERROR".to_string();
-            resp.error_code = format!("INFRA_{}", code);
+            resp.error_code = "INFRA_UNKNOWN_CATEGORY".to_string();
         }
     }
 }

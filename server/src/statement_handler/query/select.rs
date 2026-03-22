@@ -14,8 +14,8 @@ use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
     VALIDATION_CODE_UNSUPPORTED_OPERATOR, VALIDATION_CODE_UNSUPPORTED_PIPELINE,
-    VALIDATION_CODE_UNSUPPORTED_PREDICATE, build_select_query_model,
-    validation_code_for_query_error,
+    VALIDATION_CODE_UNSUPPORTED_PREDICATE, VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+    build_select_query_model, validation_code_for_query_error,
 };
 use kionas::{config, parse_env_vars};
 use serde_json::{Value, json};
@@ -70,7 +70,7 @@ fn validation_code_for_planner_error(err: &kionas::planner::PlannerError) -> &'s
         kionas::planner::PlannerError::UnsupportedPredicate(_) => {
             VALIDATION_CODE_UNSUPPORTED_PREDICATE
         }
-        _ => "UNSUPPORTED_QUERY_SHAPE",
+        _ => VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
     }
 }
 
@@ -569,7 +569,7 @@ pub(crate) async fn handle_select_query(
                 } else {
                     return format_outcome(
                         "VALIDATION",
-                        "UNSUPPORTED_QUERY_SHAPE",
+                        VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
                         format!("failed to build logical plan: {}", message),
                     );
                 }

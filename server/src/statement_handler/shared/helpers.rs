@@ -5,6 +5,98 @@ use std::error::Error;
 use crate::workers::PooledConn;
 use uuid::Uuid;
 
+const OUTCOME_PREFIX: &str = "RESULT";
+
+fn format_outcome(category: &str, code: &str, message: &str) -> String {
+    format!("{}|{}|{}|{}", OUTCOME_PREFIX, category, code, message)
+}
+
+fn is_staged_query_params(params: &HashMap<String, String>) -> bool {
+    params.contains_key("stage_id")
+        || params.contains_key("partition_index")
+        || params.contains_key("partition_count")
+        || params.contains_key("upstream_stage_ids")
+}
+
+fn parse_u32_param(params: &HashMap<String, String>, key: &str) -> Option<u32> {
+    params.get(key).and_then(|v| v.parse::<u32>().ok())
+}
+
+/// What: Format the stage-dispatch diagnostics event for EP-1 runtime observability.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Distributed stage id.
+/// - `task_id`: Concrete scheduled task id.
+/// - `partition_count`: Stage partition fan-out.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+///
+/// Details:
+/// - Event name is fixed to `execution.stage_dispatch_boundary`.
+pub(crate) fn format_stage_dispatch_boundary_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    partition_count: u32,
+) -> String {
+    format!(
+        "event=execution.stage_dispatch_boundary query_id={} stage_id={} task_id={} category=execution origin=server_dispatch partition_count={}",
+        query_id, stage_id, task_id, partition_count
+    )
+}
+
+fn validate_query_dispatch_context(
+    operation: &str,
+    params: &HashMap<String, String>,
+    auth_ctx: Option<&DispatchAuthContext>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !operation.eq_ignore_ascii_case("query") {
+        return Ok(());
+    }
+
+    let query_id = auth_ctx
+        .map(|ctx| ctx.query_id.trim())
+        .filter(|v| !v.is_empty());
+
+    if query_id.is_none() {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format_outcome(
+                "INFRA",
+                "INFRA_WORKER_EXECUTION_CONTEXT_MISSING",
+                "dispatch checkpoint failed: query_id is missing for query task",
+            ),
+        )));
+    }
+
+    if is_staged_query_params(params) {
+        if parse_u32_param(params, "stage_id").is_none() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format_outcome(
+                    "EXECUTION",
+                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING",
+                    "dispatch checkpoint failed: stage_id is missing or invalid",
+                ),
+            )));
+        }
+        if parse_u32_param(params, "partition_index").is_none() {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format_outcome(
+                    "EXECUTION",
+                    "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
+                    "dispatch checkpoint failed: partition_index is missing or invalid",
+                ),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// What: Auth metadata propagated from warehouse query dispatch to worker execution.
 ///
 /// Inputs:
@@ -179,11 +271,27 @@ pub async fn run_task_for_input_with_params(
     auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    validate_query_dispatch_context(operation, &params, auth_ctx)?;
+
     // Resolve session and worker key
     let (session, key) = resolve_session_and_key(shared_data, session_id).await?;
 
     // Create a query id and schedule task
-    let query_id = Uuid::new_v4().to_string();
+    let query_id = auth_ctx
+        .map(|ctx| ctx.query_id.clone())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut params = params;
+    let diagnostics_stage_id = parse_u32_param(&params, "stage_id");
+    let diagnostics_partition_count = parse_u32_param(&params, "partition_count")
+        .filter(|v| *v > 0)
+        .unwrap_or(1);
+    if operation.eq_ignore_ascii_case("query")
+        && let Some(ctx) = auth_ctx
+    {
+        params.insert("__query_id".to_string(), ctx.query_id.clone());
+    }
+    let query_id_for_event = query_id.clone();
     let task_id = build_task_and_schedule(
         shared_data,
         query_id,
@@ -193,6 +301,20 @@ pub async fn run_task_for_input_with_params(
         params,
     )
     .await?;
+
+    if operation.eq_ignore_ascii_case("query")
+        && let Some(stage_id) = diagnostics_stage_id
+    {
+        log::info!(
+            "{}",
+            format_stage_dispatch_boundary_event(
+                &query_id_for_event,
+                stage_id,
+                &task_id,
+                diagnostics_partition_count,
+            )
+        );
+    }
 
     // Acquire pooled connection (validates via heartbeat)
     let conn =
@@ -262,6 +384,15 @@ pub async fn run_stage_groups_for_input(
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "stage scheduler received no stage groups",
+        )));
+    }
+
+    if let Some(ctx) = auth_ctx
+        && ctx.query_id.trim().is_empty()
+    {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "dispatch checkpoint failed: query_id is missing for staged query dispatch",
         )));
     }
 
@@ -415,3 +546,7 @@ pub async fn run_stage_groups_for_input(
             ))) as Box<dyn Error + Send + Sync>
         })
 }
+
+#[cfg(test)]
+#[path = "../../tests/statement_handler_shared_helpers_tests.rs"]
+mod tests;

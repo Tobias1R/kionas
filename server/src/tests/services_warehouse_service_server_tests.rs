@@ -59,7 +59,7 @@ fn clears_stale_query_handle_for_non_query_outcome() {
 }
 
 #[test]
-fn maps_unsupported_operator_as_business_error() {
+fn maps_unsupported_operator_as_validation_error() {
     let mut resp = QueryResponse {
         message: String::new(),
         status: "OK".to_string(),
@@ -74,7 +74,7 @@ fn maps_unsupported_operator_as_business_error() {
     );
 
     assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_OPERATOR");
+    assert_eq!(resp.error_code, "VALIDATION_UNSUPPORTED_OPERATOR");
     assert_eq!(
         resp.message,
         "physical operator 'HashJoin' is not supported in this phase"
@@ -82,7 +82,7 @@ fn maps_unsupported_operator_as_business_error() {
 }
 
 #[test]
-fn maps_unsupported_predicate_as_business_error() {
+fn maps_unsupported_predicate_as_validation_error() {
     let mut resp = QueryResponse {
         message: String::new(),
         status: "OK".to_string(),
@@ -97,7 +97,7 @@ fn maps_unsupported_predicate_as_business_error() {
     );
 
     assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PREDICATE");
+    assert_eq!(resp.error_code, "VALIDATION_UNSUPPORTED_PREDICATE");
     assert_eq!(
         resp.message,
         "predicate is not supported in this phase: LIKE"
@@ -105,7 +105,7 @@ fn maps_unsupported_predicate_as_business_error() {
 }
 
 #[test]
-fn maps_unsupported_pipeline_as_business_error() {
+fn maps_unsupported_pipeline_as_validation_error() {
     let mut resp = QueryResponse {
         message: String::new(),
         status: "OK".to_string(),
@@ -120,7 +120,7 @@ fn maps_unsupported_pipeline_as_business_error() {
     );
 
     assert_eq!(resp.status, "ERROR");
-    assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PIPELINE");
+    assert_eq!(resp.error_code, "VALIDATION_UNSUPPORTED_PIPELINE");
     assert_eq!(
         resp.message,
         "invalid physical pipeline: pipeline must end with materialize"
@@ -128,15 +128,31 @@ fn maps_unsupported_pipeline_as_business_error() {
 }
 
 #[test]
-fn maps_select_validation_codes_to_business_error_family() {
+fn maps_select_validation_codes_to_validation_error_family() {
     let cases = vec![
         (
             "UNSUPPORTED_QUERY_SHAPE",
-            "BUSINESS_UNSUPPORTED_QUERY_SHAPE",
+            "VALIDATION_UNSUPPORTED_QUERY_SHAPE",
         ),
-        ("UNSUPPORTED_OPERATOR", "BUSINESS_UNSUPPORTED_OPERATOR"),
-        ("UNSUPPORTED_PREDICATE", "BUSINESS_UNSUPPORTED_PREDICATE"),
-        ("UNSUPPORTED_PIPELINE", "BUSINESS_UNSUPPORTED_PIPELINE"),
+        (
+            "VALIDATION_UNSUPPORTED_QUERY_SHAPE",
+            "VALIDATION_UNSUPPORTED_QUERY_SHAPE",
+        ),
+        ("UNSUPPORTED_OPERATOR", "VALIDATION_UNSUPPORTED_OPERATOR"),
+        (
+            "VALIDATION_UNSUPPORTED_OPERATOR",
+            "VALIDATION_UNSUPPORTED_OPERATOR",
+        ),
+        ("UNSUPPORTED_PREDICATE", "VALIDATION_UNSUPPORTED_PREDICATE"),
+        (
+            "VALIDATION_UNSUPPORTED_PREDICATE",
+            "VALIDATION_UNSUPPORTED_PREDICATE",
+        ),
+        ("UNSUPPORTED_PIPELINE", "VALIDATION_UNSUPPORTED_PIPELINE"),
+        (
+            "VALIDATION_UNSUPPORTED_PIPELINE",
+            "VALIDATION_UNSUPPORTED_PIPELINE",
+        ),
     ];
 
     for (validation_code, expected_error_code) in cases {
@@ -163,4 +179,45 @@ fn maps_select_validation_codes_to_business_error_family() {
             format!("validation message for {}", validation_code)
         );
     }
+}
+
+#[test]
+fn maps_constraint_and_execution_categories_deterministically() {
+    let mut resp = QueryResponse {
+        message: String::new(),
+        status: "OK".to_string(),
+        error_code: "0".to_string(),
+        execution_time: "0".to_string(),
+        data: Vec::new(),
+    };
+
+    apply_statement_outcome(
+        "RESULT|CONSTRAINT|NOT_NULL_VIOLATION|missing not null column",
+        &mut resp,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.error_code, "CONSTRAINT_NOT_NULL_VIOLATION");
+
+    apply_statement_outcome(
+        "RESULT|EXECUTION|WORKER_OPERATOR_FAILED|hash join failed",
+        &mut resp,
+    );
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.error_code, "EXECUTION_WORKER_OPERATOR_FAILED");
+}
+
+#[test]
+fn maps_non_structured_outcome_to_infra_generic() {
+    let mut resp = QueryResponse {
+        message: String::new(),
+        status: "OK".to_string(),
+        error_code: "0".to_string(),
+        execution_time: "0".to_string(),
+        data: Vec::new(),
+    };
+
+    apply_statement_outcome("Unsupported statement", &mut resp);
+    assert_eq!(resp.status, "ERROR");
+    assert_eq!(resp.error_code, "INFRA_GENERIC");
+    assert_eq!(resp.message, "Unsupported statement");
 }

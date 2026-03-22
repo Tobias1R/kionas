@@ -766,8 +766,7 @@ mod tests {
 
     #[test]
     fn fallback_error_classifier_accepts_object_store_resolution_failures() {
-        let object_store_error =
-            "Internal error: No suitable object store found for s3://warehouse/path. See RuntimeEnv::register_object_store";
+        let object_store_error = "Internal error: No suitable object store found for s3://warehouse/path. See RuntimeEnv::register_object_store";
         assert!(is_fallback_eligible_datafusion_error(object_store_error));
     }
 

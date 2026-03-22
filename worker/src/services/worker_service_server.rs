@@ -11,10 +11,141 @@ pub mod worker_service {
     tonic::include_proto!("worker_service");
 }
 
+#[cfg(test)]
+#[path = "../tests/services_worker_service_server_tests.rs"]
+mod tests;
+
 #[derive(Default)]
 pub struct WorkerService {
     pub shared_data: SharedData,
     pub authorizer: Arc<crate::authz::WorkerAuthorizer>,
+}
+
+const OUTCOME_PREFIX: &str = "RESULT";
+
+fn format_outcome(category: &str, code: &str, message: &str) -> String {
+    format!("{}|{}|{}|{}", OUTCOME_PREFIX, category, code, message)
+}
+
+fn parse_structured_outcome(raw: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = raw.splitn(4, '|');
+    let prefix = parts.next()?;
+    if prefix != OUTCOME_PREFIX {
+        return None;
+    }
+    let category = parts.next()?;
+    let code = parts.next()?;
+    let message = parts.next().unwrap_or_default();
+    Some((category, code, message))
+}
+
+fn normalize_worker_error_for_response(raw_error: &str) -> String {
+    if let Some((category, code, message)) = parse_structured_outcome(raw_error)
+        && matches!(
+            category,
+            "VALIDATION" | "CONSTRAINT" | "EXECUTION" | "INFRA"
+        )
+    {
+        return format_outcome(category, code, message);
+    }
+
+    let lower = raw_error.to_ascii_lowercase();
+
+    let (category, code) = if lower.contains("temporal_literal_invalid") {
+        ("VALIDATION", "VALIDATION_TEMPORAL_LITERAL_INVALID")
+    } else if lower.contains("datetime_timezone_not_allowed") {
+        ("VALIDATION", "VALIDATION_DATETIME_TIMEZONE_NOT_ALLOWED")
+    } else if lower.contains("decimal_coercion_failed") {
+        ("VALIDATION", "VALIDATION_DECIMAL_COERCION_FAILED")
+    } else if lower.contains("insert_type_hints_malformed") {
+        ("VALIDATION", "VALIDATION_INSERT_TYPE_HINTS_MALFORMED")
+    } else if lower.contains("missing not null column") {
+        ("CONSTRAINT", "CONSTRAINT_NOT_NULL_COLUMNS_MISSING")
+    } else if lower.contains("not null constraint violated") {
+        ("CONSTRAINT", "CONSTRAINT_NOT_NULL_VIOLATION")
+    } else if lower.contains("table not found") {
+        ("VALIDATION", "VALIDATION_TABLE_NOT_FOUND")
+    } else if lower.contains("unsupported") || lower.contains("invalid") {
+        ("VALIDATION", "VALIDATION_WORKER_TASK_INVALID")
+    } else if lower.contains("permission denied") || lower.contains("unauthenticated") {
+        ("INFRA", "INFRA_WORKER_AUTHZ_FAILED")
+    } else if lower.contains("storage")
+        || lower.contains("object store")
+        || lower.contains("result location")
+    {
+        ("INFRA", "INFRA_WORKER_STORAGE_OR_RESULT_UNAVAILABLE")
+    } else {
+        ("INFRA", "INFRA_WORKER_TASK_FAILED")
+    };
+
+    format_outcome(category, code, raw_error)
+}
+
+fn is_staged_query_task(task: &worker_service::Task) -> bool {
+    task.params.contains_key("stage_id")
+        || task.params.contains_key("partition_index")
+        || task.params.contains_key("partition_count")
+        || task.params.contains_key("upstream_stage_ids")
+}
+
+fn validate_query_task_context(task: &worker_service::Task) -> Result<(), tonic::Status> {
+    if task.task_id.trim().is_empty() {
+        return Err(tonic::Status::invalid_argument(format_outcome(
+            "INFRA",
+            "INFRA_WORKER_EXECUTION_TASK_CONTEXT_MISSING",
+            "task_id is required for query task",
+        )));
+    }
+
+    let query_id = task
+        .params
+        .get("__query_id")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    if query_id.is_none() {
+        return Err(tonic::Status::failed_precondition(format_outcome(
+            "INFRA",
+            "INFRA_WORKER_EXECUTION_CONTEXT_MISSING",
+            format!("query_id is missing for task_id={}", task.task_id).as_str(),
+        )));
+    }
+
+    if is_staged_query_task(task) {
+        let stage_id = task
+            .params
+            .get("stage_id")
+            .and_then(|v| v.parse::<u32>().ok());
+        if stage_id.is_none() {
+            return Err(tonic::Status::failed_precondition(format_outcome(
+                "EXECUTION",
+                "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING",
+                format!(
+                    "stage_id is missing or invalid for task_id={}",
+                    task.task_id
+                )
+                .as_str(),
+            )));
+        }
+
+        let partition_index = task
+            .params
+            .get("partition_index")
+            .and_then(|v| v.parse::<u32>().ok());
+        if partition_index.is_none() {
+            return Err(tonic::Status::failed_precondition(format_outcome(
+                "EXECUTION",
+                "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
+                format!(
+                    "partition_index is missing or invalid for task_id={} stage_id={}",
+                    task.task_id,
+                    stage_id.unwrap_or_default()
+                )
+                .as_str(),
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_flight_port(default_worker_port: u32) -> u32 {
@@ -223,10 +354,19 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
             }
         }
 
+        for task in &req.tasks {
+            if task.operation.eq_ignore_ascii_case("query") {
+                validate_query_task_context(task)?;
+            }
+        }
+
         log::info!("Received task: {}", req.session_id);
 
-        let resp =
+        let mut resp =
             crate::transactions::maestro::handle_execute_task(self.shared_data.clone(), req).await;
+        if resp.status != "ok" {
+            resp.error = normalize_worker_error_for_response(resp.error.as_str());
+        }
         Ok(tonic::Response::new(resp))
     }
 

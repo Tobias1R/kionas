@@ -3,8 +3,8 @@ use crate::execution::aggregate::{
 };
 use crate::execution::artifacts::{persist_query_artifacts, persist_stage_exchange_artifacts};
 use crate::execution::join::apply_hash_join_pipeline;
-use crate::execution::planner::RuntimeScanHints;
 use crate::execution::planner::StageExecutionContext;
+use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
 use crate::services::query_execution::{
@@ -65,6 +65,202 @@ const DELTA_PRUNING_CACHE_TTL: Duration = Duration::from_secs(30);
 static DELTA_PRUNING_CACHE: LazyLock<Mutex<HashMap<String, DeltaPruningCacheEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// What: Convert runtime scan mode enum into a stable diagnostics string value.
+///
+/// Inputs:
+/// - `mode`: Runtime scan mode selected for the task.
+///
+/// Output:
+/// - Stable snake_case label used in diagnostics events.
+fn runtime_scan_mode_label(mode: &RuntimeScanMode) -> &'static str {
+    match mode {
+        RuntimeScanMode::Full => "full",
+        RuntimeScanMode::MetadataPruned => "metadata_pruned",
+    }
+}
+
+/// What: Context fields required to emit scan decision diagnostics.
+///
+/// Inputs:
+/// - `query_id`: Query correlation identifier.
+/// - `stage_id`: Stage identifier for the current task.
+/// - `task_id`: Task identifier.
+///
+/// Output:
+/// - Immutable view used by scan decision telemetry emission.
+pub(crate) struct ScanDecisionContext<'a> {
+    pub(crate) query_id: &'a str,
+    pub(crate) stage_id: u32,
+    pub(crate) task_id: &'a str,
+}
+
+/// What: Structured result from scan pruning evaluation.
+///
+/// Inputs:
+/// - Internal pruning decision data.
+///
+/// Output:
+/// - Effective mode, bounded reason, and resulting key set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScanPruningOutcome {
+    pub(crate) keys: Vec<String>,
+    pub(crate) effective_mode: RuntimeScanMode,
+    pub(crate) reason: &'static str,
+    pub(crate) cache_hit: Option<bool>,
+}
+
+/// What: Inputs for rendering one scan pruning decision event.
+///
+/// Inputs:
+/// - `requested_mode`: Requested scan mode from task params.
+/// - `effective_mode`: Runtime mode actually used for file reads.
+/// - `reason`: Bounded reason label for applied mode/fallback.
+/// - `delta_version_pin`: Optional delta version pin provided by planner.
+/// - `cache_hit`: Whether pruning metadata came from cache.
+/// - `total_files`: Candidate file count before pruning.
+/// - `retained_files`: File count after pruning decision.
+///
+/// Output:
+/// - Struct consumed by `format_scan_pruning_decision_event`.
+pub(crate) struct ScanPruningDecisionFields<'a> {
+    pub(crate) requested_mode: &'a str,
+    pub(crate) effective_mode: &'a str,
+    pub(crate) reason: &'a str,
+    pub(crate) delta_version_pin: Option<u64>,
+    pub(crate) cache_hit: Option<bool>,
+    pub(crate) total_files: usize,
+    pub(crate) retained_files: usize,
+}
+
+/// What: Format `execution.scan_pruning_decision` diagnostics event payload.
+///
+/// Inputs:
+/// - `ctx`: Query/stage/task context for this decision.
+/// - `requested_mode`: Requested scan mode from task params.
+/// - `effective_mode`: Runtime mode actually used for read path.
+/// - `reason`: Bounded reason label.
+/// - `delta_version_pin`: Optional delta pin from task params.
+/// - `cache_hit`: Cache-hit state for pruning metadata.
+/// - `total_files`: File count before pruning.
+/// - `retained_files`: File count after pruning decision.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_scan_pruning_decision_event(
+    ctx: &ScanDecisionContext<'_>,
+    fields: &ScanPruningDecisionFields<'_>,
+) -> String {
+    let cache_label = match fields.cache_hit {
+        Some(true) => "hit",
+        Some(false) => "miss",
+        None => "n/a",
+    };
+    format!(
+        "event=execution.scan_pruning_decision query_id={} stage_id={} task_id={} operator_family=scan category=execution origin=worker_scan requested_mode={} effective_mode={} reason={} delta_version_pin={} cache_hit={} total_files={} retained_files={} pruned_files={}",
+        ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        fields.requested_mode,
+        fields.effective_mode,
+        fields.reason,
+        fields.delta_version_pin.unwrap_or(0),
+        cache_label,
+        fields.total_files,
+        fields.retained_files,
+        fields.total_files.saturating_sub(fields.retained_files)
+    )
+}
+
+/// What: Format `execution.scan_mode_chosen` diagnostics event payload.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Stage identifier.
+/// - `task_id`: Task identifier.
+/// - `scan_mode`: Chosen scan mode label.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_scan_mode_chosen_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    scan_mode: &str,
+) -> String {
+    format!(
+        "event=execution.scan_mode_chosen query_id={} stage_id={} task_id={} operator_family=scan category=execution origin=worker_runtime_planner scan_mode={}",
+        query_id, stage_id, task_id, scan_mode
+    )
+}
+
+/// What: Format `execution.scan_fallback_reason` diagnostics event payload.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Stage identifier.
+/// - `task_id`: Task identifier.
+/// - `reason`: Bounded fallback reason identifier.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_scan_fallback_reason_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "event=execution.scan_fallback_reason query_id={} stage_id={} task_id={} operator_family=scan category=execution origin=worker_runtime_planner reason={}",
+        query_id, stage_id, task_id, reason
+    )
+}
+
+/// What: Format `execution.exchange_io_decision` diagnostics event payload.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Stage identifier.
+/// - `task_id`: Task identifier.
+/// - `partition_index`: Partition index involved in exchange I/O.
+/// - `direction`: Exchange direction (`read` or `write`).
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_exchange_io_decision_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    partition_index: u32,
+    direction: &str,
+) -> String {
+    format!(
+        "event=execution.exchange_io_decision query_id={} stage_id={} task_id={} partition_index={} operator_family=exchange category=execution origin=worker_pipeline direction={}",
+        query_id, stage_id, task_id, partition_index, direction
+    )
+}
+
+/// What: Format `execution.materialization_decision` diagnostics event payload.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Stage identifier.
+/// - `task_id`: Task identifier.
+/// - `output_format`: Selected output representation.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_materialization_decision_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    output_format: &str,
+) -> String {
+    format!(
+        "event=execution.materialization_decision query_id={} stage_id={} task_id={} operator_family=materialization category=execution origin=worker_pipeline output_format={}",
+        query_id, stage_id, task_id, output_format
+    )
+}
+
 /// What: Load cached Delta version and file stats for a table when entry is fresh.
 ///
 /// Inputs:
@@ -118,10 +314,10 @@ fn put_cached_delta_pruning_metadata(
 ///
 /// Output:
 /// - Parsed predicate AST when a supported `predicate_ast` is present.
-fn parse_predicate_ast_from_hints(scan_hints_json: &str) -> Option<PredicateAstNode> {
-    let hints: Value = serde_json::from_str(scan_hints_json).ok()?;
-    let ast = hints.get("predicate_ast")?;
-    parse_predicate_ast_node(ast)
+fn parse_predicate_ast_from_hints(scan_hints_json: &str) -> Result<PredicateAstNode, &'static str> {
+    let hints: Value = serde_json::from_str(scan_hints_json).map_err(|_| "hints_invalid")?;
+    let ast = hints.get("predicate_ast").ok_or("predicate_ast_missing")?;
+    parse_predicate_ast_node(ast).ok_or("predicate_ast_missing")
 }
 
 fn parse_predicate_ast_node(node: &Value) -> Option<PredicateAstNode> {
@@ -423,42 +619,61 @@ async fn maybe_prune_scan_keys(
     source_prefix: &str,
     keys: &[String],
     scan_hints: &RuntimeScanHints,
-) -> Vec<String> {
-    if scan_hints.mode != crate::execution::planner::RuntimeScanMode::MetadataPruned
-        || !scan_hints.pruning_eligible
-    {
-        return keys.to_vec();
+) -> ScanPruningOutcome {
+    if scan_hints.mode != crate::execution::planner::RuntimeScanMode::MetadataPruned {
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "mode_full_requested",
+            cache_hit: None,
+        };
+    }
+
+    if !scan_hints.pruning_eligible {
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "ineligible_or_missing_reason",
+            cache_hit: None,
+        };
     }
 
     let Some(scan_hints_json) = scan_hints.pruning_hints_json.as_deref() else {
-        log::warn!(
-            "scan pruning fallback: metadata_pruned mode without scan_pruning_hints_json for prefix={}",
-            source_prefix
-        );
-        return keys.to_vec();
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "hints_missing",
+            cache_hit: None,
+        };
     };
 
-    let Some(predicate_ast) = parse_predicate_ast_from_hints(scan_hints_json) else {
-        log::warn!(
-            "scan pruning fallback: unable to parse predicate_ast from hints for prefix={}",
-            source_prefix
-        );
-        return keys.to_vec();
+    let predicate_ast = match parse_predicate_ast_from_hints(scan_hints_json) {
+        Ok(value) => value,
+        Err(reason) => {
+            return ScanPruningOutcome {
+                keys: keys.to_vec(),
+                effective_mode: RuntimeScanMode::Full,
+                reason,
+                cache_hit: None,
+            };
+        }
     };
 
     let Some(delta_log_prefix) = delta_log_prefix_from_source_prefix(source_prefix) else {
-        log::warn!(
-            "scan pruning fallback: invalid source prefix (missing staging suffix) for prefix={}",
-            source_prefix
-        );
-        return keys.to_vec();
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "source_prefix_invalid",
+            cache_hit: None,
+        };
     };
     let Some(table_prefix) = table_prefix_from_source_prefix(source_prefix) else {
-        log::warn!(
-            "scan pruning fallback: invalid table prefix for source prefix={}",
-            source_prefix
-        );
-        return keys.to_vec();
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "table_prefix_invalid",
+            cache_hit: None,
+        };
     };
 
     let cache_key = table_prefix.clone();
@@ -467,52 +682,40 @@ async fn maybe_prune_scan_keys(
             && pin > 0
             && pin != cached_version
         {
-            log::warn!(
-                "scan pruning fallback: delta version pin mismatch for prefix={} pin={} latest={} (cache hit)",
-                source_prefix,
-                pin,
-                cached_version
-            );
-            return keys.to_vec();
+            return ScanPruningOutcome {
+                keys: keys.to_vec(),
+                effective_mode: RuntimeScanMode::Full,
+                reason: "delta_pin_mismatch",
+                cache_hit: Some(true),
+            };
         }
 
         if cached_stats.is_empty() {
-            log::warn!(
-                "scan pruning fallback: no usable delta file stats for prefix={} version={} (cache hit)",
-                source_prefix,
-                cached_version
-            );
-            return keys.to_vec();
+            return ScanPruningOutcome {
+                keys: keys.to_vec(),
+                effective_mode: RuntimeScanMode::Full,
+                reason: "delta_stats_unavailable",
+                cache_hit: Some(true),
+            };
         }
 
-        let pruned = prune_keys_by_delta_stats(keys, &cached_stats, &predicate_ast);
-        log::info!(
-            "scan pruning applied for prefix={} version={} total_files={} retained_files={} pruned_files={} cache=hit",
-            source_prefix,
-            cached_version,
-            keys.len(),
-            pruned.len(),
-            keys.len().saturating_sub(pruned.len())
-        );
-        return pruned;
+        return ScanPruningOutcome {
+            keys: prune_keys_by_delta_stats(keys, &cached_stats, &predicate_ast),
+            effective_mode: RuntimeScanMode::MetadataPruned,
+            reason: "pruning_applied",
+            cache_hit: Some(true),
+        };
     }
 
     let latest_version = match latest_delta_log_version(provider, &delta_log_prefix).await {
         Ok(Some(version)) => version,
-        Ok(None) => {
-            log::warn!(
-                "scan pruning fallback: no delta log json version found under {}",
-                delta_log_prefix
-            );
-            return keys.to_vec();
-        }
-        Err(err) => {
-            log::warn!(
-                "scan pruning fallback: failed reading latest delta log version under {}: {}",
-                delta_log_prefix,
-                err
-            );
-            return keys.to_vec();
+        Ok(None) | Err(_) => {
+            return ScanPruningOutcome {
+                keys: keys.to_vec(),
+                effective_mode: RuntimeScanMode::Full,
+                reason: "delta_version_unavailable",
+                cache_hit: Some(false),
+            };
         }
     };
 
@@ -520,13 +723,12 @@ async fn maybe_prune_scan_keys(
         && pin > 0
         && pin != latest_version
     {
-        log::warn!(
-            "scan pruning fallback: delta version pin mismatch for prefix={} pin={} latest={}",
-            source_prefix,
-            pin,
-            latest_version
-        );
-        return keys.to_vec();
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "delta_pin_mismatch",
+            cache_hit: Some(false),
+        };
     }
 
     let stats = match load_delta_file_stats_for_version(
@@ -538,38 +740,33 @@ async fn maybe_prune_scan_keys(
     .await
     {
         Ok(value) => value,
-        Err(err) => {
-            log::warn!(
-                "scan pruning fallback: failed to load delta file stats for prefix={} version={}: {}",
-                source_prefix,
-                latest_version,
-                err
-            );
-            return keys.to_vec();
+        Err(_) => {
+            return ScanPruningOutcome {
+                keys: keys.to_vec(),
+                effective_mode: RuntimeScanMode::Full,
+                reason: "delta_stats_unavailable",
+                cache_hit: Some(false),
+            };
         }
     };
 
     if stats.is_empty() {
-        log::warn!(
-            "scan pruning fallback: no usable delta file stats for prefix={} version={}",
-            source_prefix,
-            latest_version
-        );
-        return keys.to_vec();
+        return ScanPruningOutcome {
+            keys: keys.to_vec(),
+            effective_mode: RuntimeScanMode::Full,
+            reason: "delta_stats_unavailable",
+            cache_hit: Some(false),
+        };
     }
 
     put_cached_delta_pruning_metadata(cache_key, latest_version, stats.clone());
 
-    let pruned = prune_keys_by_delta_stats(keys, &stats, &predicate_ast);
-    log::info!(
-        "scan pruning applied for prefix={} version={} total_files={} retained_files={} pruned_files={} cache=miss",
-        source_prefix,
-        latest_version,
-        keys.len(),
-        pruned.len(),
-        keys.len().saturating_sub(pruned.len())
-    );
-    pruned
+    ScanPruningOutcome {
+        keys: prune_keys_by_delta_stats(keys, &stats, &predicate_ast),
+        effective_mode: RuntimeScanMode::MetadataPruned,
+        reason: "pruning_applied",
+        cache_hit: Some(false),
+    }
 }
 
 /// What: Execute validated query payload on the worker and materialize deterministic artifacts.
@@ -622,25 +819,79 @@ pub(crate) async fn execute_query_task(
     }
 
     let runtime_plan = extract_runtime_plan(task)?;
-    let stage_context = stage_execution_context(task);
+    let stage_context = stage_execution_context(task)?;
+    let query_id = task
+        .params
+        .get("__query_id")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    log::info!(
+        "{}",
+        format_scan_mode_chosen_event(
+            &query_id,
+            stage_context.stage_id,
+            &task.task_id,
+            runtime_scan_mode_label(&stage_context.scan_hints.mode),
+        )
+    );
+    if let Some(reason) = stage_context
+        .scan_hints
+        .pruning_reason
+        .as_deref()
+        .filter(|v| !v.is_empty())
+    {
+        log::info!(
+            "{}",
+            format_scan_fallback_reason_event(
+                &query_id,
+                stage_context.stage_id,
+                &task.task_id,
+                reason,
+            )
+        );
+    }
+    let context_tag = format!(
+        "query_id={} stage_id={} task_id={} partition_index={}",
+        query_id, stage_context.stage_id, task.task_id, stage_context.partition_index
+    );
+    let decision_ctx = ScanDecisionContext {
+        query_id: &query_id,
+        stage_id: stage_context.stage_id,
+        task_id: &task.task_id,
+    };
     let relation_columns_by_key = parse_relation_columns_map(task);
     let source_relation_key = relation_key(namespace);
-    let mut batches = load_input_batches(shared, session_id, namespace, &stage_context).await?;
+    let mut batches =
+        load_input_batches(shared, session_id, namespace, &stage_context, &decision_ctx)
+            .await
+            .map_err(|e| format!("{} [{}]", e, context_tag))?;
 
-    if stage_context.upstream_stage_ids.is_empty() && batches.is_empty() {
-        if let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str()) {
-            log::info!(
-                "query source scan has no parquet files for {}; materializing empty table result",
-                source_relation_key
-            );
-            batches.push(build_empty_batch_from_relation_columns(columns)?);
-        }
+    if stage_context.upstream_stage_ids.is_empty()
+        && batches.is_empty()
+        && let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str())
+    {
+        log::info!(
+            "query source scan has no parquet files for {}; materializing empty table result",
+            source_relation_key
+        );
+        batches.push(build_empty_batch_from_relation_columns(columns)?);
     }
 
     if stage_context.upstream_stage_ids.is_empty()
         && let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str())
     {
         batches = apply_relation_column_names(&batches, columns)?;
+    } else {
+        log::info!(
+            "{}",
+            format_exchange_io_decision_event(
+                &query_id,
+                stage_context.stage_id,
+                &task.task_id,
+                stage_context.partition_index,
+                "read",
+            )
+        );
     }
 
     if let Some(predicate) = runtime_plan.filter_predicate.as_ref() {
@@ -658,8 +909,14 @@ pub(crate) async fn execute_query_task(
             table: join_spec.right_relation.table.clone(),
         };
         let right_prefix = source_table_staging_prefix(&right_namespace);
-        let mut right_batches =
-            load_scan_batches(shared, &right_prefix, &RuntimeScanHints::full_scan()).await?;
+        let mut right_batches = load_scan_batches(
+            shared,
+            &right_prefix,
+            &RuntimeScanHints::full_scan(),
+            &decision_ctx,
+        )
+        .await
+        .map_err(|e| format!("{} [{}]", e, context_tag))?;
         let right_relation_key = relation_key(&right_namespace);
         if let Some(columns) = relation_columns_by_key.get(right_relation_key.as_str()) {
             right_batches = apply_relation_column_names(&right_batches, columns)?;
@@ -688,7 +945,10 @@ pub(crate) async fn execute_query_task(
     }
 
     if batches.is_empty() {
-        return Err("query execution produced no record batches".to_string());
+        return Err(format!(
+            "query execution produced no record batches [{}]",
+            context_tag
+        ));
     }
 
     let normalized_batches = normalize_batches_for_sort(&batches)?;
@@ -703,9 +963,30 @@ pub(crate) async fn execute_query_task(
         &stage_context.upstream_stage_ids,
         &normalized_batches,
     )
-    .await?;
+    .await
+    .map_err(|e| format!("{} [{}]", e, context_tag))?;
+
+    log::info!(
+        "{}",
+        format_exchange_io_decision_event(
+            &query_id,
+            stage_context.stage_id,
+            &task.task_id,
+            stage_context.partition_index,
+            "write",
+        )
+    );
 
     if runtime_plan.has_materialize {
+        log::info!(
+            "{}",
+            format_materialization_decision_event(
+                &query_id,
+                stage_context.stage_id,
+                &task.task_id,
+                "parquet",
+            )
+        );
         persist_query_artifacts(
             shared,
             result_location,
@@ -714,7 +995,17 @@ pub(crate) async fn execute_query_task(
             &normalized_batches,
         )
         .await
+        .map_err(|e| format!("{} [{}]", e, context_tag))
     } else {
+        log::info!(
+            "{}",
+            format_materialization_decision_event(
+                &query_id,
+                stage_context.stage_id,
+                &task.task_id,
+                "exchange_only",
+            )
+        );
         Ok(())
     }
 }
@@ -778,7 +1069,9 @@ fn apply_relation_column_names(
     Ok(renamed)
 }
 
-fn build_empty_batch_from_relation_columns(relation_columns: &[String]) -> Result<RecordBatch, String> {
+fn build_empty_batch_from_relation_columns(
+    relation_columns: &[String],
+) -> Result<RecordBatch, String> {
     let mut fields = Vec::<Field>::new();
     let mut arrays = Vec::<std::sync::Arc<dyn arrow::array::Array>>::new();
 
@@ -789,7 +1082,9 @@ fn build_empty_batch_from_relation_columns(relation_columns: &[String]) -> Resul
         }
 
         fields.push(Field::new(normalized, DataType::Utf8, true));
-        arrays.push(std::sync::Arc::new(StringArray::from(Vec::<Option<String>>::new())));
+        arrays.push(std::sync::Arc::new(StringArray::from(
+            Vec::<Option<String>>::new(),
+        )));
     }
 
     let schema = std::sync::Arc::new(Schema::new(fields));
@@ -896,10 +1191,18 @@ pub(crate) async fn load_input_batches(
     session_id: &str,
     namespace: &QueryNamespace,
     stage_context: &StageExecutionContext,
+    decision_ctx: &ScanDecisionContext<'_>,
 ) -> Result<Vec<RecordBatch>, String> {
     if stage_context.upstream_stage_ids.is_empty() {
         let source_prefix = source_table_staging_prefix(namespace);
-        let source_batches = match load_scan_batches(shared, &source_prefix, &stage_context.scan_hints).await {
+        let source_batches = match load_scan_batches(
+            shared,
+            &source_prefix,
+            &stage_context.scan_hints,
+            decision_ctx,
+        )
+        .await
+        {
             Ok(batches) => batches,
             Err(error)
                 if error
@@ -1088,30 +1391,16 @@ pub(crate) async fn load_scan_batches(
     shared: &SharedData,
     source_prefix: &str,
     scan_hints: &RuntimeScanHints,
+    decision_ctx: &ScanDecisionContext<'_>,
 ) -> Result<Vec<RecordBatch>, String> {
     let provider = shared
         .storage_provider
         .as_ref()
         .ok_or_else(|| "storage provider is not configured for query execution".to_string())?;
 
-    if scan_hints.mode == crate::execution::planner::RuntimeScanMode::MetadataPruned {
-        if scan_hints.pruning_eligible {
-            log::info!(
-                "scan_mode=metadata_pruned requested for prefix={} delta_version_pin={:?} hints_present={} reason={} (fallback to full scan until pruning phase is implemented)",
-                source_prefix,
-                scan_hints.delta_version_pin,
-                scan_hints.pruning_hints_json.is_some(),
-                scan_hints.pruning_reason.as_deref().unwrap_or("eligible")
-            );
-        } else {
-            log::warn!(
-                "scan_mode=metadata_pruned requested but hints are not eligible for prefix={} delta_version_pin={:?} reason={} (falling back to full scan)",
-                source_prefix,
-                scan_hints.delta_version_pin,
-                scan_hints.pruning_reason.as_deref().unwrap_or("unknown")
-            );
-        }
-    } else if scan_hints.pruning_hints_json.is_some() || scan_hints.delta_version_pin.is_some() {
+    if scan_hints.mode == crate::execution::planner::RuntimeScanMode::Full
+        && (scan_hints.pruning_hints_json.is_some() || scan_hints.delta_version_pin.is_some())
+    {
         log::debug!(
             "scan hints supplied while mode=full for prefix={} delta_version_pin={:?} hints_present={}",
             source_prefix,
@@ -1134,8 +1423,26 @@ pub(crate) async fn load_scan_batches(
         ));
     }
 
-    let keys = maybe_prune_scan_keys(provider, source_prefix, &keys, scan_hints).await;
-    if keys.is_empty() {
+    let total_files = keys.len();
+    let pruning_outcome = maybe_prune_scan_keys(provider, source_prefix, &keys, scan_hints).await;
+    let retained_files = pruning_outcome.keys.len();
+    log::info!(
+        "{}",
+        format_scan_pruning_decision_event(
+            decision_ctx,
+            &ScanPruningDecisionFields {
+                requested_mode: runtime_scan_mode_label(&scan_hints.mode),
+                effective_mode: runtime_scan_mode_label(&pruning_outcome.effective_mode),
+                reason: pruning_outcome.reason,
+                delta_version_pin: scan_hints.delta_version_pin,
+                cache_hit: pruning_outcome.cache_hit,
+                total_files,
+                retained_files,
+            },
+        )
+    );
+
+    if pruning_outcome.keys.is_empty() {
         return Err(format!(
             "scan pruning eliminated all source parquet files for query prefix {}",
             source_prefix
@@ -1143,7 +1450,7 @@ pub(crate) async fn load_scan_batches(
     }
 
     let mut all_batches = Vec::new();
-    for key in keys {
+    for key in pruning_outcome.keys {
         let bytes = provider
             .get_object(&key)
             .await

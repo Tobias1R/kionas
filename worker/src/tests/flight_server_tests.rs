@@ -1,10 +1,11 @@
 use super::{
-    checksum_fnv64_hex, expected_artifacts_from_metadata, schema_from_metadata, to_staging_prefix,
-    validate_metadata_alignment,
+    checksum_fnv64_hex, expected_artifacts_from_metadata, parse_descriptor_scope,
+    schema_from_metadata, to_staging_prefix, validate_metadata_alignment,
 };
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::FlightDescriptor;
 use std::sync::Arc;
 
 fn sample_batches() -> Vec<RecordBatch> {
@@ -43,6 +44,37 @@ fn builds_task_scoped_staging_prefix() {
     .expect("prefix must build");
 
     assert_eq!(prefix, "query/db1/s1/t1/worker1/staging/s1/t1/");
+}
+
+#[test]
+fn parses_descriptor_scope_from_path() {
+    let descriptor = FlightDescriptor::new_path(vec!["s1".to_string(), "t1".to_string()]);
+    let (session_id, task_id) = parse_descriptor_scope(&descriptor).expect("scope must parse");
+
+    assert_eq!(session_id, "s1");
+    assert_eq!(task_id, "t1");
+}
+
+#[test]
+fn parses_descriptor_scope_from_cmd() {
+    let descriptor = FlightDescriptor::new_cmd(b"s2:t2".to_vec());
+    let (session_id, task_id) = parse_descriptor_scope(&descriptor).expect("scope must parse");
+
+    assert_eq!(session_id, "s2");
+    assert_eq!(task_id, "t2");
+}
+
+#[test]
+fn rejects_descriptor_without_task_scope() {
+    let descriptor = FlightDescriptor::new_cmd(b"s-only".to_vec());
+    let err = parse_descriptor_scope(&descriptor)
+        .expect_err("descriptor without task scope must be rejected");
+
+    assert_eq!(err.code(), tonic14::Code::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        "flight descriptor must provide session and task scope"
+    );
 }
 
 #[test]

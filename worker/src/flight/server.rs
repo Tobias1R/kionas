@@ -86,8 +86,10 @@ fn dispatch_context_from_flight_metadata(
     let query_id = metadata
         .get("query_id")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::permission_denied("missing query_id metadata"))?
+        .to_string();
 
     Ok(crate::authz::DispatchAuthContext {
         session_id,

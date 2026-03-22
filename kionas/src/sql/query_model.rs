@@ -18,13 +18,13 @@ use serde_json::json;
 pub const QUERY_PAYLOAD_VERSION: u8 = 2;
 
 /// What: Validation outcome code for unsupported query shape errors.
-pub const VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE: &str = "UNSUPPORTED_QUERY_SHAPE";
+pub const VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE: &str = "VALIDATION_UNSUPPORTED_QUERY_SHAPE";
 /// What: Validation outcome code for invalid physical pipeline errors.
-pub const VALIDATION_CODE_UNSUPPORTED_PIPELINE: &str = "UNSUPPORTED_PIPELINE";
+pub const VALIDATION_CODE_UNSUPPORTED_PIPELINE: &str = "VALIDATION_UNSUPPORTED_PIPELINE";
 /// What: Validation outcome code for unsupported physical operators.
-pub const VALIDATION_CODE_UNSUPPORTED_OPERATOR: &str = "UNSUPPORTED_OPERATOR";
+pub const VALIDATION_CODE_UNSUPPORTED_OPERATOR: &str = "VALIDATION_UNSUPPORTED_OPERATOR";
 /// What: Validation outcome code for unsupported predicates.
-pub const VALIDATION_CODE_UNSUPPORTED_PREDICATE: &str = "UNSUPPORTED_PREDICATE";
+pub const VALIDATION_CODE_UNSUPPORTED_PREDICATE: &str = "VALIDATION_UNSUPPORTED_PREDICATE";
 
 /// What: Canonical namespace fields used to identify query source table.
 ///

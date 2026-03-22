@@ -16,6 +16,12 @@ struct ProxyFlightService;
 
 type FlightStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+const OUTCOME_PREFIX: &str = "RESULT";
+
+fn format_outcome(category: &str, code: &str, message: &str) -> String {
+    format!("{}|{}|{}|{}", OUTCOME_PREFIX, category, code, message)
+}
+
 /// What: Resolve the bind port for the flight proxy service.
 ///
 /// Inputs:
@@ -63,22 +69,46 @@ fn resolve_worker_flight_port() -> u16 {
 /// Details:
 /// - Expected payload format is signed compact JWT with `sid`, `tid`, and `wid` claims.
 fn decode_internal_ticket(ticket_raw: &[u8]) -> Result<(String, String, String), Status> {
-    let token = std::str::from_utf8(ticket_raw)
-        .map_err(|_| Status::invalid_argument("ticket is not valid UTF-8"))?;
+    let token = std::str::from_utf8(ticket_raw).map_err(|_| {
+        Status::invalid_argument(format_outcome(
+            "VALIDATION",
+            "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_UTF8",
+            "ticket is not valid UTF-8",
+        ))
+    })?;
 
     let mut parts = token.split('.');
-    let _header = parts
-        .next()
-        .ok_or_else(|| Status::invalid_argument("invalid signed ticket format"))?;
-    let claims = parts
-        .next()
-        .ok_or_else(|| Status::invalid_argument("invalid signed ticket format"))?;
+    let _header = parts.next().ok_or_else(|| {
+        Status::invalid_argument(format_outcome(
+            "VALIDATION",
+            "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_FORMAT",
+            "invalid signed ticket format",
+        ))
+    })?;
+    let claims = parts.next().ok_or_else(|| {
+        Status::invalid_argument(format_outcome(
+            "VALIDATION",
+            "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_FORMAT",
+            "invalid signed ticket format",
+        ))
+    })?;
 
     let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(claims)
-        .map_err(|_| Status::invalid_argument("ticket claims are not valid base64url"))?;
-    let claims_json: serde_json::Value = serde_json::from_slice(&claims_bytes)
-        .map_err(|_| Status::invalid_argument("ticket claims are not valid JSON"))?;
+        .map_err(|_| {
+            Status::invalid_argument(format_outcome(
+                "VALIDATION",
+                "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_BASE64URL",
+                "ticket claims are not valid base64url",
+            ))
+        })?;
+    let claims_json: serde_json::Value = serde_json::from_slice(&claims_bytes).map_err(|_| {
+        Status::invalid_argument(format_outcome(
+            "VALIDATION",
+            "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_JSON",
+            "ticket claims are not valid JSON",
+        ))
+    })?;
 
     let session_id = claims_json
         .get("sid")
@@ -100,9 +130,11 @@ fn decode_internal_ticket(ticket_raw: &[u8]) -> Result<(String, String, String),
         .to_string();
 
     if session_id.is_empty() || task_id.is_empty() || worker_id.is_empty() {
-        return Err(Status::invalid_argument(
+        return Err(Status::invalid_argument(format_outcome(
+            "VALIDATION",
+            "VALIDATION_FLIGHT_PROXY_TICKET_INVALID_PAYLOAD",
             "ticket payload is invalid; expected session_id:task_id:worker_id",
-        ));
+        )));
     }
 
     Ok((session_id, task_id, worker_id))
@@ -143,8 +175,13 @@ fn parse_descriptor_worker_scope(descriptor: &FlightDescriptor) -> Result<String
     }
 
     if !descriptor.cmd.is_empty() {
-        let cmd = std::str::from_utf8(&descriptor.cmd)
-            .map_err(|_| Status::invalid_argument("descriptor cmd is not valid UTF-8"))?;
+        let cmd = std::str::from_utf8(&descriptor.cmd).map_err(|_| {
+            Status::invalid_argument(format_outcome(
+                "VALIDATION",
+                "VALIDATION_FLIGHT_PROXY_DESCRIPTOR_INVALID_UTF8",
+                "descriptor cmd is not valid UTF-8",
+            ))
+        })?;
         let mut parts = cmd.splitn(3, ':');
         let _session_id = parts.next();
         let _task_id = parts.next();
@@ -154,9 +191,11 @@ fn parse_descriptor_worker_scope(descriptor: &FlightDescriptor) -> Result<String
         }
     }
 
-    Err(Status::invalid_argument(
+    Err(Status::invalid_argument(format_outcome(
+        "VALIDATION",
+        "VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING",
         "descriptor must provide worker scope in path[2] or cmd as session:task:worker",
-    ))
+    )))
 }
 
 /// What: Map an upstream Flight error into a proxy status while preserving status code.
@@ -168,7 +207,14 @@ fn parse_descriptor_worker_scope(descriptor: &FlightDescriptor) -> Result<String
 /// Output:
 /// - Proxy status with same code and contextualized message.
 fn map_upstream_status(status: Status, context: &str) -> Status {
-    Status::new(status.code(), format!("{}: {}", context, status.message()))
+    Status::new(
+        status.code(),
+        format_outcome(
+            "INFRA",
+            "INFRA_FLIGHT_PROXY_UPSTREAM_FAILED",
+            format!("{}: {}", context, status.message()).as_str(),
+        ),
+    )
 }
 
 fn copy_auth_metadata<T, U>(from: &Request<T>, to: &mut Request<U>) {
@@ -368,4 +414,35 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .serve(addr)
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_upstream_status, parse_descriptor_worker_scope};
+    use arrow_flight::FlightDescriptor;
+    use tonic14::{Code, Status};
+
+    #[test]
+    fn wraps_upstream_status_with_canonical_envelope() {
+        let upstream = Status::new(Code::Unavailable, "worker connection failed");
+        let wrapped = map_upstream_status(upstream, "worker DoGet failed");
+        assert_eq!(wrapped.code(), Code::Unavailable);
+        assert!(
+            wrapped
+                .message()
+                .starts_with("RESULT|INFRA|INFRA_FLIGHT_PROXY_UPSTREAM_FAILED|")
+        );
+    }
+
+    #[test]
+    fn descriptor_scope_missing_returns_structured_validation_error() {
+        let descriptor = FlightDescriptor::new_cmd(Vec::new());
+        let err = parse_descriptor_worker_scope(&descriptor)
+            .expect_err("missing scope should fail as invalid argument");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message()
+                .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING|")
+        );
+    }
 }
