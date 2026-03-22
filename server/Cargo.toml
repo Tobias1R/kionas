@@ -16,7 +16,7 @@ env_logger.workspace = true
 tonic-reflection.workspace = true
 prost = "0.13.5"
 prost-types = "0.13.5"
-rdkafka = { version = "0.37.0", features = ["tokio"] }
+# rdkafka = { version = "0.37.0", features = ["tokio"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
 kionas = { path = "../kionas" }
 base64 = "0.22"
@@ -31,6 +31,7 @@ chrono.workspace = true
 rustls.workspace = true
 uuid = "1.22.0"
 deltalake = { version = "0.31.1", features = ["s3"] }
+datafusion = "52.2.0"
 url = "2"
 sysinfo = "0.29"
 

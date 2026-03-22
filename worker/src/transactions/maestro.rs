@@ -1,9 +1,9 @@
+use crate::services::worker_service_server::worker_service::Task;
 use crate::state::SharedData;
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use kionas::parser::datafusion_sql::sqlparser::ast::{Expr, SetExpr, Statement, Value as SqlValue};
-use kionas::parser::sql::parse_query;
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +21,22 @@ pub(crate) struct ParsedInsertPayload {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<InsertScalar>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum InsertScalarPayload {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Null,
+}
+
+#[derive(Deserialize)]
+struct ParsedInsertPayloadWire {
+    table_name: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<InsertScalarPayload>>,
 }
 
 fn normalize_identifier(raw: &str) -> String {
@@ -88,84 +104,53 @@ fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Optio
 #[path = "../tests/transactions_maestro_uri_tests.rs"]
 mod uri_tests;
 
-/// What: Parse an INSERT SQL payload into table metadata and row values.
+/// What: Parse structured INSERT payload from task params into typed row values.
 ///
 /// Inputs:
-/// - `sql`: Raw SQL payload from task input
+/// - `task`: Insert task containing `insert_payload_json` params.
 ///
 /// Output:
-/// - Parsed table name, optional column list and VALUES rows
+/// - Parsed table name, columns, and rows for Arrow conversion.
 ///
 /// Details:
-/// - Supports INSERT statements where source is a VALUES clause.
-fn parse_insert_payload(sql: &str) -> Result<ParsedInsertPayload, String> {
-    let statements = parse_query(sql).map_err(|e| format!("insert parse error: {}", e))?;
-    let stmt = statements
-        .first()
-        .ok_or_else(|| "insert parse error: empty statement list".to_string())?;
+/// - Rejects missing or malformed payloads with actionable messages.
+fn parse_insert_payload(task: &Task) -> Result<ParsedInsertPayload, String> {
+    let raw = task.params.get("insert_payload_json").ok_or_else(|| {
+        "insert payload contract missing: insert_payload_json parameter is required".to_string()
+    })?;
 
-    let insert = match stmt {
-        Statement::Insert(insert_stmt) => insert_stmt,
-        _ => return Err("task payload is not an INSERT statement".to_string()),
-    };
+    let payload = serde_json::from_str::<ParsedInsertPayloadWire>(raw)
+        .map_err(|e| format!("insert payload contract malformed: {}", e))?;
 
-    let source = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| "INSERT source is missing".to_string())?;
-
-    let values = match source.body.as_ref() {
-        SetExpr::Values(values) => values,
-        _ => {
-            return Err(
-                "INSERT source is not VALUES; only VALUES inserts are supported in worker"
-                    .to_string(),
-            );
-        }
-    };
-
-    if values.rows.is_empty() {
-        return Err("INSERT VALUES has no rows".to_string());
-    }
-
-    let mut rows = Vec::with_capacity(values.rows.len());
-    for row in &values.rows {
-        let mut parsed_row = Vec::with_capacity(row.len());
-        for expr in row {
-            let scalar = match expr {
-                Expr::Value(vws) => match &vws.value {
-                    SqlValue::Number(n, _) => n
-                        .parse::<i64>()
-                        .map(InsertScalar::Int)
-                        .unwrap_or_else(|_| InsertScalar::Str(n.clone())),
-                    SqlValue::Boolean(b) => InsertScalar::Bool(*b),
-                    SqlValue::Null => InsertScalar::Null,
-                    other => InsertScalar::Str(other.to_string()),
-                },
-                other => InsertScalar::Str(other.to_string()),
-            };
-            parsed_row.push(scalar);
-        }
-        rows.push(parsed_row);
-    }
-
-    let column_count = rows.first().map(|r| r.len()).unwrap_or(0);
+    let column_count = payload.rows.first().map(|r| r.len()).unwrap_or(0);
     if column_count == 0 {
         return Err("INSERT VALUES produced zero columns".to_string());
     }
-    if rows.iter().any(|r| r.len() != column_count) {
+    if payload.rows.iter().any(|r| r.len() != column_count) {
         return Err("INSERT VALUES row width mismatch".to_string());
     }
+    if payload.columns.len() != column_count {
+        return Err("INSERT payload columns width mismatch".to_string());
+    }
 
-    let columns = if insert.columns.is_empty() {
-        (1..=column_count).map(|i| format!("c{}", i)).collect()
-    } else {
-        insert.columns.iter().map(ToString::to_string).collect()
-    };
+    let rows = payload
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|scalar| match scalar {
+                    InsertScalarPayload::Int(v) => InsertScalar::Int(v),
+                    InsertScalarPayload::Bool(v) => InsertScalar::Bool(v),
+                    InsertScalarPayload::Str(v) => InsertScalar::Str(v),
+                    InsertScalarPayload::Null => InsertScalar::Null,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
     Ok(ParsedInsertPayload {
-        table_name: insert.table.to_string(),
-        columns,
+        table_name: payload.table_name,
+        columns: payload.columns,
         rows,
     })
 }
@@ -768,10 +753,6 @@ pub async fn handle_execute_task(
         .as_ref()
         .map(|t| t.operation.to_lowercase())
         .unwrap_or_default();
-    let task_input = first_task
-        .as_ref()
-        .map(|t| t.input.clone())
-        .unwrap_or_default();
     let task_id = first_task
         .as_ref()
         .map(|t| t.task_id.clone())
@@ -928,8 +909,20 @@ pub async fn handle_execute_task(
                 }
             })
     });
-    let parsed_insert = if operation == "insert" && !task_input.trim().is_empty() {
-        parse_insert_payload(&task_input).ok()
+    let parsed_insert = if operation == "insert" {
+        match first_task.as_ref() {
+            Some(task) => match parse_insert_payload(task) {
+                Ok(parsed) => Some(parsed),
+                Err(message) => {
+                    return crate::services::worker_service_server::worker_service::TaskResponse {
+                        status: "error".to_string(),
+                        error: message,
+                        result_location: String::new(),
+                    };
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };

@@ -520,7 +520,9 @@ fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
         let remaining_lower = &lower[current_pos..];
 
         // Try to find BETWEEN keyword
-        let between_pos = remaining_lower.find(" between ").map(|pos| current_pos + pos);
+        let between_pos = remaining_lower
+            .find(" between ")
+            .map(|pos| current_pos + pos);
 
         // Check if there's a NOT before BETWEEN
         let mut clause_start = current_pos;

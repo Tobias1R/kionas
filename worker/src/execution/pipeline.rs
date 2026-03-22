@@ -15,7 +15,9 @@ use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
 use crate::storage::exchange::list_stage_exchange_data_keys;
 use arrow::array::BooleanArray;
+use arrow::array::StringArray;
 use arrow::compute::filter_record_batch;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -625,6 +627,16 @@ pub(crate) async fn execute_query_task(
     let source_relation_key = relation_key(namespace);
     let mut batches = load_input_batches(shared, session_id, namespace, &stage_context).await?;
 
+    if stage_context.upstream_stage_ids.is_empty() && batches.is_empty() {
+        if let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str()) {
+            log::info!(
+                "query source scan has no parquet files for {}; materializing empty table result",
+                source_relation_key
+            );
+            batches.push(build_empty_batch_from_relation_columns(columns)?);
+        }
+    }
+
     if stage_context.upstream_stage_ids.is_empty()
         && let Some(columns) = relation_columns_by_key.get(source_relation_key.as_str())
     {
@@ -766,6 +778,25 @@ fn apply_relation_column_names(
     Ok(renamed)
 }
 
+fn build_empty_batch_from_relation_columns(relation_columns: &[String]) -> Result<RecordBatch, String> {
+    let mut fields = Vec::<Field>::new();
+    let mut arrays = Vec::<std::sync::Arc<dyn arrow::array::Array>>::new();
+
+    for column in relation_columns {
+        let normalized = column.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        fields.push(Field::new(normalized, DataType::Utf8, true));
+        arrays.push(std::sync::Arc::new(StringArray::from(Vec::<Option<String>>::new())));
+    }
+
+    let schema = std::sync::Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays)
+        .map_err(|e| format!("failed to build empty fallback record batch: {}", e))
+}
+
 /// What: Parse exchange partition index from a stage artifact key.
 ///
 /// Inputs:
@@ -868,8 +899,21 @@ pub(crate) async fn load_input_batches(
 ) -> Result<Vec<RecordBatch>, String> {
     if stage_context.upstream_stage_ids.is_empty() {
         let source_prefix = source_table_staging_prefix(namespace);
-        let source_batches =
-            load_scan_batches(shared, &source_prefix, &stage_context.scan_hints).await?;
+        let source_batches = match load_scan_batches(shared, &source_prefix, &stage_context.scan_hints).await {
+            Ok(batches) => batches,
+            Err(error)
+                if error
+                    .to_ascii_lowercase()
+                    .contains("no source parquet files found for query prefix") =>
+            {
+                log::info!(
+                    "query source prefix {} has no parquet files; continuing with empty input",
+                    source_prefix
+                );
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         return partition_input_batches(
             &source_batches,
             stage_context.partition_count,

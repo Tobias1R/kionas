@@ -5,9 +5,12 @@
 mod auth;
 mod auth_setup;
 mod consul;
+mod planner;
+mod providers;
 //mod core;
 mod handlers;
 mod janitor;
+mod parser;
 mod server;
 mod services;
 mod session;

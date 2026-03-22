@@ -467,9 +467,7 @@ fn predicate_expr_to_proto(
                 .iter()
                 .map(predicate_expr_to_proto)
                 .collect::<Option<Vec<_>>>()?;
-            ws::filter_predicate::Variant::Conjunction(ws::PredicateConjunction {
-                clauses,
-            })
+            ws::filter_predicate::Variant::Conjunction(ws::PredicateConjunction { clauses })
         }
         PredicateExpr::Comparison { column, op, value } => {
             let (proto_value, value_type) = predicate_value_to_proto_scalar(value)?;

@@ -1,9 +1,9 @@
 // Minimal, clean service implementation for `warehouse_service`.
 // This file intentionally keeps handler logic simple so the crate builds.
 
+use crate::parser::sql::parse_query;
 use crate::statement_handler::handle_statement;
 use crate::warehouse::state::SharedData;
-use kionas::parser::sql::parse_query;
 use tonic::{Request, Response, Status};
 
 pub mod warehouse_service {

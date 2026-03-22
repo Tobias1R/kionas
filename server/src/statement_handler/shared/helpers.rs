@@ -373,12 +373,10 @@ pub async fn run_stage_groups_for_input(
             })?;
 
             let location = partition_result.map_err(|e| {
-                Box::new(std::io::Error::other(
-                    format!(
-                        "stage {} partition {} dispatch failed: {}",
-                        stage_id, partition_index, e
-                    ),
-                )) as Box<dyn Error + Send + Sync>
+                Box::new(std::io::Error::other(format!(
+                    "stage {} partition {} dispatch failed: {}",
+                    stage_id, partition_index, e
+                ))) as Box<dyn Error + Send + Sync>
             })?;
             stage_locations.push((partition_index, location));
         }
@@ -411,11 +409,9 @@ pub async fn run_stage_groups_for_input(
     result_by_stage
         .remove(&final_stage.stage_id)
         .ok_or_else(|| {
-            Box::new(std::io::Error::other(
-                format!(
-                    "final stage {} has no result location",
-                    final_stage.stage_id
-                ),
-            )) as Box<dyn Error + Send + Sync>
+            Box::new(std::io::Error::other(format!(
+                "final stage {} has no result location",
+                final_stage.stage_id
+            ))) as Box<dyn Error + Send + Sync>
         })
 }

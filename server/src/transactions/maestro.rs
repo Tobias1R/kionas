@@ -393,9 +393,8 @@ impl Maestro {
             if let Ok(pool) = {
                 let state = self.shared.lock().await;
                 state.get_or_create_pool_for_key(&p.target).await
-            }
-                && let Ok(conn) =
-                    crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 5).await
+            } && let Ok(conn) =
+                crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 5).await
             {
                 let areq = crate::services::worker_service_client::worker_service::AbortRequest {
                     tx_id: tx_id.to_string(),

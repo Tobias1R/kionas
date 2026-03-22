@@ -1,4 +1,4 @@
-use super::maybe_prune_scan_keys;
+use super::{build_empty_batch_from_relation_columns, maybe_prune_scan_keys};
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::storage::StorageProvider;
 use crate::storage::mock::MockProvider;
@@ -24,6 +24,20 @@ fn metadata_pruned_hints(predicate_ast: serde_json::Value, pin: u64) -> RuntimeS
 
 fn as_storage(provider: Arc<MockProvider>) -> Arc<dyn StorageProvider + Send + Sync> {
     provider
+}
+
+#[test]
+fn builds_empty_batch_from_relation_columns() {
+    let batch = build_empty_batch_from_relation_columns(&[
+        "Id".to_string(),
+        "Name".to_string(),
+    ])
+    .expect("empty batch should build");
+
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.num_columns(), 2);
+    assert_eq!(batch.schema().field(0).name(), "id");
+    assert_eq!(batch.schema().field(1).name(), "name");
 }
 
 #[tokio::test]

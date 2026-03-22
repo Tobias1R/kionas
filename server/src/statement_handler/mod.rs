@@ -4,9 +4,9 @@ pub(crate) mod query;
 pub(crate) mod shared;
 pub(crate) mod utility;
 
+use crate::parser::datafusion_sql::sqlparser::ast::Statement;
 use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
 
 /// Discover worker address tied to session
 #[allow(dead_code)]

@@ -25,18 +25,20 @@ pub async fn acquire_channel_with_heartbeat(
             .await
             {
                 Ok(Ok(_)) => Ok(conn),
-                Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-                    format!("heartbeat error: {:?}", e),
-                ))),
+                Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+                    "heartbeat error: {:?}",
+                    e
+                )))),
                 Err(_) => Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timed out during heartbeat",
                 ))),
             }
         }
-        Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-            format!("pool.get() error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "pool.get() error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out getting pooled connection",
@@ -81,9 +83,10 @@ pub async fn send_task_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-            format!("execute_task error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "execute_task error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out executing task",
@@ -108,9 +111,10 @@ pub async fn send_prepare_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-            format!("prepare error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "prepare error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during prepare",
@@ -135,9 +139,10 @@ pub async fn send_commit_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-            format!("commit error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "commit error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during commit",
@@ -162,9 +167,10 @@ pub async fn send_abort_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::other(
-            format!("abort error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "abort error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during abort",

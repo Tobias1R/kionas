@@ -17,25 +17,25 @@
 
 #[cfg(not(feature = "std"))]
 use crate::alloc::string::ToString;
-use datafusion::sql::sqlparser::ast::helpers::key_value_options::{
+use sqlparser::ast::helpers::key_value_options::{
     KeyValueOption, KeyValueOptionType, KeyValueOptions, KeyValueOptionsDelimiter,
 };
-use datafusion::sql::sqlparser::ast::helpers::stmt_create_database::CreateDatabaseBuilder;
-use datafusion::sql::sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
-use datafusion::sql::sqlparser::ast::helpers::stmt_data_loading::{
+use sqlparser::ast::helpers::stmt_create_database::CreateDatabaseBuilder;
+use sqlparser::ast::helpers::stmt_create_table::CreateTableBuilder;
+use sqlparser::ast::helpers::stmt_data_loading::{
     FileStagingCommand, StageLoadSelectItem, StageLoadSelectItemKind, StageParamsObject,
 };
-use datafusion::sql::sqlparser::ast::{
+use sqlparser::ast::{
     CatalogSyncNamespaceMode, ColumnOption, ColumnPolicy, ColumnPolicyProperty, ContactEntry,
     CopyIntoSnowflakeKind, CreateTableLikeKind, DollarQuotedString, Ident, IdentityParameters,
     IdentityProperty, IdentityPropertyFormatKind, IdentityPropertyKind, IdentityPropertyOrder,
     InitializeKind, ObjectName, ObjectNamePart, RefreshModeKind, RowAccessPolicy, ShowObjects,
     SqlOption, Statement, StorageSerializationPolicy, TagsColumnOption, WrappedCollection,
 };
-use datafusion::sql::sqlparser::dialect::{Dialect, Precedence};
-use datafusion::sql::sqlparser::keywords::Keyword;
-use datafusion::sql::sqlparser::parser::{IsOptional, Parser, ParserError};
-use datafusion::sql::sqlparser::tokenizer::Token;
+use sqlparser::dialect::{Dialect, Precedence};
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::{IsOptional, Parser, ParserError};
+use sqlparser::tokenizer::Token;
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 #[cfg(not(feature = "std"))]
@@ -45,7 +45,7 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec};
 
-use datafusion::sql::sqlparser::keywords::RESERVED_FOR_IDENTIFIER;
+use sqlparser::keywords::RESERVED_FOR_IDENTIFIER;
 
 const RESERVED_KEYWORDS_FOR_SELECT_ITEM_OPERATOR: [Keyword; 1] = [Keyword::CONNECT_BY_ROOT];
 
@@ -679,7 +679,7 @@ pub fn parse_create_table(
                 Keyword::LIKE => {
                     let name = parser.parse_object_name(false)?;
                     builder = builder.like(Some(CreateTableLikeKind::Plain(
-                        datafusion::sql::sqlparser::ast::CreateTableLike {
+                        sqlparser::ast::CreateTableLike {
                             name,
                             defaults: None,
                         },

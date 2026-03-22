@@ -149,6 +149,24 @@ pub struct QueryDispatchEnvelope {
     pub table: String,
 }
 
+/// What: Canonical SELECT dispatch model bundle without planning artifacts.
+///
+/// Inputs:
+/// - `model`: Canonical semantic model extracted from SQL AST.
+/// - `database`: Canonical database identifier.
+/// - `schema`: Canonical schema identifier.
+/// - `table`: Canonical table identifier.
+///
+/// Output:
+/// - Reusable bundle consumed by server-owned planning and payload emission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectQueryDispatchModel {
+    pub model: SelectQueryModel,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+}
+
 /// What: Error type produced while translating SQL AST into shared query model.
 ///
 /// Inputs:
@@ -557,12 +575,59 @@ fn parse_join_specs(
 /// Details:
 /// - This function centralizes query payload construction outside the server crate so
 ///   planner and other crates can share the same model boundary.
-pub fn build_select_query_dispatch_envelope(
+pub async fn build_select_query_dispatch_envelope(
     query: &SqlQuery,
     session_id: &str,
     default_database: &str,
     default_schema: &str,
 ) -> Result<QueryDispatchEnvelope, QueryModelError> {
+    let select_query =
+        build_select_query_model(query, session_id, default_database, default_schema)?;
+    let database = select_query.database;
+    let schema = select_query.schema;
+    let table = select_query.table;
+    let model = select_query.model;
+
+    let payload = json!({
+        "version": model.version,
+        "statement": model.statement,
+        "session_id": model.session_id,
+        "namespace": model.namespace,
+        "projection": model.projection,
+        "selection": model.selection,
+        "joins": model.joins,
+        "group_by": model.group_by,
+        "order_by": model.order_by,
+        "limit": model.limit,
+        "offset": model.offset,
+        "sql": model.sql,
+    })
+    .to_string();
+
+    Ok(QueryDispatchEnvelope {
+        payload,
+        database,
+        schema,
+        table,
+    })
+}
+
+/// What: Build canonical SELECT query model and namespace metadata from SQL AST.
+///
+/// Inputs:
+/// - `query`: Parsed SQL query AST.
+/// - `session_id`: Current session identifier.
+/// - `default_database`: Session default database fallback.
+/// - `default_schema`: Session default schema fallback.
+///
+/// Output:
+/// - `SelectQueryDispatchModel` containing canonical semantic model and relation namespace.
+pub fn build_select_query_model(
+    query: &SqlQuery,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<SelectQueryDispatchModel, QueryModelError> {
     let select = extract_minimal_select(query)?;
 
     let from = &select.from[0];
@@ -603,54 +668,8 @@ pub fn build_select_query_dispatch_envelope(
         sql: canonical_sql,
     };
 
-    let logical_plan = crate::planner::build_logical_plan_from_select_model(&model)
-        .map_err(|e| QueryModelError::PlannerTranslationFailed(e.to_string()))?;
-    let physical_plan = crate::planner::build_physical_plan_from_logical_plan(&logical_plan)
-        .map_err(|e| match e {
-            crate::planner::PlannerError::InvalidPhysicalPipeline(message) => {
-                QueryModelError::InvalidPhysicalPipeline(message)
-            }
-            crate::planner::PlannerError::UnsupportedPhysicalOperator(name) => {
-                QueryModelError::UnsupportedPhysicalOperator(name)
-            }
-            crate::planner::PlannerError::UnsupportedPredicate(name) => {
-                QueryModelError::UnsupportedPredicate(name)
-            }
-            _ => QueryModelError::PlannerPhysicalFailed(e.to_string()),
-        })?;
-    let logical_plan_text = crate::planner::explain::explain_logical_plan(&logical_plan);
-    let physical_plan_text = crate::planner::explain::explain_physical_plan(&physical_plan);
-    let physical_pipeline = physical_plan
-        .operators
-        .iter()
-        .map(|op| op.canonical_name().to_string())
-        .collect::<Vec<_>>();
-
-    let payload = json!({
-        "version": model.version,
-        "statement": model.statement,
-        "session_id": model.session_id,
-        "namespace": model.namespace,
-        "projection": model.projection,
-        "selection": model.selection,
-        "joins": model.joins,
-        "group_by": model.group_by,
-        "order_by": model.order_by,
-        "limit": model.limit,
-        "offset": model.offset,
-        "sql": model.sql,
-        "logical_plan": logical_plan,
-        "physical_plan": physical_plan,
-        "diagnostics": {
-            "logical_plan_text": logical_plan_text,
-            "physical_plan_text": physical_plan_text,
-            "physical_pipeline": physical_pipeline,
-        },
-    })
-    .to_string();
-
-    Ok(QueryDispatchEnvelope {
-        payload,
+    Ok(SelectQueryDispatchModel {
+        model,
         database,
         schema,
         table,
@@ -663,13 +682,13 @@ mod tests {
         QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
         VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
         VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE, build_select_query_dispatch_envelope,
-        validation_code_for_query_error,
+        build_select_query_model, validation_code_for_query_error,
     };
     use crate::parser::sql::parse_query;
     use serde_json::Value;
 
-    #[test]
-    fn builds_payload_for_minimal_select() {
+    #[tokio::test]
+    async fn builds_payload_for_minimal_select() {
         let statements = parse_query("SELECT id FROM sales.public.users WHERE active = true")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -679,18 +698,16 @@ mod tests {
         };
 
         let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect("payload should build");
 
         assert!(envelope.payload.contains("\"statement\":\"Select\""));
         assert!(envelope.payload.contains("\"database\":\"sales\""));
-        assert!(envelope.payload.contains("\"logical_plan\""));
-        assert!(envelope.payload.contains("\"physical_plan\""));
-        assert!(envelope.payload.contains("\"diagnostics\""));
         assert_eq!(envelope.table, "users");
     }
 
-    #[test]
-    fn captures_order_by_in_payload() {
+    #[tokio::test]
+    async fn captures_order_by_in_payload() {
         let statements =
             parse_query("SELECT id FROM sales.public.users ORDER BY id DESC LIMIT 5 OFFSET 2")
                 .expect("statement should parse");
@@ -701,6 +718,7 @@ mod tests {
         };
 
         let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect("payload should build");
         let parsed: Value =
             serde_json::from_str(&envelope.payload).expect("payload should be valid json");
@@ -721,18 +739,12 @@ mod tests {
         assert_eq!(parsed.get("limit").and_then(Value::as_u64), Some(5));
         assert_eq!(parsed.get("offset").and_then(Value::as_u64), Some(2));
 
-        let diagnostics = parsed
-            .get("diagnostics")
-            .expect("payload should include diagnostics");
-        let physical_text = diagnostics
-            .get("physical_plan_text")
-            .and_then(Value::as_str)
-            .expect("diagnostics should include physical_plan_text");
-        assert!(physical_text.contains("Sort(id DESC)"));
+        assert!(parsed.get("diagnostics").is_none());
+        assert!(parsed.get("physical_plan").is_none());
     }
 
-    #[test]
-    fn rejects_offset_without_limit() {
+    #[tokio::test]
+    async fn rejects_offset_without_limit() {
         let statements = parse_query("SELECT id FROM sales.public.users OFFSET 2")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -742,12 +754,13 @@ mod tests {
         };
 
         let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect_err("must reject offset without limit");
         assert!(matches!(err, QueryModelError::OffsetWithoutLimit));
     }
 
-    #[test]
-    fn rejects_fetch_clause() {
+    #[tokio::test]
+    async fn rejects_fetch_clause() {
         let statements = parse_query("SELECT id FROM sales.public.users FETCH FIRST 1 ROWS ONLY")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -757,12 +770,35 @@ mod tests {
         };
 
         let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect_err("must reject fetch");
         assert!(matches!(err, QueryModelError::UnsupportedFetchClause));
     }
 
-    #[test]
-    fn rejects_multi_table_select() {
+    #[tokio::test]
+    async fn builds_payload_when_relation_does_not_exist_in_runtime_catalog() {
+        let statements = parse_query("SELECT id FROM abc.schema1.table4 ORDER BY id")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "abc", "schema1")
+            .await
+            .expect("payload should build without runtime catalog lookups");
+
+        let parsed: Value =
+            serde_json::from_str(&envelope.payload).expect("payload should be valid json");
+        assert_eq!(
+            parsed.get("sql").and_then(Value::as_str),
+            Some("SELECT id FROM abc.schema1.table4 ORDER BY id")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_multi_table_select() {
         let statements = parse_query("SELECT * FROM a, b").expect("statement should parse");
         let statement = statements.first().expect("statement expected");
         let query = match statement {
@@ -771,13 +807,14 @@ mod tests {
         };
 
         let err = build_select_query_dispatch_envelope(query, "s1", "default", "public")
+            .await
             .expect_err("must reject unsupported shape");
 
         assert!(err.to_string().contains("exactly one table"));
     }
 
-    #[test]
-    fn payload_contains_logical_plan_structure() {
+    #[tokio::test]
+    async fn payload_contains_query_model_structure() {
         let statements = parse_query("SELECT id, name FROM sales.public.users WHERE active = true")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -787,6 +824,7 @@ mod tests {
         };
 
         let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect("payload should build");
 
         let parsed: Value =
@@ -814,41 +852,12 @@ mod tests {
             Some("users")
         );
 
-        let logical_plan = parsed
-            .get("logical_plan")
-            .expect("payload should include logical_plan");
-        let relation = logical_plan
-            .get("relation")
-            .expect("logical_plan should include relation");
-        assert_eq!(
-            relation.get("database").and_then(Value::as_str),
-            Some("sales")
-        );
-        assert_eq!(
-            relation.get("schema").and_then(Value::as_str),
-            Some("public")
-        );
-        assert_eq!(relation.get("table").and_then(Value::as_str), Some("users"));
-
-        let projection_exprs = logical_plan
-            .get("projection")
-            .and_then(|p| p.get("expressions"))
-            .and_then(Value::as_array)
-            .expect("logical_plan.projection.expressions should be an array");
-        assert_eq!(projection_exprs.len(), 2);
-
-        let physical_plan = parsed
-            .get("physical_plan")
-            .expect("payload should include physical_plan");
-        let operators = physical_plan
-            .get("operators")
-            .and_then(Value::as_array)
-            .expect("physical_plan.operators should be an array");
-        assert!(operators.len() >= 3);
+        assert!(parsed.get("logical_plan").is_none());
+        assert!(parsed.get("physical_plan").is_none());
     }
 
-    #[test]
-    fn rejects_deferred_predicate_shapes() {
+    #[tokio::test]
+    async fn accepts_deferred_predicate_shapes_in_model_only_envelope() {
         let statements = parse_query("SELECT id FROM sales.public.users WHERE name LIKE 'a%'")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -857,13 +866,30 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
-            .expect_err("must reject deferred predicate");
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect("model-only envelope should not reject deferred predicates");
+        assert!(envelope.payload.contains("name LIKE 'a%'"));
+    }
 
-        match err {
-            QueryModelError::UnsupportedPredicate(name) => assert_eq!(name, "LIKE"),
-            other => panic!("unexpected error: {}", other),
-        }
+    #[tokio::test]
+    async fn builds_select_query_model_without_planning_artifacts() {
+        let statements = parse_query("SELECT id FROM sales.public.users ORDER BY id DESC LIMIT 5")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build");
+
+        assert_eq!(model.database, "sales");
+        assert_eq!(model.schema, "public");
+        assert_eq!(model.table, "users");
+        assert_eq!(model.model.limit, Some(5));
+        assert_eq!(model.model.order_by.len(), 1);
     }
 
     #[test]

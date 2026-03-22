@@ -1,8 +1,9 @@
+use crate::parser::datafusion_sql::sqlparser::ast::{Expr, ObjectName, SchemaName, SqlOption};
+use crate::providers::normalize_identifier;
 use crate::services::metastore_client::MetastoreClient;
 use crate::services::metastore_client::metastore_service as ms;
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::{Expr, ObjectName, SchemaName, SqlOption};
 
 const OUTCOME_PREFIX: &str = "RESULT";
 
@@ -47,25 +48,6 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
         code,
         message.into()
     )
-}
-
-/// What: Normalize SQL identifier fragments for deterministic comparisons and paths.
-///
-/// Inputs:
-/// - `raw`: Identifier text.
-///
-/// Output:
-/// - Lowercase normalized identifier without common quoting characters.
-///
-/// Details:
-/// - Supports common quoting styles: `"name"`, `` `name` ``, and `[name]`.
-fn normalize_identifier(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase()
 }
 
 /// What: Validate server-side naming rules for CREATE SCHEMA namespace parts.

@@ -1,7 +1,6 @@
 use super::{
     apply_filter_pipeline, apply_filter_predicate_pipeline, apply_limit_pipeline,
-    apply_projection_pipeline,
-    parse_projection_identifier, split_case_insensitive,
+    apply_projection_pipeline, parse_projection_identifier, split_case_insensitive,
 };
 use crate::execution::artifacts::{QueryArtifactMetadata, encode_result_metadata};
 use crate::execution::pipeline::{

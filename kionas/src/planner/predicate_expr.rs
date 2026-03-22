@@ -446,8 +446,8 @@ fn render_predicate_value(value: &PredicateValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_predicate_sql, render_predicate_expr, PredicateComparisonOp, PredicateExpr,
-        PredicateValue,
+        PredicateComparisonOp, PredicateExpr, PredicateValue, parse_predicate_sql,
+        render_predicate_expr,
     };
 
     #[test]

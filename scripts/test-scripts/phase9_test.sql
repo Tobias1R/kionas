@@ -198,3 +198,6 @@ SELECT COUNT(*) as total_rows FROM zxczzx.test_schema.products WHERE price > 0 A
 -- DROP TABLE zxczzx.test_schema.products;
 -- DROP SCHEMA zxczzx.test_schema;
 -- DROP DATABASE zxczzx;
+
+
+select * from bench.seed1.customers order by id limit 5;

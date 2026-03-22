@@ -1,10 +1,11 @@
+use crate::parser::datafusion_sql::sqlparser::ast::{
+    ColumnOption, CreateTable as SqlCreateTable, ObjectName,
+};
+use crate::providers::normalize_identifier;
 use crate::services::metastore_client::MetastoreClient;
 use crate::services::metastore_client::metastore_service as ms;
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::{
-    ColumnOption, CreateTable as SqlCreateTable, ObjectName,
-};
 use kionas::planner::validate_constraint_contract;
 use kionas::planner::validate_datatype_contract;
 use kionas::sql::constraints::{
@@ -46,22 +47,6 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
         code,
         message.into()
     )
-}
-
-/// What: Normalize identifier text for deterministic comparisons.
-///
-/// Inputs:
-/// - `raw`: Identifier text, possibly quoted.
-///
-/// Output:
-/// - Canonical lowercase identifier.
-fn normalize_identifier(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase()
 }
 
 /// What: Validate canonical namespace segment names.

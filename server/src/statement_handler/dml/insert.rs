@@ -1,8 +1,10 @@
-use crate::services::metastore_client::MetastoreClient;
-use crate::services::metastore_client::metastore_service as ms;
+use crate::parser::datafusion_sql::sqlparser::ast::{
+    Expr, Insert, SetExpr, Statement, Value as SqlValue,
+};
+use crate::providers::{KionasMetastoreResolver, normalize_identifier};
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::{Insert, Statement};
+use serde::Serialize;
 use std::collections::HashMap;
 
 const OUTCOME_PREFIX: &str = "RESULT";
@@ -62,22 +64,6 @@ fn normalize_insert_error_message(code: &str, err: &str) -> String {
     }
 }
 
-/// What: Normalize identifier text for deterministic metadata lookups.
-///
-/// Inputs:
-/// - `raw`: Identifier text that may include quoting.
-///
-/// Output:
-/// - Canonical lowercase identifier.
-fn normalize_identifier(raw: &str) -> String {
-    raw.trim()
-        .trim_matches('"')
-        .trim_matches('`')
-        .trim_matches('[')
-        .trim_matches(']')
-        .to_ascii_lowercase()
-}
-
 /// What: Canonicalize insert table text into a deterministic name.
 ///
 /// Inputs:
@@ -121,6 +107,101 @@ fn parse_table_namespace(table_name: &str) -> Option<(String, String, String)> {
     Some((parts[0].clone(), parts[1].clone(), parts[2].clone()))
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum InsertScalarPayload {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Null,
+}
+
+#[derive(Serialize)]
+struct InsertPayload {
+    table_name: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<InsertScalarPayload>>,
+}
+
+/// What: Build the worker INSERT payload contract from server-side SQL AST.
+///
+/// Inputs:
+/// - `insert_stmt`: Insert AST node from parsed SQL statement.
+/// - `table_name`: Canonical table name computed by the server.
+///
+/// Output:
+/// - JSON text for `insert_payload_json` task param.
+///
+/// Details:
+/// - Supports only `INSERT ... VALUES (...)` forms.
+/// - Preserves scalar intent across int, bool, string, and null values.
+fn build_insert_payload_json(insert_stmt: &Insert, table_name: &str) -> Result<String, String> {
+    let source = insert_stmt
+        .source
+        .as_ref()
+        .ok_or_else(|| "INSERT source is missing".to_string())?;
+
+    let values = match source.body.as_ref() {
+        SetExpr::Values(values) => values,
+        _ => {
+            return Err(
+                "INSERT source is not VALUES; only VALUES inserts are supported in worker"
+                    .to_string(),
+            );
+        }
+    };
+
+    if values.rows.is_empty() {
+        return Err("INSERT VALUES has no rows".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(values.rows.len());
+    for row in &values.rows {
+        let mut parsed_row = Vec::with_capacity(row.len());
+        for expr in row {
+            let scalar = match expr {
+                Expr::Value(vws) => match &vws.value {
+                    SqlValue::Number(n, _) => n
+                        .parse::<i64>()
+                        .map(InsertScalarPayload::Int)
+                        .unwrap_or_else(|_| InsertScalarPayload::Str(n.clone())),
+                    SqlValue::Boolean(b) => InsertScalarPayload::Bool(*b),
+                    SqlValue::Null => InsertScalarPayload::Null,
+                    other => InsertScalarPayload::Str(other.to_string()),
+                },
+                other => InsertScalarPayload::Str(other.to_string()),
+            };
+            parsed_row.push(scalar);
+        }
+        rows.push(parsed_row);
+    }
+
+    let column_count = rows.first().map(std::vec::Vec::len).unwrap_or(0);
+    if column_count == 0 {
+        return Err("INSERT VALUES produced zero columns".to_string());
+    }
+    if rows.iter().any(|r| r.len() != column_count) {
+        return Err("INSERT VALUES row width mismatch".to_string());
+    }
+
+    let columns = if insert_stmt.columns.is_empty() {
+        (1..=column_count).map(|i| format!("c{}", i)).collect()
+    } else {
+        insert_stmt
+            .columns
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    serde_json::to_string(&InsertPayload {
+        table_name: table_name.to_string(),
+        columns,
+        rows,
+    })
+    .map_err(|e| format!("failed to serialize INSERT payload: {}", e))
+}
+
 /// What: Load ordered table columns and NOT NULL columns from metastore metadata.
 ///
 /// Inputs:
@@ -140,71 +221,10 @@ async fn load_table_constraint_columns(
     schema: &str,
     table: &str,
 ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), String> {
-    let mut client = MetastoreClient::connect_with_shared(shared_data)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to connect to metastore for INSERT constraints: {}",
-                e
-            )
-        })?;
+    let resolver = KionasMetastoreResolver::new(shared_data.clone(), 8)?;
+    let metadata = resolver.resolve_relation(database, schema, table).await?;
 
-    let response = client
-        .execute(ms::MetastoreRequest {
-            action: Some(ms::metastore_request::Action::GetTable(
-                ms::GetTableRequest {
-                    database_name: database.to_string(),
-                    schema_name: schema.to_string(),
-                    table_name: table.to_string(),
-                    location: String::new(),
-                },
-            )),
-        })
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to load table metadata for INSERT constraints {}.{}.{}: {}",
-                database, schema, table, e
-            )
-        })?;
-
-    let result = response.result.ok_or_else(|| {
-        format!(
-            "metastore returned empty response for INSERT constraints {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let get_table = match result {
-        ms::metastore_response::Result::GetTableResponse(value) => value,
-        _ => {
-            return Err(format!(
-                "metastore returned unexpected response for INSERT constraints {}.{}.{}",
-                database, schema, table
-            ));
-        }
-    };
-
-    if !get_table.success {
-        return Err(format!(
-            "metastore table lookup failed for INSERT constraints {}.{}.{}: {}",
-            database, schema, table, get_table.message
-        ));
-    }
-
-    let metadata = get_table.metadata.ok_or_else(|| {
-        format!(
-            "metastore table lookup missing metadata for INSERT constraints {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let mut table_columns = metadata
-        .columns
-        .iter()
-        .map(|column| normalize_identifier(&column.name))
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
+    let mut table_columns = metadata.column_names();
     table_columns.dedup();
 
     let mut required_columns = metadata
@@ -265,6 +285,15 @@ pub(crate) async fn handle_insert_statement(
     let table_name =
         canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
     params.insert("table_name".to_string(), table_name.clone());
+    let insert_payload_json = match build_insert_payload_json(insert_stmt, &table_name) {
+        Ok(value) => value,
+        Err(e) => {
+            let err = e.to_string();
+            let (category, code) = map_insert_dispatch_error(&err);
+            return format_outcome(category, code, normalize_insert_error_message(code, &err));
+        }
+    };
+    params.insert("insert_payload_json".to_string(), insert_payload_json);
 
     if let Some((database, schema, table)) = parse_table_namespace(&table_name) {
         match load_table_constraint_columns(shared_data, &database, &schema, &table).await {

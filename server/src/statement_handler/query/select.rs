@@ -1,16 +1,21 @@
-use crate::services::metastore_client::MetastoreClient;
-use crate::services::metastore_client::metastore_service as ms;
+use crate::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
+use crate::planner::{
+    DataFusionPlanArtifacts, build_datafusion_plan_artifacts_with_providers,
+    translate_datafusion_to_kionas_physical_plan_with_providers,
+};
+use crate::providers::{KionasMetastoreResolver, KionasRelationMetadata};
 use crate::services::request_context::RequestContext;
 use crate::statement_handler::shared::distributed_dag;
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
 use deltalake::open_table_with_storage_options;
-use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
 use kionas::planner::render_predicate_expr;
 use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
-    build_select_query_dispatch_envelope, validation_code_for_query_error,
+    VALIDATION_CODE_UNSUPPORTED_OPERATOR, VALIDATION_CODE_UNSUPPORTED_PIPELINE,
+    VALIDATION_CODE_UNSUPPORTED_PREDICATE, build_select_query_model,
+    validation_code_for_query_error,
 };
 use kionas::{config, parse_env_vars};
 use serde_json::{Value, json};
@@ -52,6 +57,28 @@ fn format_outcome(category: &str, code: &str, message: impl Into<String>) -> Str
         code,
         message.into()
     )
+}
+
+fn validation_code_for_planner_error(err: &kionas::planner::PlannerError) -> &'static str {
+    match err {
+        kionas::planner::PlannerError::InvalidPhysicalPipeline(_) => {
+            VALIDATION_CODE_UNSUPPORTED_PIPELINE
+        }
+        kionas::planner::PlannerError::UnsupportedPhysicalOperator(_) => {
+            VALIDATION_CODE_UNSUPPORTED_OPERATOR
+        }
+        kionas::planner::PlannerError::UnsupportedPredicate(_) => {
+            VALIDATION_CODE_UNSUPPORTED_PREDICATE
+        }
+        _ => "UNSUPPORTED_QUERY_SHAPE",
+    }
+}
+
+fn is_relation_resolution_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("table") && lower.contains("not found"))
+        || lower.contains("no suitable object store found")
+        || lower.contains("register_object_store")
 }
 
 /// What: Build a stable relation key used by worker-side relation column mapping.
@@ -237,61 +264,9 @@ async fn load_relation_location(
     schema: &str,
     table: &str,
 ) -> Result<String, String> {
-    let mut client = MetastoreClient::connect_with_shared(shared_data)
-        .await
-        .map_err(|e| format!("failed to connect to metastore for location lookup: {}", e))?;
-
-    let response = client
-        .execute(ms::MetastoreRequest {
-            action: Some(ms::metastore_request::Action::GetTable(
-                ms::GetTableRequest {
-                    database_name: database.to_string(),
-                    schema_name: schema.to_string(),
-                    table_name: table.to_string(),
-                    location: String::new(),
-                },
-            )),
-        })
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to fetch table location from metastore for {}.{}.{}: {}",
-                database, schema, table, e
-            )
-        })?;
-
-    let table_result = response.result.ok_or_else(|| {
-        format!(
-            "metastore returned empty get_table result for location lookup {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let get_table_response = match table_result {
-        ms::metastore_response::Result::GetTableResponse(value) => value,
-        _ => {
-            return Err(format!(
-                "metastore returned unexpected response for get_table location lookup {}.{}.{}",
-                database, schema, table
-            ));
-        }
-    };
-
-    if !get_table_response.success {
-        return Err(format!(
-            "metastore get_table failed for location lookup {}.{}.{}: {}",
-            database, schema, table, get_table_response.message
-        ));
-    }
-
-    let metadata = get_table_response.metadata.ok_or_else(|| {
-        format!(
-            "metastore get_table missing metadata for location lookup {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let location = metadata.location.trim().to_string();
+    let resolver = KionasMetastoreResolver::new(shared_data.clone(), 8)?;
+    let relation = resolver.resolve_relation(database, schema, table).await?;
+    let location = relation.location.unwrap_or_default().trim().to_string();
     if location.is_empty() {
         return Err(format!(
             "metastore get_table returned empty location for {}.{}.{}",
@@ -427,71 +402,9 @@ async fn load_relation_columns(
     schema: &str,
     table: &str,
 ) -> Result<Vec<String>, String> {
-    let mut client = MetastoreClient::connect_with_shared(shared_data)
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to connect to metastore for relation metadata: {}",
-                e
-            )
-        })?;
-
-    let response = client
-        .execute(ms::MetastoreRequest {
-            action: Some(ms::metastore_request::Action::GetTable(
-                ms::GetTableRequest {
-                    database_name: database.to_string(),
-                    schema_name: schema.to_string(),
-                    table_name: table.to_string(),
-                    location: String::new(),
-                },
-            )),
-        })
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to fetch table metadata from metastore for {}.{}.{}: {}",
-                database, schema, table, e
-            )
-        })?;
-
-    let table_result = response.result.ok_or_else(|| {
-        format!(
-            "metastore returned empty get_table result for {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let get_table_response = match table_result {
-        ms::metastore_response::Result::GetTableResponse(value) => value,
-        _ => {
-            return Err(format!(
-                "metastore returned unexpected response for get_table {}.{}.{}",
-                database, schema, table
-            ));
-        }
-    };
-
-    if !get_table_response.success {
-        return Err(format!(
-            "metastore get_table failed for {}.{}.{}: {}",
-            database, schema, table, get_table_response.message
-        ));
-    }
-
-    let metadata = get_table_response.metadata.ok_or_else(|| {
-        format!(
-            "metastore get_table missing metadata for {}.{}.{}",
-            database, schema, table
-        )
-    })?;
-
-    let columns = metadata
-        .columns
-        .iter()
-        .map(|column| column.name.trim().to_ascii_lowercase())
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
+    let resolver = KionasMetastoreResolver::new(shared_data.clone(), 8)?;
+    let relation = resolver.resolve_relation(database, schema, table).await?;
+    let columns = relation.column_names();
 
     if columns.is_empty() {
         return Err(format!(
@@ -544,247 +457,383 @@ pub(crate) async fn handle_select_query(
         }
     };
 
-    match build_select_query_dispatch_envelope(
-        ast.query,
-        session_id,
-        &default_database,
-        &default_schema,
-    ) {
-        Ok(canonical_query) => {
-            let payload = canonical_query.payload;
-            let database = canonical_query.database;
-            let schema = canonical_query.schema;
-            let table = canonical_query.table;
+    let canonical_query =
+        match build_select_query_model(ast.query, session_id, &default_database, &default_schema) {
+            Ok(value) => value,
+            Err(e) => {
+                return format_outcome(
+                    "VALIDATION",
+                    validation_code_for_query_error(&e),
+                    e.to_string(),
+                );
+            }
+        };
 
-            let payload_value: Value = match serde_json::from_str(&payload) {
-                Ok(value) => value,
-                Err(e) => {
+    let database = canonical_query.database;
+    let schema = canonical_query.schema;
+    let table = canonical_query.table;
+    let model = canonical_query.model;
+
+    let mut planning_relation_set = BTreeSet::<(String, String, String)>::new();
+    planning_relation_set.insert((database.clone(), schema.clone(), table.clone()));
+    for join in &model.joins {
+        planning_relation_set.insert((
+            join.right.database.clone(),
+            join.right.schema.clone(),
+            join.right.table.clone(),
+        ));
+    }
+
+    let resolver = match KionasMetastoreResolver::new(shared_data.clone(), 8) {
+        Ok(value) => value,
+        Err(error) => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                format!("failed to initialize metastore resolver: {}", error),
+            );
+        }
+    };
+
+    let mut planner_relation_inputs = Vec::<KionasRelationMetadata>::new();
+    let mut relation_columns_by_relation = BTreeMap::<String, Vec<String>>::new();
+    for (relation_db, relation_schema, relation_table) in &planning_relation_set {
+        match resolver
+            .resolve_relation(
+                relation_db.as_str(),
+                relation_schema.as_str(),
+                relation_table.as_str(),
+            )
+            .await
+        {
+            Ok(metadata) => {
+                let columns = metadata.column_names();
+                relation_columns_by_relation.insert(
+                    relation_key(
+                        relation_db.as_str(),
+                        relation_schema.as_str(),
+                        relation_table.as_str(),
+                    ),
+                    columns.clone(),
+                );
+                planner_relation_inputs.push(metadata);
+            }
+            Err(err) => {
+                log::warn!(
+                    "query_select relation metadata unavailable for planner {}.{}.{}: {}",
+                    relation_db,
+                    relation_schema,
+                    relation_table,
+                    err
+                );
+            }
+        }
+    }
+
+    let physical_plan = match translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        &planner_relation_inputs,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => {
+            return format_outcome(
+                "VALIDATION",
+                validation_code_for_planner_error(&e),
+                e.to_string(),
+            );
+        }
+    };
+    let physical_plan_text = kionas::planner::explain::explain_physical_plan(&physical_plan);
+
+    let datafusion_artifacts =
+        match build_datafusion_plan_artifacts_with_providers(&model.sql, &planner_relation_inputs)
+            .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(err) => {
+                let message = err.to_string();
+                if is_relation_resolution_error(&message) {
+                    DataFusionPlanArtifacts {
+                        logical_plan_text: format!(
+                            "DataFusion logical diagnostics unavailable: {}",
+                            message
+                        ),
+                        optimized_logical_plan_text: format!(
+                            "DataFusion optimized logical diagnostics unavailable: {}",
+                            message
+                        ),
+                        physical_plan_text: physical_plan_text.clone(),
+                    }
+                } else {
                     return format_outcome(
-                        "INFRA",
-                        "WORKER_QUERY_FAILED",
-                        format!("failed to parse canonical query payload: {}", e),
+                        "VALIDATION",
+                        "UNSUPPORTED_QUERY_SHAPE",
+                        format!("failed to build logical plan: {}", message),
                     );
                 }
-            };
+            }
+        };
 
-            let physical_value = match payload_value.get("physical_plan") {
-                Some(value) => value.clone(),
-                None => {
-                    return format_outcome(
-                        "INFRA",
-                        "WORKER_QUERY_FAILED",
-                        "canonical query payload missing physical_plan",
-                    );
-                }
-            };
+    let physical_pipeline = physical_plan
+        .operators
+        .iter()
+        .map(|op| op.canonical_name().to_string())
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "version": model.version,
+        "statement": model.statement,
+        "session_id": model.session_id,
+        "namespace": model.namespace,
+        "projection": model.projection,
+        "selection": model.selection,
+        "joins": model.joins,
+        "group_by": model.group_by,
+        "order_by": model.order_by,
+        "limit": model.limit,
+        "offset": model.offset,
+        "sql": model.sql,
+        "logical_plan": {
+            "engine": "datafusion",
+            "text": datafusion_artifacts.logical_plan_text,
+        },
+        "physical_plan": physical_plan,
+        "diagnostics": {
+            "logical_plan_text": datafusion_artifacts.logical_plan_text,
+            "logical_plan_optimized_text": datafusion_artifacts.optimized_logical_plan_text,
+            "physical_plan_text": datafusion_artifacts.physical_plan_text,
+            "physical_plan_legacy_text": physical_plan_text,
+            "physical_pipeline": physical_pipeline,
+        },
+    })
+    .to_string();
 
-            let physical_plan: PhysicalPlan = match serde_json::from_value(physical_value) {
-                Ok(plan) => plan,
-                Err(e) => {
-                    return format_outcome(
-                        "INFRA",
-                        "WORKER_QUERY_FAILED",
-                        format!("failed to decode physical_plan from payload: {}", e),
-                    );
-                }
-            };
+    let payload_value: Value = match serde_json::from_str(&payload) {
+        Ok(value) => value,
+        Err(e) => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                format!("failed to parse canonical query payload: {}", e),
+            );
+        }
+    };
 
-            let distributed_plan = distributed_from_physical_plan(&physical_plan);
-            if let Err(e) = validate_distributed_physical_plan(&distributed_plan) {
+    let physical_value = match payload_value.get("physical_plan") {
+        Some(value) => value.clone(),
+        None => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                "canonical query payload missing physical_plan",
+            );
+        }
+    };
+
+    let physical_plan: PhysicalPlan = match serde_json::from_value(physical_value) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                format!("failed to decode physical_plan from payload: {}", e),
+            );
+        }
+    };
+
+    let distributed_plan = distributed_from_physical_plan(&physical_plan);
+    if let Err(e) = validate_distributed_physical_plan(&distributed_plan) {
+        return format_outcome(
+            "INFRA",
+            "WORKER_QUERY_FAILED",
+            format!("distributed plan validation failed: {}", e),
+        );
+    }
+
+    let mut stage_groups =
+        match distributed_dag::compile_stage_task_groups(&distributed_plan, "query") {
+            Ok(groups) => groups,
+            Err(e) => {
                 return format_outcome(
                     "INFRA",
                     "WORKER_QUERY_FAILED",
-                    format!("distributed plan validation failed: {}", e),
+                    format!("failed to compile distributed stage groups: {}", e),
                 );
             }
+        };
 
-            let mut stage_groups =
-                match distributed_dag::compile_stage_task_groups(&distributed_plan, "query") {
-                    Ok(groups) => groups,
-                    Err(e) => {
-                        return format_outcome(
-                            "INFRA",
-                            "WORKER_QUERY_FAILED",
-                            format!("failed to compile distributed stage groups: {}", e),
-                        );
-                    }
-                };
+    let mut relation_set = BTreeSet::<(String, String, String)>::new();
+    relation_set.insert((database.clone(), schema.clone(), table.clone()));
+    for operator in &physical_plan.operators {
+        if let PhysicalOperator::HashJoin { spec } = operator {
+            relation_set.insert((
+                spec.right_relation.database.clone(),
+                spec.right_relation.schema.clone(),
+                spec.right_relation.table.clone(),
+            ));
+        }
+    }
 
-            let mut relation_set = BTreeSet::<(String, String, String)>::new();
-            relation_set.insert((database.clone(), schema.clone(), table.clone()));
-            for operator in &physical_plan.operators {
-                if let PhysicalOperator::HashJoin { spec } = operator {
-                    relation_set.insert((
-                        spec.right_relation.database.clone(),
-                        spec.right_relation.schema.clone(),
-                        spec.right_relation.table.clone(),
-                    ));
-                }
+    let mut relation_columns = BTreeMap::<String, Vec<String>>::new();
+    for (relation_db, relation_schema, relation_table) in relation_set {
+        let key = relation_key(
+            relation_db.as_str(),
+            relation_schema.as_str(),
+            relation_table.as_str(),
+        );
+        if let Some(existing) = relation_columns_by_relation.get(key.as_str()) {
+            relation_columns.insert(key, existing.clone());
+            continue;
+        }
+
+        match load_relation_columns(
+            shared_data,
+            relation_db.as_str(),
+            relation_schema.as_str(),
+            relation_table.as_str(),
+        )
+        .await
+        {
+            Ok(columns) => {
+                relation_columns.insert(key, columns);
             }
-
-            let mut relation_columns = BTreeMap::<String, Vec<String>>::new();
-            for (relation_db, relation_schema, relation_table) in relation_set {
-                match load_relation_columns(
-                    shared_data,
-                    relation_db.as_str(),
-                    relation_schema.as_str(),
-                    relation_table.as_str(),
-                )
-                .await
-                {
-                    Ok(columns) => {
-                        relation_columns.insert(
-                            relation_key(
-                                relation_db.as_str(),
-                                relation_schema.as_str(),
-                                relation_table.as_str(),
-                            ),
-                            columns,
-                        );
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "query_select relation metadata unavailable for {}.{}.{}: {}",
-                            relation_db,
-                            relation_schema,
-                            relation_table,
-                            err
-                        );
-                    }
-                }
-            }
-
-            let relation_columns_json = if relation_columns.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&relation_columns).ok()
-            };
-
-            let query_run_id = Uuid::new_v4().to_string();
-            let scan_pruning_hints_json = build_scan_pruning_hints_json(&physical_plan);
-            let scan_hints_eligible = scan_pruning_hints_json
-                .as_ref()
-                .and_then(|value| serde_json::from_str::<Value>(value).ok())
-                .and_then(|value| value.get("eligible").and_then(Value::as_bool))
-                .unwrap_or(false);
-            let scan_mode = if scan_hints_eligible {
-                "metadata_pruned"
-            } else {
-                "full"
-            };
-            let scan_delta_version_pin = match resolve_scan_delta_version_pin(
-                shared_data,
-                database.as_str(),
-                schema.as_str(),
-                table.as_str(),
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    log::warn!(
-                        "query_select failed to resolve delta snapshot version pin for {}.{}.{}: {} (emitting sentinel scan_delta_version_pin=0)",
-                        database,
-                        schema,
-                        table,
-                        err
-                    );
-                    0
-                }
-            };
-
-            if scan_mode == "metadata_pruned" && scan_delta_version_pin == 0 {
+            Err(err) => {
                 log::warn!(
-                    "query_select metadata_pruned mode enabled without concrete delta version pin; emitting sentinel scan_delta_version_pin=0"
+                    "query_select relation metadata unavailable for {}.{}.{}: {}",
+                    relation_db,
+                    relation_schema,
+                    relation_table,
+                    err
                 );
             }
+        }
+    }
 
-            for group in &mut stage_groups {
-                group
-                    .params
-                    .insert("database_name".to_string(), database.clone());
-                group
-                    .params
-                    .insert("schema_name".to_string(), schema.clone());
-                group.params.insert("table_name".to_string(), table.clone());
-                group
-                    .params
-                    .insert("query_kind".to_string(), "select".to_string());
-                group
-                    .params
-                    .insert("query_run_id".to_string(), query_run_id.clone());
-                // Phase FOUNDATION contract: scan metadata is always explicit,
-                // even when runtime falls back to full scan behavior.
-                group
-                    .params
-                    .insert("scan_mode".to_string(), scan_mode.to_string());
-                group.params.insert(
-                    "scan_delta_version_pin".to_string(),
-                    scan_delta_version_pin.to_string(),
-                );
-                if let Some(scan_hints_json) = scan_pruning_hints_json.as_ref() {
-                    group.params.insert(
-                        "scan_pruning_hints_json".to_string(),
-                        scan_hints_json.clone(),
-                    );
-                }
-                if let Some(mapping_json) = relation_columns_json.as_ref() {
-                    group
-                        .params
-                        .insert("relation_columns_json".to_string(), mapping_json.clone());
-                }
-            }
+    let relation_columns_json = if relation_columns.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&relation_columns).ok()
+    };
 
-            let auth_scope = format!("select:{}.{}.{}", database, schema, table);
-            let dispatch_auth_ctx = helpers::DispatchAuthContext {
-                rbac_user: ctx.rbac_user.clone(),
-                rbac_role: ctx.role.clone(),
-                scope: auth_scope,
-                query_id: ctx.query_id.clone(),
-            };
-
-            let worker_result_location = match helpers::run_stage_groups_for_input(
-                shared_data,
-                session_id,
-                &stage_groups,
-                Some(&dispatch_auth_ctx),
-                120,
-            )
-            .await
-            {
-                Ok(location) => location,
-                Err(e) => {
-                    return format_outcome(
-                        "INFRA",
-                        "WORKER_QUERY_FAILED",
-                        format!("worker query dispatch failed: {}", e),
-                    );
-                }
-            };
-
-            log::info!(
-                "query_select dispatched: session_id={} database={} schema={} table={} worker_result_location={}",
-                session_id,
+    let query_run_id = Uuid::new_v4().to_string();
+    let scan_pruning_hints_json = build_scan_pruning_hints_json(&physical_plan);
+    let scan_hints_eligible = scan_pruning_hints_json
+        .as_ref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.get("eligible").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let scan_mode = if scan_hints_eligible {
+        "metadata_pruned"
+    } else {
+        "full"
+    };
+    let scan_delta_version_pin = match resolve_scan_delta_version_pin(
+        shared_data,
+        database.as_str(),
+        schema.as_str(),
+        table.as_str(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!(
+                "query_select failed to resolve delta snapshot version pin for {}.{}.{}: {} (emitting sentinel scan_delta_version_pin=0)",
                 database,
                 schema,
                 table,
-                worker_result_location
+                err
             );
-            format_outcome(
-                "SUCCESS",
-                "QUERY_DISPATCHED",
-                format!(
-                    "query dispatched successfully for {}.{}.{} (location: {})",
-                    database, schema, table, worker_result_location
-                ),
-            )
+            0
         }
-        Err(e) => format_outcome(
-            "VALIDATION",
-            validation_code_for_query_error(&e),
-            e.to_string(),
-        ),
+    };
+
+    if scan_mode == "metadata_pruned" && scan_delta_version_pin == 0 {
+        log::warn!(
+            "query_select metadata_pruned mode enabled without concrete delta version pin; emitting sentinel scan_delta_version_pin=0"
+        );
     }
+
+    for group in &mut stage_groups {
+        group
+            .params
+            .insert("database_name".to_string(), database.clone());
+        group
+            .params
+            .insert("schema_name".to_string(), schema.clone());
+        group.params.insert("table_name".to_string(), table.clone());
+        group
+            .params
+            .insert("query_kind".to_string(), "select".to_string());
+        group
+            .params
+            .insert("query_run_id".to_string(), query_run_id.clone());
+        // Phase FOUNDATION contract: scan metadata is always explicit,
+        // even when runtime falls back to full scan behavior.
+        group
+            .params
+            .insert("scan_mode".to_string(), scan_mode.to_string());
+        group.params.insert(
+            "scan_delta_version_pin".to_string(),
+            scan_delta_version_pin.to_string(),
+        );
+        if let Some(scan_hints_json) = scan_pruning_hints_json.as_ref() {
+            group.params.insert(
+                "scan_pruning_hints_json".to_string(),
+                scan_hints_json.clone(),
+            );
+        }
+        if let Some(mapping_json) = relation_columns_json.as_ref() {
+            group
+                .params
+                .insert("relation_columns_json".to_string(), mapping_json.clone());
+        }
+    }
+
+    let auth_scope = format!("select:{}.{}.{}", database, schema, table);
+    let dispatch_auth_ctx = helpers::DispatchAuthContext {
+        rbac_user: ctx.rbac_user.clone(),
+        rbac_role: ctx.role.clone(),
+        scope: auth_scope,
+        query_id: ctx.query_id.clone(),
+    };
+
+    let worker_result_location = match helpers::run_stage_groups_for_input(
+        shared_data,
+        session_id,
+        &stage_groups,
+        Some(&dispatch_auth_ctx),
+        120,
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(e) => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                format!("worker query dispatch failed: {}", e),
+            );
+        }
+    };
+
+    log::info!(
+        "query_select dispatched: session_id={} database={} schema={} table={} worker_result_location={}",
+        session_id,
+        database,
+        schema,
+        table,
+        worker_result_location
+    );
+    format_outcome(
+        "SUCCESS",
+        "QUERY_DISPATCHED",
+        format!(
+            "query dispatched successfully for {}.{}.{} (location: {})",
+            database, schema, table, worker_result_location
+        ),
+    )
 }
 
 /// What: Build a SELECT AST wrapper from a generic SQL statement.
