@@ -1,6 +1,7 @@
 use super::{
-    ScanDecisionContext, ScanPruningDecisionFields, StageRuntimeTelemetryFields,
-    build_empty_batch_from_relation_columns, format_exchange_io_decision_event,
+    ScanDecisionContext, ScanPruningDecisionFields, StageRuntimeTelemetryFields, StorageErrorClass,
+    build_empty_batch_from_relation_columns, classify_storage_error,
+    format_exchange_io_decision_event, format_exchange_retry_decision_event,
     format_materialization_decision_event, format_scan_fallback_reason_event,
     format_scan_mode_chosen_event, format_scan_pruning_decision_event, format_stage_runtime_event,
     load_scan_batches, maybe_prune_scan_keys, parse_partition_index_from_exchange_key,
@@ -10,7 +11,12 @@ use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::state::SharedData;
 use crate::storage::StorageProvider;
 use crate::storage::mock::MockProvider;
+use async_trait::async_trait;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 fn metadata_pruned_hints(predicate_ast: serde_json::Value, pin: u64) -> RuntimeScanHints {
     RuntimeScanHints {
@@ -49,6 +55,160 @@ fn decision_context() -> ScanDecisionContext<'static> {
         query_id: "q-edge",
         stage_id: 1,
         task_id: "t-edge",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestStorageError(String);
+
+impl fmt::Display for TestStorageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for TestStorageError {}
+
+#[derive(Default)]
+struct FlakyProvider {
+    list_failures_remaining: AtomicUsize,
+    get_failures_remaining: AtomicUsize,
+    map: tokio::sync::Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl FlakyProvider {
+    fn new(list_failures: usize, get_failures: usize) -> Self {
+        Self {
+            list_failures_remaining: AtomicUsize::new(list_failures),
+            get_failures_remaining: AtomicUsize::new(get_failures),
+            map: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn seed(&self, key: &str, value: Vec<u8>) {
+        let mut guard = self.map.lock().await;
+        guard.insert(key.to_string(), value);
+    }
+}
+
+#[async_trait]
+impl StorageProvider for FlakyProvider {
+    async fn put_object(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut guard = self.map.lock().await;
+        guard.insert(key.to_string(), data);
+        Ok(())
+    }
+
+    async fn get_object(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .get_failures_remaining
+            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |count| {
+                if count == 0 { None } else { Some(count - 1) }
+            })
+            .is_ok()
+        {
+            return Err(Box::new(TestStorageError(
+                "timeout while reading object".to_string(),
+            )));
+        }
+
+        let guard = self.map.lock().await;
+        Ok(guard.get(key).cloned())
+    }
+
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .list_failures_remaining
+            .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |count| {
+                if count == 0 { None } else { Some(count - 1) }
+            })
+            .is_ok()
+        {
+            return Err(Box::new(TestStorageError(
+                "temporarily unavailable during list".to_string(),
+            )));
+        }
+
+        let guard = self.map.lock().await;
+        let mut keys = Vec::new();
+        for key in guard.keys() {
+            if key.starts_with(prefix) {
+                keys.push(key.clone());
+            }
+        }
+        Ok(keys)
+    }
+
+    async fn delete_object(
+        &self,
+        key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut guard = self.map.lock().await;
+        guard.remove(key);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct NonRetriableProvider {
+    list_calls: AtomicUsize,
+    get_calls: AtomicUsize,
+}
+
+impl NonRetriableProvider {
+    fn new() -> Self {
+        Self {
+            list_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageProvider for NonRetriableProvider {
+    async fn put_object(
+        &self,
+        _key: &str,
+        _data: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
+    async fn get_object(
+        &self,
+        _key: &str,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Err(Box::new(TestStorageError(
+            "invalid object key format".to_string(),
+        )))
+    }
+
+    async fn list_objects(
+        &self,
+        _prefix: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.list_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Err(Box::new(TestStorageError(
+            "invalid object key format".to_string(),
+        )))
+    }
+
+    async fn delete_object(
+        &self,
+        _key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 }
 
@@ -99,6 +259,31 @@ fn formats_exchange_io_decision_event_with_required_dimensions() {
     assert!(event.contains("partition_index=2"));
     assert!(event.contains("operator_family=exchange"));
     assert!(event.contains("direction=write"));
+}
+
+#[test]
+fn formats_exchange_retry_decision_event_with_required_dimensions() {
+    let event = format_exchange_retry_decision_event(
+        "q-retry",
+        11,
+        "list",
+        2,
+        "retrying",
+        "retriable",
+        "upstream_stage=9",
+    );
+
+    assert!(event.starts_with("event=execution.exchange_retry_decision "));
+    assert!(event.contains("query_id=q-retry"));
+    assert!(event.contains("stage_id=11"));
+    assert!(event.contains("operator_family=exchange"));
+    assert!(event.contains("category=execution"));
+    assert!(event.contains("origin=worker_pipeline"));
+    assert!(event.contains("operation=list"));
+    assert!(event.contains("attempt=2"));
+    assert!(event.contains("outcome=retrying"));
+    assert!(event.contains("failure_class=retriable"));
+    assert!(event.contains("target=upstream_stage=9"));
 }
 
 #[test]
@@ -433,4 +618,346 @@ async fn load_scan_batches_rejects_empty_source_for_metadata_pruned_mode() {
         err.contains("no source parquet files found for query prefix"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn classifies_transient_storage_errors_as_retriable() {
+    assert_eq!(
+        classify_storage_error("timeout while reading object"),
+        StorageErrorClass::Retriable
+    );
+    assert_eq!(
+        classify_storage_error("connection reset by peer"),
+        StorageErrorClass::Retriable
+    );
+    assert_eq!(
+        classify_storage_error("invalid object key format"),
+        StorageErrorClass::NonRetriable
+    );
+}
+
+#[tokio::test]
+async fn retries_exchange_list_then_succeeds() {
+    use super::list_stage_exchange_data_keys_with_retry;
+
+    let provider = Arc::new(FlakyProvider::new(2, 0));
+    provider
+        .seed(
+            "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+            b"p0".to_vec(),
+        )
+        .await;
+    provider
+        .seed(
+            "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json",
+            b"{}".to_vec(),
+        )
+        .await;
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+
+    let keys = list_stage_exchange_data_keys_with_retry(&provider_storage, "run-1", "sess-1", 2)
+        .await
+        .expect("retriable list should eventually succeed");
+
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].ends_with("part-00000.parquet"));
+}
+
+#[tokio::test]
+async fn retries_exchange_get_until_exhaustion() {
+    use super::get_exchange_artifact_with_retry;
+
+    let provider = Arc::new(FlakyProvider::new(0, 5));
+    provider
+        .seed(
+            "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+            b"p0".to_vec(),
+        )
+        .await;
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+
+    let err = get_exchange_artifact_with_retry(
+        &provider_storage,
+        "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+    )
+    .await
+    .expect_err("persistent retriable failures must exhaust retries");
+
+    assert!(err.contains("after 3 attempt(s)"));
+}
+
+#[tokio::test]
+async fn retries_exchange_get_then_succeeds() {
+    use super::get_exchange_artifact_with_retry;
+
+    let provider = Arc::new(FlakyProvider::new(0, 2));
+    provider
+        .seed(
+            "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+            b"ok".to_vec(),
+        )
+        .await;
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+
+    let bytes = get_exchange_artifact_with_retry(
+        &provider_storage,
+        "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+    )
+    .await
+    .expect("transient get failures should recover")
+    .expect("artifact should exist");
+
+    assert_eq!(bytes, b"ok".to_vec());
+}
+
+#[tokio::test]
+async fn non_retriable_exchange_list_fails_without_retry() {
+    use super::list_stage_exchange_data_keys_with_retry;
+
+    let provider = Arc::new(NonRetriableProvider::new());
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+
+    let err = list_stage_exchange_data_keys_with_retry(&provider_storage, "run-1", "sess-1", 2)
+        .await
+        .expect_err("non-retriable list failure must fail immediately");
+
+    assert!(err.contains("after 1 attempt(s)"));
+    assert_eq!(provider.list_calls.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_retriable_exchange_get_fails_without_retry() {
+    use super::get_exchange_artifact_with_retry;
+
+    let provider = Arc::new(NonRetriableProvider::new());
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+
+    let err = get_exchange_artifact_with_retry(
+        &provider_storage,
+        "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet",
+    )
+    .await
+    .expect_err("non-retriable get failure must fail immediately");
+
+    assert!(err.contains("after 1 attempt(s)"));
+    assert_eq!(provider.get_calls.load(AtomicOrdering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn validates_exchange_artifact_with_matching_metadata() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = MockProvider::new().into_arc();
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+    let metadata_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json";
+
+    provider
+        .put_object(data_key, b"abc".to_vec())
+        .await
+        .expect("data must seed");
+    provider
+        .put_object(
+            metadata_key,
+            serde_json::json!({
+                "artifacts": [{
+                    "key": data_key,
+                    "size_bytes": 3,
+                    "checksum_fnv64": "e71fa2190541574b"
+                }]
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await
+        .expect("metadata must seed");
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let bytes = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect("matching metadata should validate");
+
+    assert_eq!(bytes, b"abc".to_vec());
+}
+
+#[tokio::test]
+async fn rejects_exchange_artifact_with_checksum_mismatch() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = MockProvider::new().into_arc();
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+    let metadata_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json";
+
+    provider
+        .put_object(data_key, b"abc".to_vec())
+        .await
+        .expect("data must seed");
+    provider
+        .put_object(
+            metadata_key,
+            serde_json::json!({
+                "artifacts": [{
+                    "key": data_key,
+                    "size_bytes": 3,
+                    "checksum_fnv64": "0000000000000000"
+                }]
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await
+        .expect("metadata must seed");
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let err = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect_err("checksum mismatch must fail validation");
+
+    assert!(err.contains("exchange artifact checksum mismatch"));
+}
+
+#[tokio::test]
+async fn rejects_exchange_artifact_when_metadata_is_missing() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = MockProvider::new().into_arc();
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+
+    provider
+        .put_object(data_key, b"abc".to_vec())
+        .await
+        .expect("data must seed");
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let err = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect_err("missing metadata must fail validation");
+
+    assert!(err.contains("exchange metadata not found"));
+}
+
+#[tokio::test]
+async fn rejects_exchange_artifact_with_size_mismatch() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = MockProvider::new().into_arc();
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+    let metadata_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json";
+
+    provider
+        .put_object(data_key, b"abc".to_vec())
+        .await
+        .expect("data must seed");
+    provider
+        .put_object(
+            metadata_key,
+            serde_json::json!({
+                "artifacts": [{
+                    "key": data_key,
+                    "size_bytes": 99,
+                    "checksum_fnv64": "e71fa2190541574b"
+                }]
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await
+        .expect("metadata must seed");
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let err = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect_err("size mismatch must fail validation");
+
+    assert!(err.contains("exchange artifact size mismatch"));
+}
+
+#[tokio::test]
+async fn recovers_exchange_artifact_validation_after_transient_metadata_read_failure() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = Arc::new(FlakyProvider::new(0, 1));
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+    let metadata_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json";
+
+    provider.seed(data_key, b"abc".to_vec()).await;
+    provider
+        .seed(
+            metadata_key,
+            serde_json::json!({
+                "artifacts": [{
+                    "key": data_key,
+                    "size_bytes": 3,
+                    "checksum_fnv64": "e71fa2190541574b"
+                }]
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await;
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let bytes = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect("transient metadata read failure should recover");
+
+    assert_eq!(bytes, b"abc".to_vec());
+}
+
+#[tokio::test]
+async fn fails_exchange_artifact_validation_after_persistent_metadata_read_failure() {
+    use super::load_validated_exchange_artifact_with_retry;
+
+    let provider = Arc::new(FlakyProvider::new(0, 5));
+    let data_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.parquet";
+    let metadata_key = "distributed_exchange/run-1/sess-1/stage-2/part-00000.metadata.json";
+
+    provider.seed(data_key, b"abc".to_vec()).await;
+    provider.seed(metadata_key, b"{}".to_vec()).await;
+
+    let provider_storage: Arc<dyn StorageProvider + Send + Sync> = provider.clone();
+    let err = load_validated_exchange_artifact_with_retry(
+        &provider_storage,
+        "run-1",
+        "sess-1",
+        2,
+        data_key,
+    )
+    .await
+    .expect_err("persistent metadata read failure must exhaust retries");
+
+    assert!(err.contains("after 3 attempt(s)"));
+    assert!(err.contains("part-00000.metadata.json"));
 }
