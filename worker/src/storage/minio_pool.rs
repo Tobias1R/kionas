@@ -107,8 +107,10 @@ impl PooledMinioProvider {
     /// - Returns a boxed error to match `StorageProvider` trait signatures.
     async fn checkout(
         &self,
-    ) -> Result<deadpool::managed::Object<MinioProviderManager>, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        deadpool::managed::Object<MinioProviderManager>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         self.pool
             .get()
             .await

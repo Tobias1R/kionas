@@ -1,4 +1,3 @@
-use pem;
 use rcgen::{
     date_time_ymd, Certificate, CertificateParams, DistinguishedName, DnType, KeyPair, SanType,
 };
@@ -40,7 +39,7 @@ fn generate_cert(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let certificates = vec!["interops", "warehouse", "worker1"];
     for namex in certificates {
-        let _ = issue_cert(namex, &cert, &key_pair)?;
+        issue_cert(namex, &cert, &key_pair)?;
     }
 
     Ok(())
@@ -67,7 +66,7 @@ fn issue_cert(
     ];
 
     let key_pair = KeyPair::generate()?;
-    let cert = params.signed_by(&key_pair, issuer_pem, &issuer_key)?;
+    let cert = params.signed_by(&key_pair, issuer_pem, issuer_key)?;
 
     let pem_serialized = cert.pem();
     let pem = pem::parse(&pem_serialized)?;

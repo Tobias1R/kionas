@@ -1,5 +1,6 @@
 use super::{
-    apply_filter_pipeline, apply_limit_pipeline, apply_projection_pipeline,
+    apply_filter_pipeline, apply_filter_predicate_pipeline, apply_limit_pipeline,
+    apply_projection_pipeline,
     parse_projection_identifier, split_case_insensitive,
 };
 use crate::execution::artifacts::{QueryArtifactMetadata, encode_result_metadata};
@@ -11,6 +12,10 @@ use crate::execution::planner::extract_runtime_plan;
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use kionas::planner::{
+    PhysicalExpr, PhysicalOperator, PhysicalPlan, PredicateComparisonOp, PredicateExpr,
+    PredicateValue,
+};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::io::Cursor;
@@ -92,6 +97,35 @@ fn rejects_unquoted_temporal_filter_literal() {
     )
     .expect_err("unquoted temporal literal must fail");
     assert!(err.contains("unsupported temporal filter literal"));
+}
+
+#[test]
+fn applies_structured_conjunction_filter_pipeline() {
+    let predicate = PredicateExpr::Conjunction {
+        clauses: vec![
+            PredicateExpr::Comparison {
+                column: "id".to_string(),
+                op: PredicateComparisonOp::Gt,
+                value: PredicateValue::Int(1),
+            },
+            PredicateExpr::InList {
+                column: "name".to_string(),
+                values: PredicateValue::StrList(vec!["b".to_string()]),
+            },
+        ],
+    };
+
+    let filtered = apply_filter_predicate_pipeline(&[batch_two_rows()], &predicate, None)
+        .expect("structured conjunction filter must run");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].num_rows(), 1);
+
+    let ids = filtered[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column must be Int64");
+    assert_eq!(ids.value(0), 2);
 }
 
 #[test]
@@ -318,10 +352,114 @@ fn extracts_runtime_limit_spec() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let plan = extract_runtime_plan(&task).expect("runtime plan must parse");
     let limit = plan.limit_spec.expect("limit must be extracted");
     assert_eq!(limit.count, 5);
     assert_eq!(limit.offset, 2);
+}
+
+fn make_physical_plan_with_filter(predicate: PredicateExpr) -> PhysicalPlan {
+    PhysicalPlan {
+        operators: vec![PhysicalOperator::Filter {
+            predicate: PhysicalExpr::Predicate { predicate },
+        }],
+        sql: "SELECT * FROM t WHERE id = 7".to_string(),
+        schema_metadata: None,
+    }
+}
+
+fn make_proto_eq_filter(
+    column: &str,
+    value: i64,
+) -> crate::services::worker_service_server::worker_service::FilterPredicate {
+    use crate::services::worker_service_server::worker_service as ws;
+
+    ws::FilterPredicate {
+        variant: Some(ws::filter_predicate::Variant::Comparison(
+            ws::PredicateComparison {
+                column_name: column.to_string(),
+                operator: ws::ComparisonOperator::Equal as i32,
+                value: Some(ws::FilterValue {
+                    variant: Some(ws::filter_value::Variant::IntValue(value)),
+                }),
+                value_type: ws::FilterValueType::Int as i32,
+            },
+        )),
+    }
+}
+
+#[test]
+fn extract_runtime_plan_accepts_matching_task_filter_predicate() {
+    let predicate = PredicateExpr::Comparison {
+        column: "id".to_string(),
+        op: PredicateComparisonOp::Eq,
+        value: PredicateValue::Int(7),
+    };
+    let plan = make_physical_plan_with_filter(predicate.clone());
+
+    let task = crate::services::worker_service_server::worker_service::Task {
+        task_id: "t-filter-match".to_string(),
+        operation: "query".to_string(),
+        input: serde_json::json!({ "physical_plan": plan }).to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: Some(make_proto_eq_filter("id", 7)),
+    };
+
+    let runtime = extract_runtime_plan(&task).expect("runtime plan must parse");
+    assert_eq!(runtime.filter_predicate, Some(predicate));
+}
+
+#[test]
+fn extract_runtime_plan_rejects_mismatched_task_filter_predicate() {
+    let predicate = PredicateExpr::Comparison {
+        column: "id".to_string(),
+        op: PredicateComparisonOp::Eq,
+        value: PredicateValue::Int(7),
+    };
+    let plan = make_physical_plan_with_filter(predicate);
+
+    let task = crate::services::worker_service_server::worker_service::Task {
+        task_id: "t-filter-mismatch".to_string(),
+        operation: "query".to_string(),
+        input: serde_json::json!({ "physical_plan": plan }).to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: Some(make_proto_eq_filter("id", 8)),
+    };
+
+    let err = extract_runtime_plan(&task).expect_err("mismatch must fail runtime-plan extraction");
+    assert!(err.contains("does not match"));
+}
+
+#[test]
+fn extract_runtime_plan_uses_task_filter_predicate_without_plan_filter() {
+    let task = crate::services::worker_service_server::worker_service::Task {
+        task_id: "t-filter-task-only".to_string(),
+        operation: "query".to_string(),
+        input: serde_json::json!({
+            "physical_plan": {
+                "operators": ["Materialize"],
+                "sql": "SELECT 1",
+                "schema_metadata": null
+            }
+        })
+        .to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: Some(make_proto_eq_filter("id", 11)),
+    };
+
+    let runtime = extract_runtime_plan(&task).expect("runtime plan must parse");
+    assert_eq!(
+        runtime.filter_predicate,
+        Some(PredicateExpr::Comparison {
+            column: "id".to_string(),
+            op: PredicateComparisonOp::Eq,
+            value: PredicateValue::Int(11),
+        })
+    );
 }

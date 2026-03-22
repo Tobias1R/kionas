@@ -140,6 +140,9 @@ fn resolve_group_indices(
             let name = match expr {
                 PhysicalExpr::ColumnRef { name } => normalize_identifier(name),
                 PhysicalExpr::Raw { sql } => normalize_identifier(sql),
+                PhysicalExpr::Predicate { .. } => {
+                    return Err("grouping expressions cannot be predicates".to_string());
+                }
             };
             resolve_schema_column_index(batch.schema().as_ref(), &name)
                 .ok_or_else(|| format!("grouping column '{}' not found", name))
@@ -195,6 +198,9 @@ fn resolve_aggregate_indices(
                                     sql, aggregate.output_name
                                 )
                             })
+                    }
+                    Some(PhysicalExpr::Predicate { .. }) => {
+                        Err("aggregate input expression cannot be a predicate".to_string())
                     }
                     None => Ok(None),
                 }
@@ -358,6 +364,9 @@ fn build_output_batches(
         let name = match expr {
             PhysicalExpr::ColumnRef { name } => normalize_identifier(name),
             PhysicalExpr::Raw { sql } => normalize_identifier(sql),
+            PhysicalExpr::Predicate { .. } => {
+                return Err("grouping expressions cannot be predicates".to_string());
+            }
         };
         let values = grouped
             .iter()

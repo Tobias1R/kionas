@@ -3,6 +3,7 @@ use std::error::Error;
 use tonic::Request;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+#[allow(dead_code, clippy::enum_variant_names)]
 pub mod metastore_service {
     tonic::include_proto!("metastore_service");
 }
@@ -46,18 +47,14 @@ impl MetastoreClient {
         let addr = "https://kionas-metastore:443".to_string();
         let mut ep = Endpoint::from_shared(addr.clone())?;
 
-        if let Some(c) = cfg {
-            if let Some(iops) = c.services.interops.as_ref() {
-                if !iops.ca_cert.is_empty() {
-                    if let Ok(ca_bytes) =
-                        std::fs::read(kionas::parse_env_vars(&iops.ca_cert).as_str())
-                    {
-                        let ca = tonic::transport::Certificate::from_pem(ca_bytes);
-                        let tls = ClientTlsConfig::new().ca_certificate(ca);
-                        ep = ep.tls_config(tls)?;
-                    }
-                }
-            }
+        if let Some(c) = cfg
+            && let Some(iops) = c.services.interops.as_ref()
+            && !iops.ca_cert.is_empty()
+            && let Ok(ca_bytes) = std::fs::read(kionas::parse_env_vars(&iops.ca_cert).as_str())
+        {
+            let ca = tonic::transport::Certificate::from_pem(ca_bytes);
+            let tls = ClientTlsConfig::new().ca_certificate(ca);
+            ep = ep.tls_config(tls)?;
         }
 
         log::info!("Creating new metastore channel to {}", addr);

@@ -32,6 +32,20 @@ Foundation plan: [roadmaps/SILK_ROAD/DATATYPES/plans/plan-DATATYPES-FOUNDATION.m
 
 Foundation matrix: [roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md](roadmaps/ROADMAP_DATATYPES_FOUNDATION_MATRIX.md)
 
+## Road to Structured Predicates (Predicate Algebra)
+
+**What:** Refactor from raw SQL string predicates (re-parsed at worker) to structured, typed PredicateExpr objects sent from server.
+
+**Why:** Current design causes parsing edge cases (BETWEEN+IN combinations failing), lacks type safety, and prevents clean operator extensibility.
+
+**Impact:** Eliminates entire class of filter parsing bugs; enables safe addition of new operators; improves performance (1 parse instead of 2).
+
+Navigation: [roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/README.md](roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/README.md)
+
+Phase 1 discovery: [roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/discovery/discovery-predicate-algebra-phase1.md](roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/discovery/discovery-predicate-algebra-phase1.md)
+
+Phase 1 plan (5 phases total): [roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/plans/plan-predicate-algebra-phase1.md](roadmaps/SILK_ROAD/PREDICATE_ALGEBRA/plans/plan-predicate-algebra-phase1.md)
+
 ## Road to UI
 
 Current roadmap: [roadmaps/SILK_ROAD/UI/ROADMAP_UI.md](roadmaps/SILK_ROAD/UI/ROADMAP_UI.md)

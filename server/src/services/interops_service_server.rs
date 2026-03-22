@@ -30,7 +30,7 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
                 worker.name.clone(),
                 digested.clone(),
                 worker.host.clone(),
-                worker.port.clone() as u32,
+                worker.port,
                 worker.warehouse_type.clone(),
             ),
         );
@@ -76,7 +76,7 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             worker.name.clone(),
             digested.clone(),
             worker.host.clone(),
-            worker.port.clone() as u32,
+            worker.port,
             worker.warehouse_type.clone(),
         );
         let entry = WorkerEntry::new(digested.clone(), warehouse.clone(), ca_bytes.clone());

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use url::Url;
 
+#[allow(clippy::enum_variant_names)]
 pub mod worker_service {
     tonic::include_proto!("worker_service");
 }

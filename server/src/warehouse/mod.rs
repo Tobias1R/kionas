@@ -49,10 +49,12 @@ impl Warehouse {
         self.port
     }
 
+    #[allow(dead_code)]
     pub fn get_warehouse_type(&self) -> String {
         self.warehouse_type.clone()
     }
 
+    #[allow(dead_code)]
     pub fn get_connection_string(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -72,10 +74,12 @@ impl std::hash::Hash for Warehouse {
     }
 }
 
+#[allow(dead_code)]
 pub struct WarehouseManager {
     warehouses: Arc<Mutex<Vec<Warehouse>>>,
 }
 
+#[allow(dead_code)]
 impl WarehouseManager {
     pub fn new() -> Self {
         Self {

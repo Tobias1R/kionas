@@ -8,6 +8,7 @@ use tonic_reflection::server::Builder as ReflectionBuilder;
 
 type ServerFuture = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error + Send + Sync>>> + Send>>;
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_servers<A, W, I>(
     wh_tls_config: ServerTlsConfig,
     iops_tls_config: ServerTlsConfig,
@@ -33,7 +34,7 @@ where
     let wh_reflection = reflection_service.clone();
 
     let wh_fut: ServerFuture = Box::pin(async move {
-        let srv = Server::builder()
+        Server::builder()
             .tls_config(wh_tls_config)
             .unwrap()
             .add_service(wh_reflection)
@@ -50,13 +51,11 @@ where
             )
             .serve(warehouse_addr)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
-
-        srv
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     });
 
     let iops_fut: ServerFuture = Box::pin(async move {
-        let srv = Server::builder()
+        Server::builder()
             .tls_config(iops_tls_config)
             .unwrap()
             .http2_adaptive_window(Some(true))
@@ -68,9 +67,7 @@ where
             )
             .serve(interops_addr)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>);
-
-        srv
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
     });
 
     (wh_fut, iops_fut)

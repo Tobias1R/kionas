@@ -1,5 +1,6 @@
 use crate::planner::logical_plan::LogicalPlan;
 use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+use crate::planner::predicate_expr::render_predicate_expr;
 
 /// What: Render a physical expression for concise diagnostics.
 ///
@@ -12,6 +13,7 @@ fn render_physical_expr(expr: &PhysicalExpr) -> String {
     match expr {
         PhysicalExpr::ColumnRef { name } => name.clone(),
         PhysicalExpr::Raw { sql } => sql.clone(),
+        PhysicalExpr::Predicate { predicate } => render_predicate_expr(predicate),
     }
 }
 

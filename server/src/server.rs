@@ -136,7 +136,7 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     janitor::start(Arc::clone(&shared_data));
 
     let address = warehouse_cfg.host.clone();
-    let port = warehouse_cfg.port.clone();
+    let port = warehouse_cfg.port;
     log::info!("Starting server on {}:{}", address, port);
     print_server_info();
     print_memory_usage();

@@ -9,6 +9,7 @@ fn task_with_params(params: HashMap<String, String>) -> worker_service::Task {
         input: String::new(),
         output: String::new(),
         params,
+        filter_predicate: None,
     }
 }
 

@@ -1,15 +1,280 @@
 use crate::services::worker_service_server::worker_service;
 use kionas::planner::{
     PhysicalAggregateSpec, PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator,
-    PhysicalPlan, PhysicalSortExpr,
+    PhysicalPlan, PhysicalSortExpr, PredicateComparisonOp, PredicateExpr, PredicateValue,
 };
 use kionas::sql::datatypes::ColumnDatatypeSpec;
 use std::collections::HashMap;
 
+/// What: Convert protobuf scalar filter value to planner predicate value.
+///
+/// Inputs:
+/// - `value`: Transport filter value.
+/// - `value_type`: Transport type tag.
+///
+/// Output:
+/// - Planner predicate literal value.
+fn decode_proto_scalar_value(
+    value: &worker_service::FilterValue,
+    value_type: i32,
+) -> Result<PredicateValue, String> {
+    let declared_type = worker_service::FilterValueType::try_from(value_type)
+        .unwrap_or(worker_service::FilterValueType::Unspecified);
+
+    let variant = value
+        .variant
+        .as_ref()
+        .ok_or_else(|| "filter value variant is missing".to_string())?;
+
+    let decoded = match variant {
+        worker_service::filter_value::Variant::IntValue(v) => PredicateValue::Int(*v),
+        worker_service::filter_value::Variant::BoolValue(v) => PredicateValue::Bool(*v),
+        worker_service::filter_value::Variant::StringValue(v) => PredicateValue::Str(v.clone()),
+        worker_service::filter_value::Variant::FloatValue(_)
+        | worker_service::filter_value::Variant::DoubleValue(_) => {
+            return Err(
+                "float predicate values are not supported by runtime predicate model".to_string(),
+            );
+        }
+    };
+
+    let inferred_type = match decoded {
+        PredicateValue::Int(_) => worker_service::FilterValueType::Int,
+        PredicateValue::Bool(_) => worker_service::FilterValueType::Bool,
+        PredicateValue::Str(_) => worker_service::FilterValueType::String,
+        PredicateValue::IntList(_) | PredicateValue::BoolList(_) | PredicateValue::StrList(_) => {
+            return Err("invalid scalar predicate value: list type was provided".to_string());
+        }
+    };
+
+    if declared_type != worker_service::FilterValueType::Unspecified
+        && declared_type != inferred_type
+    {
+        return Err(format!(
+            "filter value type mismatch: declared {:?}, inferred {:?}",
+            declared_type, inferred_type
+        ));
+    }
+
+    Ok(decoded)
+}
+
+/// What: Convert protobuf IN list values to planner predicate list value.
+///
+/// Inputs:
+/// - `values`: Transport list values.
+/// - `value_type`: Declared list type tag.
+///
+/// Output:
+/// - Homogeneous planner list literal value.
+fn decode_proto_list_value(
+    values: &[worker_service::FilterValue],
+    value_type: i32,
+) -> Result<PredicateValue, String> {
+    let declared_type = worker_service::FilterValueType::try_from(value_type)
+        .unwrap_or(worker_service::FilterValueType::Unspecified);
+
+    match declared_type {
+        worker_service::FilterValueType::Int => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                match decode_proto_scalar_value(value, value_type)? {
+                    PredicateValue::Int(v) => out.push(v),
+                    _ => {
+                        return Err("IN list value type mismatch: expected int".to_string());
+                    }
+                }
+            }
+            Ok(PredicateValue::IntList(out))
+        }
+        worker_service::FilterValueType::Bool => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                match decode_proto_scalar_value(value, value_type)? {
+                    PredicateValue::Bool(v) => out.push(v),
+                    _ => {
+                        return Err("IN list value type mismatch: expected bool".to_string());
+                    }
+                }
+            }
+            Ok(PredicateValue::BoolList(out))
+        }
+        worker_service::FilterValueType::String => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                match decode_proto_scalar_value(value, value_type)? {
+                    PredicateValue::Str(v) => out.push(v),
+                    _ => {
+                        return Err("IN list value type mismatch: expected string".to_string());
+                    }
+                }
+            }
+            Ok(PredicateValue::StrList(out))
+        }
+        worker_service::FilterValueType::Unspecified => {
+            if values.is_empty() {
+                return Err("IN list is empty and has unspecified value type".to_string());
+            }
+
+            let mut inferred = Vec::with_capacity(values.len());
+            for value in values {
+                inferred.push(decode_proto_scalar_value(
+                    value,
+                    worker_service::FilterValueType::Unspecified as i32,
+                )?);
+            }
+
+            match &inferred[0] {
+                PredicateValue::Int(_) => {
+                    let mut out = Vec::with_capacity(inferred.len());
+                    for value in inferred {
+                        if let PredicateValue::Int(v) = value {
+                            out.push(v);
+                        } else {
+                            return Err(
+                                "IN list value type mismatch: mixed scalar types are not supported"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Ok(PredicateValue::IntList(out))
+                }
+                PredicateValue::Bool(_) => {
+                    let mut out = Vec::with_capacity(inferred.len());
+                    for value in inferred {
+                        if let PredicateValue::Bool(v) = value {
+                            out.push(v);
+                        } else {
+                            return Err(
+                                "IN list value type mismatch: mixed scalar types are not supported"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Ok(PredicateValue::BoolList(out))
+                }
+                PredicateValue::Str(_) => {
+                    let mut out = Vec::with_capacity(inferred.len());
+                    for value in inferred {
+                        if let PredicateValue::Str(v) = value {
+                            out.push(v);
+                        } else {
+                            return Err(
+                                "IN list value type mismatch: mixed scalar types are not supported"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Ok(PredicateValue::StrList(out))
+                }
+                PredicateValue::IntList(_)
+                | PredicateValue::BoolList(_)
+                | PredicateValue::StrList(_) => {
+                    Err("IN list contains nested list value".to_string())
+                }
+            }
+        }
+        worker_service::FilterValueType::Float | worker_service::FilterValueType::Double => {
+            Err("float IN list values are not supported by runtime predicate model".to_string())
+        }
+    }
+}
+
+/// What: Convert protobuf filter predicate transport node into planner predicate expression.
+///
+/// Inputs:
+/// - `predicate`: Transport predicate node from task request.
+///
+/// Output:
+/// - Planner structured predicate expression.
+fn decode_proto_predicate(
+    predicate: &worker_service::FilterPredicate,
+) -> Result<PredicateExpr, String> {
+    let variant = predicate
+        .variant
+        .as_ref()
+        .ok_or_else(|| "filter predicate variant is missing".to_string())?;
+
+    match variant {
+        worker_service::filter_predicate::Variant::Conjunction(node) => {
+            let mut clauses = Vec::with_capacity(node.clauses.len());
+            for child in &node.clauses {
+                clauses.push(decode_proto_predicate(child)?);
+            }
+            Ok(PredicateExpr::Conjunction { clauses })
+        }
+        worker_service::filter_predicate::Variant::Comparison(node) => {
+            let op = match worker_service::ComparisonOperator::try_from(node.operator)
+                .unwrap_or(worker_service::ComparisonOperator::Unspecified)
+            {
+                worker_service::ComparisonOperator::Equal => PredicateComparisonOp::Eq,
+                worker_service::ComparisonOperator::NotEqual => PredicateComparisonOp::Ne,
+                worker_service::ComparisonOperator::GreaterThan => PredicateComparisonOp::Gt,
+                worker_service::ComparisonOperator::GreaterEqual => PredicateComparisonOp::Ge,
+                worker_service::ComparisonOperator::LessThan => PredicateComparisonOp::Lt,
+                worker_service::ComparisonOperator::LessEqual => PredicateComparisonOp::Le,
+                worker_service::ComparisonOperator::Unspecified => {
+                    return Err("comparison operator is unspecified".to_string());
+                }
+            };
+
+            let value = node
+                .value
+                .as_ref()
+                .ok_or_else(|| "comparison value is missing".to_string())
+                .and_then(|value| decode_proto_scalar_value(value, node.value_type))?;
+
+            Ok(PredicateExpr::Comparison {
+                column: node.column_name.clone(),
+                op,
+                value,
+            })
+        }
+        worker_service::filter_predicate::Variant::Between(node) => {
+            let lower = node
+                .lower
+                .as_ref()
+                .ok_or_else(|| "between lower bound is missing".to_string())
+                .and_then(|value| decode_proto_scalar_value(value, node.value_type))?;
+            let upper = node
+                .upper
+                .as_ref()
+                .ok_or_else(|| "between upper bound is missing".to_string())
+                .and_then(|value| decode_proto_scalar_value(value, node.value_type))?;
+
+            Ok(PredicateExpr::Between {
+                column: node.column_name.clone(),
+                lower,
+                upper,
+                negated: node.is_negated,
+            })
+        }
+        worker_service::filter_predicate::Variant::InList(node) => {
+            let values = decode_proto_list_value(&node.values, node.value_type)?;
+            Ok(PredicateExpr::InList {
+                column: node.column_name.clone(),
+                values,
+            })
+        }
+        worker_service::filter_predicate::Variant::IsNull(node) => Ok(PredicateExpr::IsNull {
+            column: node.column_name.clone(),
+        }),
+        worker_service::filter_predicate::Variant::IsNotNull(node) => {
+            Ok(PredicateExpr::IsNotNull {
+                column: node.column_name.clone(),
+            })
+        }
+        worker_service::filter_predicate::Variant::Disjunction(_)
+        | worker_service::filter_predicate::Variant::Not(_) => Err(
+            "disjunction/not predicates are not supported by runtime predicate model".to_string(),
+        ),
+    }
+}
+
 /// What: Executable subset extracted from validated physical operators.
 ///
 /// Inputs:
-/// - `filter_sql`: Optional raw SQL predicate for simple conjunction filtering.
+/// - `filter_predicate`: Optional structured predicate for worker filtering.
 /// - `projection_exprs`: Ordered projection expressions from payload.
 /// - `schema_metadata`: Optional column type contract for Phase 9b type validation.
 ///
@@ -17,7 +282,7 @@ use std::collections::HashMap;
 /// - Runtime projection/filter directives for the local worker pipeline.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimePlan {
-    pub(crate) filter_sql: Option<String>,
+    pub(crate) filter_predicate: Option<PredicateExpr>,
     pub(crate) schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
     pub(crate) join_spec: Option<PhysicalJoinSpec>,
     pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
@@ -162,7 +427,12 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
 
     let operators = extract_runtime_operators(task)?;
 
-    let mut filter_sql = None;
+    let task_filter_predicate = match &task.filter_predicate {
+        Some(predicate) => Some(decode_proto_predicate(predicate)?),
+        None => None,
+    };
+
+    let mut plan_filter_predicate = None;
     let mut join_spec = None;
     let mut aggregate_partial_spec = None;
     let mut aggregate_final_spec = None;
@@ -175,11 +445,17 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
         match op {
             PhysicalOperator::TableScan { .. } => {}
             PhysicalOperator::Filter { predicate } => {
-                let raw = match predicate {
-                    PhysicalExpr::Raw { sql } => sql,
-                    PhysicalExpr::ColumnRef { name } => name,
+                let structured = match predicate {
+                    PhysicalExpr::Predicate { predicate } => Some(predicate),
+                    _ => None,
                 };
-                filter_sql = Some(raw);
+                if let Some(predicate) = structured {
+                    plan_filter_predicate = Some(predicate);
+                } else {
+                    return Err(
+                        "Filter operator must contain structured predicate expression".to_string(),
+                    );
+                }
             }
             PhysicalOperator::HashJoin { spec } => {
                 join_spec = Some(spec);
@@ -211,8 +487,35 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
         }
     }
 
+    let filter_predicate = match (task_filter_predicate, plan_filter_predicate) {
+        (Some(task_predicate), Some(plan_predicate)) => {
+            if task_predicate != plan_predicate {
+                return Err(
+                    "task filter_predicate does not match physical plan filter predicate"
+                        .to_string(),
+                );
+            }
+            log::info!(
+                "Using structured predicate execution from both task transport and physical plan"
+            );
+            Some(task_predicate)
+        }
+        (Some(task_predicate), None) => {
+            log::info!("Using structured predicate execution from task transport only");
+            Some(task_predicate)
+        }
+        (None, Some(plan_predicate)) => {
+            log::info!("Using structured predicate execution from physical plan only");
+            Some(plan_predicate)
+        }
+        (None, None) => {
+            log::info!("No filter predicate provided for this runtime plan");
+            None
+        }
+    };
+
     Ok(RuntimePlan {
-        filter_sql,
+        filter_predicate,
         schema_metadata,
         join_spec,
         aggregate_partial_spec,

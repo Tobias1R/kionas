@@ -111,6 +111,9 @@ pub fn distributed_from_physical_plan(plan: &PhysicalPlan) -> DistributedPhysica
                                 name.clone()
                             }
                             crate::planner::physical_plan::PhysicalExpr::Raw { sql } => sql.clone(),
+                            crate::planner::physical_plan::PhysicalExpr::Predicate {
+                                predicate,
+                            } => crate::planner::predicate_expr::render_predicate_expr(predicate),
                         })
                         .collect::<Vec<_>>(),
                 }),

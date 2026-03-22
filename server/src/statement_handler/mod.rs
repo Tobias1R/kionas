@@ -9,6 +9,7 @@ use crate::warehouse::state::SharedData;
 use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
 
 /// Discover worker address tied to session
+#[allow(dead_code)]
 pub async fn get_worker_addr_for_session(
     shared_data: &SharedData,
     session_id: &str,

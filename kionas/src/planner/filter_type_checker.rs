@@ -93,6 +93,7 @@ pub fn check_filter_predicate_types(
             // For Phase 9b Step 5, log known patterns; comprehensive type checking deferred to Step 6.
             validate_raw_sql_predicate(sql, column_types)
         }
+        PhysicalExpr::Predicate { .. } => Ok(()),
     }
 }
 

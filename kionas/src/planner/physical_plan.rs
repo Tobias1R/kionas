@@ -1,6 +1,7 @@
 use crate::planner::aggregate_spec::PhysicalAggregateSpec;
 use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::{LogicalExpr, LogicalRelation};
+use crate::planner::predicate_expr::PredicateExpr;
 use crate::sql::datatypes::ColumnDatatypeSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 pub enum PhysicalExpr {
     ColumnRef { name: String },
     Raw { sql: String },
+    Predicate { predicate: PredicateExpr },
 }
 
 /// What: One physical ORDER BY expression.

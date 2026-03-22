@@ -9,6 +9,7 @@ pub mod logical_plan;
 pub mod physical_plan;
 pub mod physical_translate;
 pub mod physical_validate;
+pub mod predicate_expr;
 pub mod translate;
 pub mod validate;
 
@@ -32,6 +33,10 @@ pub use physical_translate::{
     build_distributed_plan_from_logical_plan, build_physical_plan_from_logical_plan,
 };
 pub use physical_validate::validate_physical_plan;
+pub use predicate_expr::{
+    PredicateComparisonOp, PredicateExpr, PredicateValue, parse_predicate_sql,
+    render_predicate_expr,
+};
 pub use translate::build_logical_plan_from_select_model;
 pub use validate::{
     validate_constraint_contract, validate_datatype_contract, validate_logical_plan,

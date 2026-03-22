@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package worker_service;
 
+import "filter_predicate.proto";
+
 // Worker registration
 message RegisterWorkerRequest {
   string worker_id = 1;
@@ -41,6 +43,7 @@ message Task {
   string input = 3; // input path or ticket
   string output = 4; // output path or ticket
   map<string, string> params = 5; // operation-specific parameters
+  FilterPredicate filter_predicate = 6;
 }
 
 // Arrow Flight integration

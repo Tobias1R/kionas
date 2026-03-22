@@ -69,6 +69,7 @@ impl Session {
         self.is_authenticated
     }
 
+    #[allow(dead_code)]
     pub fn update_last_active(&mut self) {
         self.last_active = chrono::Utc::now().timestamp() as u64;
     }
@@ -77,9 +78,11 @@ impl Session {
         self.last_active
     }
 
+    #[allow(dead_code)]
     pub fn get_last_active_timestamp(&self) -> String {
-        let datetime = chrono::NaiveDateTime::from_timestamp(self.last_active as i64, 0);
-        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+        chrono::DateTime::<chrono::Utc>::from_timestamp(self.last_active as i64, 0)
+            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string())
     }
 
     pub fn get_warehouse_uuid(&self) -> String {
@@ -94,6 +97,7 @@ impl Session {
         self.use_database.clone()
     }
 
+    #[allow(dead_code)]
     pub fn set_use_database(&mut self, database: String) {
         self.use_database = database;
     }
@@ -140,17 +144,16 @@ impl SessionManager {
     pub async fn get_session(&self, id: String) -> Option<Session> {
         let key = Self::session_key(&id);
         let value = self.provider.get(&key).await.unwrap();
-        match serde_json::from_str::<Session>(&value) {
-            Ok(session) => Some(session),
-            Err(_) => None,
-        }
+        serde_json::from_str::<Session>(&value).ok()
     }
 
+    #[allow(dead_code)]
     pub async fn remove_session(&self, id: String) {
         let key = Self::session_key(&id);
         self.provider.del(&key).await.unwrap();
     }
 
+    #[allow(dead_code)]
     pub async fn authenticate_session(&self, id: String, auth_token: String) -> bool {
         let mut session = self.get_session(id.clone()).await.unwrap();
         session.authenticate(auth_token);

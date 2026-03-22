@@ -19,6 +19,7 @@ impl JwtInterceptor {
         Self { secret }
     }
 
+    #[allow(clippy::result_large_err)]
     fn validate_token(&self, token: &str) -> Result<Claims, Status> {
         let validation = Validation::new(Algorithm::HS256);
         //println!("Validate Token: {:?}", token);
@@ -54,7 +55,7 @@ impl Interceptor for JwtInterceptor {
         {
             Ok(request)
         } else {
-            return Err(Status::unauthenticated("Missing session_id"));
+            Err(Status::unauthenticated("Missing session_id"))
         }
     }
 }

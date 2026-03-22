@@ -4,6 +4,7 @@ pub mod persistence;
 use serde::{Deserialize, Serialize};
 use tonic::{Request, Status, service::Interceptor};
 
+#[allow(dead_code)]
 pub struct NoOpInterceptor;
 
 impl Interceptor for NoOpInterceptor {

@@ -232,10 +232,7 @@ pub async fn run_task_for_input_with_params(
     if resp.status == "ok" {
         Ok(resp.result_location)
     } else {
-        Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            resp.error,
-        )))
+        Err(Box::new(std::io::Error::other(resp.error)))
     }
 }
 
@@ -369,15 +366,14 @@ pub async fn run_stage_groups_for_input(
         let mut stage_locations = Vec::<(u32, String)>::new();
         while let Some(joined) = join_set.join_next().await {
             let (partition_index, partition_result) = joined.map_err(|e| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("stage {} partition task panicked: {}", stage_id, e),
-                )) as Box<dyn Error + Send + Sync>
+                Box::new(std::io::Error::other(format!(
+                    "stage {} partition task panicked: {}",
+                    stage_id, e
+                ))) as Box<dyn Error + Send + Sync>
             })?;
 
             let location = partition_result.map_err(|e| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Box::new(std::io::Error::other(
                     format!(
                         "stage {} partition {} dispatch failed: {}",
                         stage_id, partition_index, e
@@ -392,10 +388,10 @@ pub async fn run_stage_groups_for_input(
             .first()
             .map(|(_, location)| location.clone())
             .ok_or_else(|| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("stage {} completed without partition results", stage_id),
-                )) as Box<dyn Error + Send + Sync>
+                Box::new(std::io::Error::other(format!(
+                    "stage {} completed without partition results",
+                    stage_id
+                ))) as Box<dyn Error + Send + Sync>
             })?;
 
         completed.insert(stage_id);
@@ -415,8 +411,7 @@ pub async fn run_stage_groups_for_input(
     result_by_stage
         .remove(&final_stage.stage_id)
         .ok_or_else(|| {
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Box::new(std::io::Error::other(
                 format!(
                     "final stage {} has no result location",
                     final_stage.stage_id

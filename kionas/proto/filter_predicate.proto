@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package worker_service;
+
+message FilterPredicate {
+  oneof variant {
+    PredicateConjunction conjunction = 1;
+    PredicateDisjunction disjunction = 2;
+    PredicateComparison comparison = 3;
+    PredicateBetween between = 4;
+    PredicateIn in_list = 5;
+    PredicateIsNull is_null = 6;
+    PredicateIsNotNull is_not_null = 7;
+    PredicateNot not = 8;
+  }
+}
+
+message PredicateConjunction {
+  repeated FilterPredicate clauses = 1;
+}
+
+message PredicateDisjunction {
+  repeated FilterPredicate clauses = 1;
+}
+
+message PredicateComparison {
+  string column_name = 1;
+  ComparisonOperator operator = 2;
+  FilterValue value = 3;
+  FilterValueType value_type = 4;
+}
+
+message PredicateBetween {
+  string column_name = 1;
+  FilterValue lower = 2;
+  FilterValue upper = 3;
+  FilterValueType value_type = 4;
+  bool is_negated = 5;
+}
+
+message PredicateIn {
+  string column_name = 1;
+  repeated FilterValue values = 2;
+  FilterValueType value_type = 3;
+}
+
+message PredicateIsNull {
+  string column_name = 1;
+}
+
+message PredicateIsNotNull {
+  string column_name = 1;
+}
+
+message PredicateNot {
+  FilterPredicate predicate = 1;
+}
+
+message FilterValue {
+  oneof variant {
+    int64 int_value = 1;
+    string string_value = 2;
+    bool bool_value = 3;
+    float float_value = 4;
+    double double_value = 5;
+  }
+}
+
+enum ComparisonOperator {
+  COMPARISON_OPERATOR_UNSPECIFIED = 0;
+  COMPARISON_OPERATOR_EQUAL = 1;
+  COMPARISON_OPERATOR_NOT_EQUAL = 2;
+  COMPARISON_OPERATOR_GREATER_THAN = 3;
+  COMPARISON_OPERATOR_GREATER_EQUAL = 4;
+  COMPARISON_OPERATOR_LESS_THAN = 5;
+  COMPARISON_OPERATOR_LESS_EQUAL = 6;
+}
+
+enum FilterValueType {
+  FILTER_VALUE_TYPE_UNSPECIFIED = 0;
+  FILTER_VALUE_TYPE_INT = 1;
+  FILTER_VALUE_TYPE_STRING = 2;
+  FILTER_VALUE_TYPE_BOOL = 3;
+  FILTER_VALUE_TYPE_FLOAT = 4;
+  FILTER_VALUE_TYPE_DOUBLE = 5;
+}

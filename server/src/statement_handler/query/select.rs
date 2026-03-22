@@ -6,6 +6,7 @@ use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
 use deltalake::open_table_with_storage_options;
 use kionas::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
+use kionas::planner::render_predicate_expr;
 use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
@@ -380,6 +381,7 @@ fn build_scan_pruning_hints_json(physical_plan: &PhysicalPlan) -> Option<String>
             let raw = match predicate {
                 PhysicalExpr::Raw { sql } => sql.trim().to_string(),
                 PhysicalExpr::ColumnRef { name } => name.trim().to_string(),
+                PhysicalExpr::Predicate { predicate } => render_predicate_expr(predicate),
             };
             if !raw.is_empty() {
                 predicate_sql = Some(raw);

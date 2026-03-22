@@ -2,5 +2,3 @@
 // Exposes the Maestro coordinator and transaction types.
 
 pub mod maestro;
-
-pub use maestro::{Maestro, Participant};

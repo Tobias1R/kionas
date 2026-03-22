@@ -7,6 +7,7 @@ use crate::planner::physical_plan::PhysicalExpr;
 use crate::planner::physical_plan::{
     PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
 };
+use crate::planner::predicate_expr::parse_predicate_sql;
 
 fn normalize_identifier(raw: &str) -> String {
     raw.trim()
@@ -63,9 +64,14 @@ pub fn build_physical_plan_from_logical_plan(
     });
 
     if let Some(selection) = &plan.selection {
-        operators.push(PhysicalOperator::Filter {
-            predicate: PhysicalExpr::from(&selection.predicate),
-        });
+        let predicate = match &selection.predicate {
+            crate::planner::LogicalExpr::Raw { sql } => {
+                let parsed = parse_predicate_sql(sql).map_err(PlannerError::InvalidLogicalPlan)?;
+                PhysicalExpr::Predicate { predicate: parsed }
+            }
+            other => PhysicalExpr::from(other),
+        };
+        operators.push(PhysicalOperator::Filter { predicate });
     }
 
     for join in &plan.joins {

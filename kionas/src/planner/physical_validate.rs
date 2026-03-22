@@ -25,6 +25,7 @@ fn ensure_supported_predicate(predicate: &PhysicalExpr) -> Result<(), PlannerErr
     let sql = match predicate {
         PhysicalExpr::Raw { sql } => sql.to_ascii_lowercase(),
         PhysicalExpr::ColumnRef { .. } => return Ok(()),
+        PhysicalExpr::Predicate { .. } => return Ok(()),
     };
 
     let unsupported = [

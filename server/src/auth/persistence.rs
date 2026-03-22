@@ -12,6 +12,7 @@ use arrow::array::{ArrayRef, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 
 pub struct Persistence {
+    #[allow(dead_code)]
     data_path: String,
 }
 
@@ -59,12 +60,12 @@ impl Persistence {
         let schema = schema.clone();
         let schema = Arc::new(schema.clone());
 
-        let mut arrow_reader = reader.get_row_iter(Some(
+        let arrow_reader = reader.get_row_iter(Some(
             Arc::try_unwrap(schema).unwrap_or_else(|s| (*s).clone()),
         ))?;
 
         let mut users = Vec::new();
-        while let Some(record) = arrow_reader.next() {
+        for record in arrow_reader {
             let record = record?;
             let username = record.get_string(0).expect("Failed to get username");
             let password = record.get_string(1).expect("Failed to get password");
@@ -121,12 +122,12 @@ impl Persistence {
         let schema = schema.clone();
         let schema = Arc::new(schema.clone());
 
-        let mut arrow_reader = reader.get_row_iter(Some(
+        let arrow_reader = reader.get_row_iter(Some(
             Arc::try_unwrap(schema).unwrap_or_else(|s| (*s).clone()),
         ))?;
 
         let mut tokens = Vec::new();
-        while let Some(record) = arrow_reader.next() {
+        for record in arrow_reader {
             let record = record?;
             let token = record.get_string(0).expect("Failed to get token");
             let username = record.get_string(1).expect("Failed to get username");

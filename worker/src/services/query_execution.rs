@@ -12,7 +12,10 @@ use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use kionas::planner::{PhysicalExpr, PhysicalLimitSpec, PhysicalSortExpr};
+use kionas::planner::{
+    PhysicalExpr, PhysicalLimitSpec, PhysicalSortExpr, PredicateComparisonOp, PredicateExpr,
+    PredicateValue, parse_predicate_sql,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -99,6 +102,8 @@ pub(crate) async fn execute_query_task(
 ///   1. MissingColumn: Column not found in schema
 ///   2. TypeMismatch: Operand type incompatible with column canonical_type
 ///   3. UnsupportedLiteral: Literal value format not recognized
+#[cfg(test)]
+#[allow(dead_code)]
 fn validate_filter_predicates_types(
     filter_sql: &str,
     schema: &std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>,
@@ -198,6 +203,46 @@ fn validate_filter_predicates_types(
     Ok(())
 }
 
+fn validate_filter_clause_types(
+    clauses: &[FilterClause],
+    schema: &std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>,
+) -> Result<(), String> {
+    for clause in clauses {
+        let col_spec = schema.get(&clause.column).ok_or_else(|| {
+            format_type_error("MissingColumn", &clause.column, "(any type)", "", "")
+        })?;
+
+        let operand_type = match &clause.value {
+            FilterValue::Int(_) | FilterValue::IntList(_) => "int",
+            FilterValue::Bool(_) | FilterValue::BoolList(_) => "bool",
+            FilterValue::Str(_) | FilterValue::StrList(_) => "string",
+        };
+
+        validate_type_compatibility(
+            &clause.column,
+            &col_spec.canonical_type,
+            operand_type,
+            "(structured)",
+        )?;
+
+        if let Some(upper) = &clause.value2 {
+            let upper_type = match upper {
+                FilterValue::Int(_) | FilterValue::IntList(_) => "int",
+                FilterValue::Bool(_) | FilterValue::BoolList(_) => "bool",
+                FilterValue::Str(_) | FilterValue::StrList(_) => "string",
+            };
+            if upper_type != operand_type {
+                return Err(format!(
+                    "type coercion violation: BETWEEN bounds type mismatch for column '{}'",
+                    clause.column
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// What: Infer the type of a filter literal value.
 ///
 /// Inputs:
@@ -205,6 +250,8 @@ fn validate_filter_predicates_types(
 ///
 /// Output:
 /// - Type identifier: "bool", "int", "string"
+#[cfg(test)]
+#[allow(dead_code)]
 fn infer_filter_literal_type(literal: &str) -> Result<String, String> {
     let trimmed = literal.trim();
 
@@ -344,6 +391,7 @@ fn validate_type_compatibility(
 /// Details:
 /// - If schema_metadata provided, pre-validates types before filter evaluation.
 /// - If schema_metadata absent, skips type checking (Phase 9b interim behavior).
+#[allow(dead_code)]
 pub fn apply_filter_pipeline(
     input: &[RecordBatch],
     filter_sql: &str,
@@ -351,41 +399,128 @@ pub fn apply_filter_pipeline(
         &std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>,
     >,
 ) -> Result<Vec<RecordBatch>, String> {
-    // Phase 9b type validation: pre-check column types if schema_metadata present
-    if let Some(schema) = schema_metadata {
-        validate_filter_predicates_types(filter_sql, schema)?;
+    let predicate = parse_predicate_sql(filter_sql)?;
+    apply_filter_predicate_pipeline(input, &predicate, schema_metadata)
+}
+
+/// What: Apply structured predicate filters to input batches without SQL string parsing.
+///
+/// Inputs:
+/// - `input`: Source batches.
+/// - `predicate`: Structured predicate from physical plan.
+/// - `schema`: Optional schema metadata contract used by legacy type-check pathways.
+///
+/// Output:
+/// - Filtered batches preserving original order.
+pub fn apply_filter_predicate_pipeline(
+    input: &[RecordBatch],
+    predicate: &PredicateExpr,
+    schema: Option<&std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>>,
+) -> Result<Vec<RecordBatch>, String> {
+    if input.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let clauses = parse_filter_clauses(filter_sql)?;
+    let clauses = predicate_to_clauses(predicate)?;
     let mut out = Vec::with_capacity(input.len());
 
     for batch in input {
+        if let Some(schema_map) = schema {
+            validate_filter_clause_types(&clauses, schema_map)?;
+        }
+
         let mask = build_filter_mask(batch, &clauses)?;
         let filtered = filter_record_batch(batch, &mask)
-            .map_err(|e| format!("failed to apply filter: {}", e))?;
+            .map_err(|e| format!("failed to apply filter mask: {}", e))?;
         out.push(filtered);
     }
 
     Ok(out)
 }
 
+fn predicate_to_clauses(predicate: &PredicateExpr) -> Result<Vec<FilterClause>, String> {
+    match predicate {
+        PredicateExpr::Conjunction { clauses } => {
+            let mut out = Vec::new();
+            for clause in clauses {
+                out.extend(predicate_to_clauses(clause)?);
+            }
+            Ok(out)
+        }
+        PredicateExpr::Comparison { column, op, value } => Ok(vec![FilterClause {
+            column: normalize_projection_identifier(column),
+            op: match op {
+                PredicateComparisonOp::Eq => FilterOp::Eq,
+                PredicateComparisonOp::Ne => FilterOp::Ne,
+                PredicateComparisonOp::Gt => FilterOp::Gt,
+                PredicateComparisonOp::Ge => FilterOp::Ge,
+                PredicateComparisonOp::Lt => FilterOp::Lt,
+                PredicateComparisonOp::Le => FilterOp::Le,
+            },
+            value: predicate_value_to_filter_value(value)?,
+            value2: None,
+        }]),
+        PredicateExpr::Between {
+            column,
+            lower,
+            upper,
+            negated,
+        } => Ok(vec![FilterClause {
+            column: normalize_projection_identifier(column),
+            op: if *negated {
+                FilterOp::NotBetween
+            } else {
+                FilterOp::Between
+            },
+            value: predicate_value_to_filter_value(lower)?,
+            value2: Some(predicate_value_to_filter_value(upper)?),
+        }]),
+        PredicateExpr::InList { column, values } => Ok(vec![FilterClause {
+            column: normalize_projection_identifier(column),
+            op: FilterOp::In,
+            value: predicate_value_to_filter_value(values)?,
+            value2: None,
+        }]),
+        PredicateExpr::IsNull { column } => Ok(vec![FilterClause {
+            column: normalize_projection_identifier(column),
+            op: FilterOp::IsNull,
+            value: FilterValue::Bool(false),
+            value2: None,
+        }]),
+        PredicateExpr::IsNotNull { column } => Ok(vec![FilterClause {
+            column: normalize_projection_identifier(column),
+            op: FilterOp::IsNotNull,
+            value: FilterValue::Bool(false),
+            value2: None,
+        }]),
+    }
+}
+
+fn predicate_value_to_filter_value(value: &PredicateValue) -> Result<FilterValue, String> {
+    match value {
+        PredicateValue::Int(v) => Ok(FilterValue::Int(*v)),
+        PredicateValue::Bool(v) => Ok(FilterValue::Bool(*v)),
+        PredicateValue::Str(v) => Ok(FilterValue::Str(v.clone())),
+        PredicateValue::IntList(values) => Ok(FilterValue::IntList(values.clone())),
+        PredicateValue::BoolList(values) => Ok(FilterValue::BoolList(values.clone())),
+        PredicateValue::StrList(values) => Ok(FilterValue::StrList(values.clone())),
+    }
+}
+
 /// What: Split filter SQL by AND, respecting BETWEEN...AND and NOT BETWEEN...AND boundaries.
+#[cfg(test)]
+#[allow(dead_code)]
 fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
     let mut clauses = Vec::new();
     let mut current_pos = 0;
     let lower = filter_sql.to_ascii_lowercase();
-    let bytes = filter_sql.as_bytes();
 
     while current_pos < filter_sql.len() {
         // Check for NOT BETWEEN or BETWEEN pattern
         let remaining_lower = &lower[current_pos..];
-        
+
         // Try to find BETWEEN keyword
-        let between_pos = if let Some(pos) = remaining_lower.find(" between ") {
-            Some(current_pos + pos)
-        } else {
-            None
-        };
+        let between_pos = remaining_lower.find(" between ").map(|pos| current_pos + pos);
 
         // Check if there's a NOT before BETWEEN
         let mut clause_start = current_pos;
@@ -395,12 +530,14 @@ fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
             while col_end > clause_start && lower.as_bytes()[col_end - 1].is_ascii_whitespace() {
                 col_end -= 1;
             }
-            
+
             // Scan back for "NOT"
             if col_end >= 4 && lower[col_end - 3..col_end].eq_ignore_ascii_case("not") {
                 // Could be NOT BETWEEN, find actual column start
                 let mut not_start = col_end - 3;
-                while not_start > clause_start && lower.as_bytes()[not_start - 1].is_ascii_whitespace() {
+                while not_start > clause_start
+                    && lower.as_bytes()[not_start - 1].is_ascii_whitespace()
+                {
                     not_start -= 1;
                 }
                 // Scan back to find column name or AND boundary
@@ -410,11 +547,13 @@ fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
                 {
                     not_start -= 1;
                 }
-                
+
                 // Check if there's an AND before this position
                 let prefix = &lower[clause_start..not_start];
                 if let Some(and_pos) = prefix.rfind(" and ") {
-                    let clause = filter_sql[clause_start..clause_start + and_pos].trim().to_string();
+                    let clause = filter_sql[clause_start..clause_start + and_pos]
+                        .trim()
+                        .to_string();
                     if !clause.is_empty() {
                         clauses.push(clause);
                     }
@@ -424,27 +563,51 @@ fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
         }
 
         // Now find the next AND that is NOT inside BETWEEN...AND
+        // First, identify which ANDs close BETWEEN clauses (so we can skip them)
+        // For each BETWEEN in the current clause, find its matching AND
+        let mut between_closing_ands = std::collections::HashSet::new();
+
+        let mut between_search_pos = clause_start;
+        while between_search_pos < filter_sql.len() {
+            let remaining_lower = &lower[between_search_pos..];
+            if let Some(between_offset) = remaining_lower.find(" between ") {
+                let between_pos = between_search_pos + between_offset;
+
+                // Now find the first AND after this BETWEEN
+                let after_between = &lower[between_pos + " between ".len()..];
+                if let Some(and_offset) = after_between.find(" and ") {
+                    let closing_and_pos = between_pos + " between ".len() + and_offset;
+                    between_closing_ands.insert(closing_and_pos);
+
+                    // Continue searching from after this AND to find nested BETWEENs
+                    between_search_pos = closing_and_pos + " and ".len();
+                } else {
+                    // BETWEEN without closing AND in this clause (shouldn't happen in valid SQL)
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Now find the next AND that is NOT a BETWEEN-closing AND
         let mut next_and_pos = None;
         let mut search_pos = clause_start;
-        
+
         while search_pos < filter_sql.len() {
             let remaining = &lower[search_pos..];
-            
+
             // Find next AND
             if let Some(and_idx) = remaining.find(" and ") {
                 let and_pos = search_pos + and_idx;
-                
-                // Check if this AND is inside a BETWEEN clause
-                let clause_section = &lower[clause_start..and_pos];
-                let between_count = clause_section.matches(" between ").count();
-                
-                // If there's an odd number of BETWEENs, we're inside one
-                if between_count % 2 == 0 {
-                    // This AND is outside BETWEEN
+
+                // Check if this AND closes a BETWEEN clause
+                if !between_closing_ands.contains(&and_pos) {
+                    // This AND is a clause separator, not BETWEEN-closing
                     next_and_pos = Some(and_pos);
                     break;
                 } else {
-                    // This AND is inside BETWEEN, skip it and continue
+                    // This AND closes a BETWEEN, skip it and continue
                     search_pos = and_pos + " and ".len();
                 }
             } else {
@@ -480,6 +643,8 @@ fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
 /// Output:
 /// - Ordered filter clauses combined with logical `AND`.
 /// - Phase 9c: Supports BETWEEN and IN predicates in addition to comparison operators
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_filter_clauses(filter_sql: &str) -> Result<Vec<FilterClause>, String> {
     if filter_sql.trim().is_empty() {
         return Err("filter predicate is empty".to_string());
@@ -783,6 +948,11 @@ pub(crate) fn apply_projection_pipeline(
                         &mut projected_fields,
                     )?;
                 }
+                PhysicalExpr::Predicate { .. } => {
+                    return Err(
+                        "projection expression cannot be a structured predicate".to_string()
+                    );
+                }
             }
         }
 
@@ -825,6 +995,9 @@ pub(crate) fn apply_sort_pipeline(
         let raw_name = match &sort_expr.expression {
             PhysicalExpr::ColumnRef { name } => name.trim().to_string(),
             PhysicalExpr::Raw { sql } => parse_projection_identifier(sql)?,
+            PhysicalExpr::Predicate { .. } => {
+                return Err("sort expression cannot be a structured predicate".to_string());
+            }
         };
 
         let idx = resolve_schema_column_index(merged.schema().as_ref(), raw_name.as_str())
@@ -1174,6 +1347,8 @@ fn is_identifier_segment(segment: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_single_clause(input: &str) -> Result<(String, FilterOp, &str), String> {
     const OPS: [(&str, FilterOp); 6] = [
         ("!=", FilterOp::Ne), // Check compound operators FIRST before single-char
@@ -1215,6 +1390,8 @@ fn parse_single_clause(input: &str) -> Result<(String, FilterOp, &str), String> 
 ///
 /// Output:
 /// - Column name, normalized.
+#[cfg(test)]
+#[allow(dead_code)]
 fn extract_column_from_is_null_clause(clause: &str, keyword: &str) -> Result<String, String> {
     let lower_clause = clause.to_ascii_lowercase();
     let lower_keyword = keyword.to_ascii_lowercase();
@@ -1239,6 +1416,8 @@ fn extract_column_from_is_null_clause(clause: &str, keyword: &str) -> Result<Str
 ///
 /// Output:
 /// - FilterClause with op=Between, value=lower bound, value2=upper bound
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_between_clause(clause: &str) -> Result<FilterClause, String> {
     let lower_case = clause.to_ascii_lowercase();
 
@@ -1282,6 +1461,8 @@ fn parse_between_clause(clause: &str) -> Result<FilterClause, String> {
 ///
 /// Output:
 /// - FilterClause with op=NotBetween, value=lower bound, value2=upper bound
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_not_between_clause(clause: &str) -> Result<FilterClause, String> {
     let lower_case = clause.to_ascii_lowercase();
 
@@ -1289,7 +1470,7 @@ fn parse_not_between_clause(clause: &str) -> Result<FilterClause, String> {
     if let Some(not_between_idx) = lower_case.find(" not between ") {
         let column_part = clause[..not_between_idx].trim();
 
-        // Everything after "NOT BETWEEN " 
+        // Everything after "NOT BETWEEN "
         let after_not_between_idx = not_between_idx + " not between ".len();
         let after_not_between = &clause[after_not_between_idx..];
         let after_not_between_lower = after_not_between.to_ascii_lowercase();
@@ -1325,6 +1506,8 @@ fn parse_not_between_clause(clause: &str) -> Result<FilterClause, String> {
 ///
 /// Output:
 /// - FilterClause with op=In, value=homogeneous list (IntList, StrList, or BoolList)
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_in_clause(clause: &str) -> Result<FilterClause, String> {
     let lower_case = clause.to_ascii_lowercase();
 
@@ -1433,6 +1616,8 @@ fn parse_in_clause(clause: &str) -> Result<FilterClause, String> {
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn parse_filter_value(raw: &str) -> Result<FilterValue, String> {
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("true") {
@@ -1456,7 +1641,9 @@ fn parse_filter_value(raw: &str) -> Result<FilterValue, String> {
     ))
 }
 
-fn split_case_insensitive<'a>(text: &'a str, token: &str) -> Vec<&'a str> {
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn split_case_insensitive<'a>(text: &'a str, token: &str) -> Vec<&'a str> {
     let splitter = format!(" {} ", token.to_ascii_lowercase());
     let lower = text.to_ascii_lowercase();
 
@@ -1664,7 +1851,11 @@ fn compare_i64(lhs: i64, rhs: i64, op: FilterOp) -> bool {
         FilterOp::Ge => lhs >= rhs,
         FilterOp::Lt => lhs < rhs,
         FilterOp::Le => lhs <= rhs,
-        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
+        FilterOp::Between
+        | FilterOp::NotBetween
+        | FilterOp::In
+        | FilterOp::IsNull
+        | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 
@@ -1676,7 +1867,11 @@ fn compare_bool(lhs: bool, rhs: bool, op: FilterOp) -> bool {
         FilterOp::Ge => lhs == rhs || (lhs && !rhs),
         FilterOp::Lt => !lhs && rhs,
         FilterOp::Le => lhs == rhs || (!lhs && rhs),
-        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
+        FilterOp::Between
+        | FilterOp::NotBetween
+        | FilterOp::In
+        | FilterOp::IsNull
+        | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 
@@ -1688,7 +1883,11 @@ fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
         FilterOp::Ge => lhs >= rhs,
         FilterOp::Lt => lhs < rhs,
         FilterOp::Le => lhs <= rhs,
-        FilterOp::Between | FilterOp::NotBetween | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull => false, // Should not reach here
+        FilterOp::Between
+        | FilterOp::NotBetween
+        | FilterOp::In
+        | FilterOp::IsNull
+        | FilterOp::IsNotNull => false, // Should not reach here
     }
 }
 

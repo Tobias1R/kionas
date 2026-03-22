@@ -1,4 +1,8 @@
 use chrono::{DateTime, Utc};
+use kionas::planner::{
+    PhysicalExpr, PhysicalOperator, PhysicalPlan, PredicateComparisonOp, PredicateExpr,
+    PredicateValue,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -15,6 +19,7 @@ pub enum TaskState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Task {
     pub id: String,
     pub query_id: String,
@@ -113,6 +118,7 @@ impl TaskManager {
     }
 
     /// Wait for task to reach a terminal state or timeout.
+    #[allow(dead_code)]
     pub async fn wait_for_completion(&self, id: &str, timeout_secs: u64) -> Option<Task> {
         use tokio::time::{Duration, timeout};
         let start = Utc::now();
@@ -206,6 +212,7 @@ impl TaskManager {
     }
 
     /// Update task fields based on worker update and notify waiters.
+    #[allow(dead_code)]
     pub async fn update_from_worker(
         &self,
         id: &str,
@@ -285,16 +292,16 @@ impl TaskManager {
                 }
 
                 let effective_count = partition_count.or(existing_partition_count);
-                if let Some(total) = effective_count {
-                    if new_completed > total {
-                        log::warn!(
-                            "Ignoring invalid partition progress for task {}: completed={} exceeds total={}",
-                            id,
-                            new_completed,
-                            total
-                        );
-                        return false;
-                    }
+                if let Some(total) = effective_count
+                    && new_completed > total
+                {
+                    log::warn!(
+                        "Ignoring invalid partition progress for task {}: completed={} exceeds total={}",
+                        id,
+                        new_completed,
+                        total
+                    );
+                    return false;
                 }
             }
 
@@ -331,13 +338,13 @@ impl TaskManager {
             applied = true;
         }
 
-        if applied {
-            if let Some(n) = {
+        if applied
+            && let Some(n) = {
                 let nmap = self.notifiers.read().await;
                 nmap.get(id).cloned()
-            } {
-                n.notify_waiters();
             }
+        {
+            n.notify_waiters();
         }
 
         applied
@@ -348,6 +355,7 @@ impl TaskManager {
 #[path = "../tests/tasks_mod_tests.rs"]
 mod tests;
 
+#[allow(dead_code)]
 pub fn sample_task_request_from_task(
     _task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
@@ -358,9 +366,210 @@ pub fn sample_task_request_from_task(
     }
 }
 
+/// What: Extract the first structured filter predicate from task payload operators.
+///
+/// Inputs:
+/// - `task`: Server-side task containing canonical payload JSON.
+///
+/// Output:
+/// - Structured predicate when a filter operator contains `PhysicalExpr::Predicate`.
+///
+/// Details:
+/// - Supports stage payload shapes (`[operators]`, `{operators:[...]}`) and canonical query payload (`{physical_plan:{...}}`).
+fn extract_structured_predicate_from_payload(task: &Task) -> Option<PredicateExpr> {
+    fn first_filter_predicate(operators: &[PhysicalOperator]) -> Option<PredicateExpr> {
+        operators.iter().find_map(|op| {
+            if let PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Predicate { predicate },
+            } = op
+            {
+                return Some(predicate.clone());
+            }
+            None
+        })
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&task.payload).ok()?;
+
+    if payload.is_array() {
+        let operators: Vec<PhysicalOperator> = serde_json::from_value(payload).ok()?;
+        return first_filter_predicate(&operators);
+    }
+
+    if let Some(operators_value) = payload.get("operators") {
+        let operators: Vec<PhysicalOperator> =
+            serde_json::from_value(operators_value.clone()).ok()?;
+        if let Some(predicate) = first_filter_predicate(&operators) {
+            return Some(predicate);
+        }
+    }
+
+    let plan_value = payload.get("physical_plan")?.clone();
+    let plan: PhysicalPlan = serde_json::from_value(plan_value).ok()?;
+    first_filter_predicate(&plan.operators)
+}
+
+/// What: Convert planner literal value into protobuf filter value representation.
+///
+/// Inputs:
+/// - `value`: Planner literal value.
+///
+/// Output:
+/// - Protobuf scalar value and type tag for transmission.
+fn predicate_value_to_proto_scalar(
+    value: &PredicateValue,
+) -> Option<(
+    crate::services::worker_service_client::worker_service::FilterValue,
+    crate::services::worker_service_client::worker_service::FilterValueType,
+)> {
+    use crate::services::worker_service_client::worker_service as ws;
+
+    match value {
+        PredicateValue::Int(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::IntValue(*v)),
+            },
+            ws::FilterValueType::Int,
+        )),
+        PredicateValue::Bool(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::BoolValue(*v)),
+            },
+            ws::FilterValueType::Bool,
+        )),
+        PredicateValue::Str(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::StringValue(v.clone())),
+            },
+            ws::FilterValueType::String,
+        )),
+        PredicateValue::IntList(_) | PredicateValue::BoolList(_) | PredicateValue::StrList(_) => {
+            None
+        }
+    }
+}
+
+/// What: Convert planner predicate expression into protobuf task transport representation.
+///
+/// Inputs:
+/// - `predicate`: Structured planner predicate.
+///
+/// Output:
+/// - Serializable protobuf filter predicate.
+fn predicate_expr_to_proto(
+    predicate: &PredicateExpr,
+) -> Option<crate::services::worker_service_client::worker_service::FilterPredicate> {
+    use crate::services::worker_service_client::worker_service as ws;
+
+    let variant = match predicate {
+        PredicateExpr::Conjunction { clauses } => {
+            let clauses = clauses
+                .iter()
+                .map(predicate_expr_to_proto)
+                .collect::<Option<Vec<_>>>()?;
+            ws::filter_predicate::Variant::Conjunction(ws::PredicateConjunction {
+                clauses,
+            })
+        }
+        PredicateExpr::Comparison { column, op, value } => {
+            let (proto_value, value_type) = predicate_value_to_proto_scalar(value)?;
+            let operator = match op {
+                PredicateComparisonOp::Eq => ws::ComparisonOperator::Equal,
+                PredicateComparisonOp::Ne => ws::ComparisonOperator::NotEqual,
+                PredicateComparisonOp::Gt => ws::ComparisonOperator::GreaterThan,
+                PredicateComparisonOp::Ge => ws::ComparisonOperator::GreaterEqual,
+                PredicateComparisonOp::Lt => ws::ComparisonOperator::LessThan,
+                PredicateComparisonOp::Le => ws::ComparisonOperator::LessEqual,
+            };
+            ws::filter_predicate::Variant::Comparison(ws::PredicateComparison {
+                column_name: column.clone(),
+                operator: operator as i32,
+                value: Some(proto_value),
+                value_type: value_type as i32,
+            })
+        }
+        PredicateExpr::Between {
+            column,
+            lower,
+            upper,
+            negated,
+        } => {
+            let (lower_value, lower_type) = predicate_value_to_proto_scalar(lower)?;
+            let (upper_value, upper_type) = predicate_value_to_proto_scalar(upper)?;
+            if lower_type != upper_type {
+                return None;
+            }
+            ws::filter_predicate::Variant::Between(ws::PredicateBetween {
+                column_name: column.clone(),
+                lower: Some(lower_value),
+                upper: Some(upper_value),
+                value_type: lower_type as i32,
+                is_negated: *negated,
+            })
+        }
+        PredicateExpr::InList { column, values } => {
+            let (proto_values, value_type) = match values {
+                PredicateValue::IntList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::IntValue(*value)),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::Int,
+                ),
+                PredicateValue::BoolList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::BoolValue(*value)),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::Bool,
+                ),
+                PredicateValue::StrList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::StringValue(value.clone())),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::String,
+                ),
+                PredicateValue::Int(_) | PredicateValue::Bool(_) | PredicateValue::Str(_) => {
+                    return None;
+                }
+            };
+
+            ws::filter_predicate::Variant::InList(ws::PredicateIn {
+                column_name: column.clone(),
+                values: proto_values,
+                value_type: value_type as i32,
+            })
+        }
+        PredicateExpr::IsNull { column } => {
+            ws::filter_predicate::Variant::IsNull(ws::PredicateIsNull {
+                column_name: column.clone(),
+            })
+        }
+        PredicateExpr::IsNotNull { column } => {
+            ws::filter_predicate::Variant::IsNotNull(ws::PredicateIsNotNull {
+                column_name: column.clone(),
+            })
+        }
+    };
+
+    Some(ws::FilterPredicate {
+        variant: Some(variant),
+    })
+}
+
 pub fn task_to_request(
     task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
+    let filter_predicate = extract_structured_predicate_from_payload(task)
+        .and_then(|predicate| predicate_expr_to_proto(&predicate));
+
     crate::services::worker_service_client::worker_service::TaskRequest {
         session_id: task.session_id.clone(),
         tasks: vec![
@@ -370,6 +579,7 @@ pub fn task_to_request(
                 operation: task.operation.clone(),
                 output: String::new(),
                 params: task.params.clone(),
+                filter_predicate,
             },
         ],
     }

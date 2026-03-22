@@ -61,6 +61,7 @@ impl Default for SharedState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WorkerEntry {
     pub key: String,
     pub warehouse: Warehouse,

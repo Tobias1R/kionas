@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use tokio::time::{Duration, timeout};
 
 /// Transaction states for the Maestro coordinator.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransactionState {
     Preparing,
@@ -19,6 +20,7 @@ pub enum TransactionState {
 }
 
 /// Participant in a distributed transaction (typically a worker)
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Participant {
     pub id: String,
@@ -31,6 +33,7 @@ pub struct Participant {
 }
 
 /// Lightweight transaction descriptor
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Transaction {
     pub tx_id: String,
@@ -46,12 +49,14 @@ pub struct Transaction {
 /// to report success, persists a transaction record in the metastore,
 /// then instructs participants to `commit` (promote staged objects by
 /// updating the manifest/pointer object). On any failure Maestro aborts.
+#[allow(dead_code)]
 pub struct Maestro {
     shared: SharedData,
     // In-memory active transactions; persisted state should live in metastore.
     active: Arc<RwLock<Vec<Transaction>>>,
 }
 
+#[allow(dead_code)]
 impl Maestro {
     /// Create a new Maestro instance bound to the shared server state.
     pub fn new(shared: SharedData) -> Self {
@@ -388,17 +393,15 @@ impl Maestro {
             if let Ok(pool) = {
                 let state = self.shared.lock().await;
                 state.get_or_create_pool_for_key(&p.target).await
-            } {
-                if let Ok(conn) =
+            }
+                && let Ok(conn) =
                     crate::workers::acquire_channel_with_heartbeat(&pool, &p.target, 5).await
-                {
-                    let areq =
-                        crate::services::worker_service_client::worker_service::AbortRequest {
-                            tx_id: tx_id.to_string(),
-                            staging_prefix: p.staging_prefix.clone(),
-                        };
-                    let _ = crate::workers::send_abort_to_worker(conn, areq, 10).await;
-                }
+            {
+                let areq = crate::services::worker_service_client::worker_service::AbortRequest {
+                    tx_id: tx_id.to_string(),
+                    staging_prefix: p.staging_prefix.clone(),
+                };
+                let _ = crate::workers::send_abort_to_worker(conn, areq, 10).await;
             }
         }
 
@@ -457,16 +460,16 @@ impl Maestro {
                     tx.state
                 );
                 // If Preparing -> try prepare then commit
-                if tx.state == TransactionState::Preparing {
-                    if let Err(e) = this.prepare_participants(&tx_id).await {
-                        log::error!(
-                            "recover_inflight: prepare failed for {}: {} — aborting",
-                            tx_id,
-                            e
-                        );
-                        let _ = this.abort(&tx_id).await;
-                        return;
-                    }
+                if tx.state == TransactionState::Preparing
+                    && let Err(e) = this.prepare_participants(&tx_id).await
+                {
+                    log::error!(
+                        "recover_inflight: prepare failed for {}: {} — aborting",
+                        tx_id,
+                        e
+                    );
+                    let _ = this.abort(&tx_id).await;
+                    return;
                 }
 
                 // If Prepared or Preparing succeeded -> commit
@@ -498,6 +501,7 @@ impl Maestro {
     }
 }
 
+#[allow(dead_code)]
 impl Maestro {
     /// Helper to create a lightweight clone of `Maestro` for spawning tasks.
     fn clone_for_recovery(&self) -> Self {

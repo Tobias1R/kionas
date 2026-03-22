@@ -28,6 +28,7 @@ fn accepts_unit_variant_string_operator_shape() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let namespace = resolve_query_namespace(&task).expect("must accept unit variant shape");
@@ -78,6 +79,7 @@ fn rejects_non_select_statement() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task).expect_err("must reject non-select statement");
@@ -98,6 +100,7 @@ fn resolves_namespace_from_stage_params() {
         input: "[]".to_string(),
         output: String::new(),
         params,
+        filter_predicate: None,
     };
 
     assert!(is_stage_query_task(&task));
@@ -133,7 +136,8 @@ fn accepts_valid_select_namespace() {
             .to_string(),
             output: String::new(),
             params: std::collections::HashMap::new(),
-        };
+        filter_predicate: None,
+    };
 
     let namespace = resolve_query_namespace(&task).expect("must parse namespace");
     assert_eq!(namespace.database, "db1");
@@ -158,6 +162,7 @@ fn rejects_missing_logical_plan_for_v2() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task).expect_err("must reject missing logical_plan object");
@@ -182,6 +187,7 @@ fn rejects_missing_physical_plan_for_v2() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task).expect_err("must reject missing physical_plan object");
@@ -209,6 +215,7 @@ fn rejects_empty_physical_plan_operators_for_v2() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task)
@@ -240,6 +247,7 @@ fn rejects_physical_plan_without_tablescan_first() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task)
@@ -271,6 +279,7 @@ fn rejects_physical_plan_without_materialize_last() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err =
@@ -302,6 +311,7 @@ fn rejects_physical_plan_without_single_projection() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task).expect_err("must reject pipeline without projection");
@@ -334,7 +344,8 @@ fn accepts_hash_join_operator_variant_in_worker_payload() {
             .to_string(),
             output: String::new(),
             params: std::collections::HashMap::new(),
-        };
+        filter_predicate: None,
+    };
 
     let namespace = resolve_query_namespace(&task)
         .expect("must accept constrained hash join operator in worker payload");
@@ -367,6 +378,7 @@ fn rejects_deferred_predicate_variant_in_worker_payload() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task)
@@ -402,6 +414,7 @@ fn accepts_limit_after_sort_pipeline() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let namespace = resolve_query_namespace(&task).expect("must accept limit pipeline");
@@ -435,6 +448,7 @@ fn rejects_limit_before_sort_pipeline() {
         .to_string(),
         output: String::new(),
         params: std::collections::HashMap::new(),
+        filter_predicate: None,
     };
 
     let err = resolve_query_namespace(&task).expect_err("must reject invalid limit placement");

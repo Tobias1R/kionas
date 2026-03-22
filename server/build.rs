@@ -5,6 +5,7 @@ fn main() {
     let protos = &[
         "../kionas/proto/warehouse_service.proto",
         "../kionas/proto/worker_service.proto",
+        "../kionas/proto/filter_predicate.proto",
         "../kionas/proto/warehouse_auth_service.proto",
         "../kionas/proto/interops_service.proto",
         "../kionas/proto/metastore_service.proto",

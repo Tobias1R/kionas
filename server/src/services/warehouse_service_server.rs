@@ -53,10 +53,10 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
 
     resp.message = message.to_string();
 
-    if code == "QUERY_DISPATCHED" {
-        if let Some(handle) = extract_query_handle_from_message(message) {
-            resp.data = handle.into_bytes();
-        }
+    if code == "QUERY_DISPATCHED"
+        && let Some(handle) = extract_query_handle_from_message(message)
+    {
+        resp.data = handle.into_bytes();
     }
 
     match category {

@@ -8,8 +8,8 @@ use crate::execution::planner::StageExecutionContext;
 use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
 use crate::services::query_execution::{
-    apply_filter_pipeline, apply_limit_pipeline, apply_projection_pipeline, apply_sort_pipeline,
-    normalize_batches_for_sort,
+    apply_filter_predicate_pipeline, apply_limit_pipeline, apply_projection_pipeline,
+    apply_sort_pipeline, normalize_batches_for_sort,
 };
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
@@ -631,8 +631,12 @@ pub(crate) async fn execute_query_task(
         batches = apply_relation_column_names(&batches, columns)?;
     }
 
-    if let Some(sql) = runtime_plan.filter_sql.as_deref() {
-        batches = apply_filter_pipeline(&batches, sql, runtime_plan.schema_metadata.as_ref())?;
+    if let Some(predicate) = runtime_plan.filter_predicate.as_ref() {
+        batches = apply_filter_predicate_pipeline(
+            &batches,
+            predicate,
+            runtime_plan.schema_metadata.as_ref(),
+        )?;
     }
 
     if let Some(join_spec) = runtime_plan.join_spec.as_ref() {
