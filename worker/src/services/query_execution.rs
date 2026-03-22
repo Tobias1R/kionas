@@ -940,8 +940,7 @@ pub(crate) fn apply_projection_pipeline(
                         continue;
                     }
 
-                    let name = parse_projection_identifier(raw)?;
-                    let output_name = normalize_projection_identifier(raw);
+                    let (name, output_name) = parse_projection_binding(raw)?;
                     push_projected_column(
                         batch,
                         &name,
@@ -1218,6 +1217,76 @@ fn normalize_projection_identifier(raw: &str) -> String {
         .to_string()
 }
 
+fn parse_projection_binding(raw_sql: &str) -> Result<(String, String), String> {
+    let trimmed = raw_sql.trim();
+
+    if let Some((lhs, rhs)) = split_projection_alias(trimmed) {
+        if !is_simple_identifier_reference(lhs) {
+            return Err(format!(
+                "unsupported projection expression '{}': only simple column references are supported in this phase",
+                trimmed
+            ));
+        }
+
+        let alias = normalize_alias_identifier(rhs).ok_or_else(|| {
+            format!(
+                "unsupported projection alias '{}': alias must be a simple identifier",
+                rhs.trim()
+            )
+        })?;
+        return Ok((normalize_projection_identifier(lhs), alias));
+    }
+
+    let source = parse_projection_identifier(trimmed)?;
+    let output = normalize_projection_identifier(trimmed);
+    Ok((source, output))
+}
+
+fn split_projection_alias(raw: &str) -> Option<(&str, &str)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(idx) = lower.rfind(" as ") {
+        let lhs = trimmed[..idx].trim();
+        let rhs = trimmed[idx + 4..].trim();
+        if lhs.is_empty() || rhs.is_empty() {
+            return None;
+        }
+        return Some((lhs, rhs));
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if !is_simple_identifier_reference(first) {
+        return None;
+    }
+
+    Some((first, second))
+}
+
+fn normalize_alias_identifier(raw: &str) -> Option<String> {
+    if !is_identifier_segment(raw) {
+        return None;
+    }
+
+    Some(
+        raw.trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches('[')
+            .trim_matches(']')
+            .to_string(),
+    )
+}
+
 pub(crate) fn resolve_schema_column_index(schema: &Schema, requested: &str) -> Option<usize> {
     let requested = requested.trim();
     if requested.is_empty() {
@@ -1292,13 +1361,24 @@ fn fallback_semantic_to_physical_column_index(schema: &Schema, normalized: &str)
 /// Output:
 /// - Parsed column identifier for projection lookup.
 fn parse_projection_identifier(raw_sql: &str) -> Result<String, String> {
-    if !is_simple_identifier_reference(raw_sql) {
+    let trimmed = raw_sql.trim();
+    if let Some((lhs, _)) = split_projection_alias(trimmed) {
+        if !is_simple_identifier_reference(lhs) {
+            return Err(format!(
+                "unsupported projection expression '{}': only simple column references are supported in this phase",
+                raw_sql.trim()
+            ));
+        }
+        return Ok(normalize_projection_identifier(lhs));
+    }
+
+    if !is_simple_identifier_reference(trimmed) {
         return Err(format!(
             "unsupported projection expression '{}': only '*' or simple column references are supported in this phase",
             raw_sql.trim()
         ));
     }
-    Ok(normalize_projection_identifier(raw_sql))
+    Ok(normalize_projection_identifier(trimmed))
 }
 
 /// What: Validate whether an expression is a simple identifier reference.

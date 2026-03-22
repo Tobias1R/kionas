@@ -117,3 +117,25 @@ fn join_with_no_matches_returns_empty_batch_with_expected_schema() {
     assert!(schema.column_with_name("orders_id").is_some());
     assert!(schema.column_with_name("value").is_some());
 }
+
+#[test]
+fn join_rejects_spec_with_empty_keys() {
+    let mut spec = build_join_spec();
+    spec.keys.clear();
+
+    let err = apply_hash_join_pipeline(&[left_batch()], &[right_batch()], &spec)
+        .expect_err("join must reject empty key set");
+
+    assert!(err.contains("requires at least one join key"));
+}
+
+#[test]
+fn join_rejects_spec_with_empty_right_relation() {
+    let mut spec = build_join_spec();
+    spec.right_relation.table = "   ".to_string();
+
+    let err = apply_hash_join_pipeline(&[left_batch()], &[right_batch()], &spec)
+        .expect_err("join must reject empty right relation metadata");
+
+    assert!(err.contains("right relation must be non-empty"));
+}

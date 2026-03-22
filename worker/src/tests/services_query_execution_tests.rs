@@ -142,6 +142,28 @@ fn applies_projection_raw_identifier() {
 }
 
 #[test]
+fn applies_projection_raw_identifier_with_alias() {
+    let projected = apply_projection_pipeline(
+        &[batch_two_rows()],
+        &[kionas::planner::PhysicalExpr::Raw {
+            sql: "name AS customer_name".to_string(),
+        }],
+    )
+    .expect("projection with alias must run");
+
+    assert_eq!(projected[0].num_columns(), 1);
+    assert_eq!(projected[0].schema().field(0).name(), "customer_name");
+
+    let values = projected[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("projected alias column must be utf8");
+    assert_eq!(values.value(0), "a");
+    assert_eq!(values.value(1), "b");
+}
+
+#[test]
 fn builds_bucket_relative_source_prefix() {
     let ns = crate::execution::query::QueryNamespace {
         database: "db1".to_string(),
@@ -212,6 +234,13 @@ fn rejects_unsupported_projection_expression() {
     let err = parse_projection_identifier("CAST(id AS STRING)")
         .expect_err("complex projection must be rejected");
     assert!(err.contains("unsupported projection expression"));
+}
+
+#[test]
+fn parses_projection_identifier_with_alias() {
+    let parsed = parse_projection_identifier("users.name AS customer_name")
+        .expect("aliased projection should parse");
+    assert_eq!(parsed, "name");
 }
 
 #[test]

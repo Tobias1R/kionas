@@ -31,6 +31,8 @@ pub(crate) fn apply_hash_join_pipeline(
     right_batches: &[RecordBatch],
     spec: &PhysicalJoinSpec,
 ) -> Result<Vec<RecordBatch>, String> {
+    validate_hash_join_spec(spec)?;
+
     if left_batches.is_empty() || right_batches.is_empty() {
         return Ok(vec![build_empty_join_batch(
             left_batches,
@@ -112,6 +114,29 @@ pub(crate) fn apply_hash_join_pipeline(
     }
 
     Ok(joined_batches)
+}
+
+/// What: Validate runtime hash join specification invariants.
+///
+/// Inputs:
+/// - `spec`: Physical join specification received from planner/runtime payload.
+///
+/// Output:
+/// - `Ok(())` when required join metadata is valid for execution.
+/// - `Err(message)` when mandatory join invariants are missing.
+fn validate_hash_join_spec(spec: &PhysicalJoinSpec) -> Result<(), String> {
+    if spec.keys.is_empty() {
+        return Err("hash join requires at least one join key".to_string());
+    }
+
+    if spec.right_relation.database.trim().is_empty()
+        || spec.right_relation.schema.trim().is_empty()
+        || spec.right_relation.table.trim().is_empty()
+    {
+        return Err("hash join right relation must be non-empty".to_string());
+    }
+
+    Ok(())
 }
 
 /// What: Build the deterministic output schema for join batches.
