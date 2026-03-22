@@ -1,9 +1,10 @@
 use super::{
-    ScanDecisionContext, ScanPruningDecisionFields, build_empty_batch_from_relation_columns,
-    format_exchange_io_decision_event, format_materialization_decision_event,
-    format_scan_fallback_reason_event, format_scan_mode_chosen_event,
-    format_scan_pruning_decision_event, load_scan_batches, maybe_prune_scan_keys,
-    parse_partition_index_from_exchange_key, validate_upstream_exchange_partition_set,
+    ScanDecisionContext, ScanPruningDecisionFields, StageRuntimeTelemetryFields,
+    build_empty_batch_from_relation_columns, format_exchange_io_decision_event,
+    format_materialization_decision_event, format_scan_fallback_reason_event,
+    format_scan_mode_chosen_event, format_scan_pruning_decision_event, format_stage_runtime_event,
+    load_scan_batches, maybe_prune_scan_keys, parse_partition_index_from_exchange_key,
+    validate_upstream_exchange_partition_set,
 };
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::state::SharedData;
@@ -143,6 +144,37 @@ fn formats_scan_pruning_decision_event_with_required_dimensions() {
     assert!(event.contains("cache_hit=hit"));
     assert!(event.contains("total_files=10"));
     assert!(event.contains("retained_files=10"));
+}
+
+#[test]
+fn formats_stage_runtime_event_with_required_dimensions_and_metrics() {
+    let event = format_stage_runtime_event(
+        "q6",
+        8,
+        "t6",
+        &StageRuntimeTelemetryFields {
+            operator_family: "stage",
+            origin: "worker_pipeline",
+            stage_runtime_ms: 123,
+            operator_rows_in: 100,
+            operator_rows_out: 80,
+            batch_count: 4,
+            artifact_bytes: 4096,
+        },
+    );
+
+    assert!(event.starts_with("event=execution.stage_runtime "));
+    assert!(event.contains("query_id=q6"));
+    assert!(event.contains("stage_id=8"));
+    assert!(event.contains("task_id=t6"));
+    assert!(event.contains("operator_family=stage"));
+    assert!(event.contains("category=execution"));
+    assert!(event.contains("origin=worker_pipeline"));
+    assert!(event.contains("stage_runtime_ms=123"));
+    assert!(event.contains("operator_rows_in=100"));
+    assert!(event.contains("operator_rows_out=80"));
+    assert!(event.contains("batch_count=4"));
+    assert!(event.contains("artifact_bytes=4096"));
 }
 
 #[test]

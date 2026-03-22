@@ -8,6 +8,7 @@ use crate::services::metastore_service::metastore_service::{
 };
 use async_trait::async_trait;
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait MetastoreProvider: Send + Sync {
     async fn create_table(&self, req: CreateTableRequest) -> CreateTableResponse;

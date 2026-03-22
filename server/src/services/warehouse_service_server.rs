@@ -131,11 +131,14 @@ impl WarehouseServiceTrait for WarehouseService {
         let query_text = req.query;
         let session_id = ctx.session_id.clone();
 
-        // print
-        log::info!("Received query: {}", query_text);
-
         // Use the query id from the context so callers can correlate work.
-        let _query_id = ctx.query_id.clone();
+        let query_id = ctx.query_id.clone();
+        log::debug!(
+            "received query query_id={} session_id={} query_len={}",
+            query_id,
+            session_id,
+            query_text.len()
+        );
 
         // Prepare a single mutable response and populate it based on interpretation of the query.
         let mut resp = QueryResponse {
@@ -148,14 +151,22 @@ impl WarehouseServiceTrait for WarehouseService {
 
         let shared_data = self.shared_data.clone();
 
-        // Attempt to fetch and log the full session (if available) for better observability
+        // Attempt to fetch session context without high-volume object dumps.
         if !ctx.session_id.is_empty() {
             let session_manager = {
                 let sd = shared_data.lock().await;
                 sd.session_manager.clone()
             };
-            if let Some(sess) = session_manager.get_session(ctx.session_id.clone()).await {
-                log::info!("Session: {:?}", sess);
+            if session_manager
+                .get_session(ctx.session_id.clone())
+                .await
+                .is_some()
+            {
+                log::debug!(
+                    "session context available for query_id={} session_id={}",
+                    query_id,
+                    session_id
+                );
             }
         }
         // Centralized handler for simple commands (e.g. `USE WAREHOUSE`) that

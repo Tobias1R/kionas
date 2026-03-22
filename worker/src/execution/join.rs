@@ -11,6 +11,8 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use kionas::planner::PhysicalJoinSpec;
 
+const JOIN_MATCH_CHUNK_SIZE: usize = 65_536;
+
 /// What: Execute a constrained inner equi hash-join between left and right batches.
 ///
 /// Inputs:
@@ -57,25 +59,51 @@ pub(crate) fn apply_hash_join_pipeline(
     let right_key_columns =
         resolve_join_key_indices(right_all.schema().as_ref(), &spec.keys, false)?;
 
-    let mut right_index = HashMap::<String, Vec<u32>>::new();
+    let mut right_index = HashMap::<String, Vec<u32>>::with_capacity(right_all.num_rows());
     for row in 0..right_all.num_rows() {
         let key = row_join_key(&right_all, row, &right_key_columns)?;
         right_index.entry(key).or_default().push(row as u32);
     }
 
-    let mut left_indices = Vec::<u32>::new();
-    let mut right_indices = Vec::<u32>::new();
+    let joined_schema = build_join_output_schema(
+        left_all.schema().as_ref(),
+        right_all.schema().as_ref(),
+        spec,
+    );
+    let mut joined_batches = Vec::<RecordBatch>::new();
+    let mut left_indices = Vec::<u32>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
+    let mut right_indices = Vec::<u32>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
     for row in 0..left_all.num_rows() {
         let key = row_join_key(&left_all, row, &left_key_columns)?;
         if let Some(matches) = right_index.get(&key) {
             for right_row in matches {
                 left_indices.push(row as u32);
                 right_indices.push(*right_row);
+
+                if left_indices.len() >= JOIN_MATCH_CHUNK_SIZE {
+                    flush_join_chunk(
+                        &left_all,
+                        &right_all,
+                        joined_schema.clone(),
+                        &mut left_indices,
+                        &mut right_indices,
+                        &mut joined_batches,
+                    )?;
+                }
             }
         }
     }
 
-    if left_indices.is_empty() {
+    flush_join_chunk(
+        &left_all,
+        &right_all,
+        joined_schema,
+        &mut left_indices,
+        &mut right_indices,
+        &mut joined_batches,
+    )?;
+
+    if joined_batches.is_empty() {
         return Ok(vec![build_empty_join_batch(
             left_batches,
             right_batches,
@@ -83,26 +111,33 @@ pub(crate) fn apply_hash_join_pipeline(
         )?]);
     }
 
-    let left_take = UInt32Array::from(left_indices);
-    let right_take = UInt32Array::from(right_indices);
+    Ok(joined_batches)
+}
 
-    let mut fields = Vec::<Field>::new();
-    let mut arrays = Vec::<ArrayRef>::new();
+/// What: Build the deterministic output schema for join batches.
+///
+/// Inputs:
+/// - `left_schema`: Schema of the concatenated left input.
+/// - `right_schema`: Schema of the concatenated right input.
+/// - `spec`: Join specification containing right relation metadata.
+///
+/// Output:
+/// - Joined output schema with duplicate right column names table-prefixed.
+fn build_join_output_schema(
+    left_schema: &Schema,
+    right_schema: &Schema,
+    spec: &PhysicalJoinSpec,
+) -> Arc<Schema> {
+    let total_columns = left_schema.fields().len() + right_schema.fields().len();
+    let mut fields = Vec::<Field>::with_capacity(total_columns);
 
-    for field in left_all.schema().fields() {
+    for field in left_schema.fields() {
         fields.push(field.as_ref().clone());
     }
 
-    for col in left_all.columns() {
-        let taken = take(col.as_ref(), &left_take, None)
-            .map_err(|e| format!("failed to take left join rows: {}", e))?;
-        arrays.push(taken);
-    }
-
-    for field in right_all.schema().fields() {
+    for field in right_schema.fields() {
         let mut right_field = field.as_ref().clone();
-        if left_all
-            .schema()
+        if left_schema
             .fields()
             .iter()
             .any(|left_field| left_field.name() == right_field.name())
@@ -116,17 +151,62 @@ pub(crate) fn apply_hash_join_pipeline(
         fields.push(right_field);
     }
 
+    Arc::new(Schema::new(fields))
+}
+
+/// What: Flush one buffered join-index chunk into a materialized output batch.
+///
+/// Inputs:
+/// - `left_all`: Concatenated left-side batch.
+/// - `right_all`: Concatenated right-side batch.
+/// - `joined_schema`: Precomputed deterministic output schema.
+/// - `left_indices`: Buffered left row indices for one chunk.
+/// - `right_indices`: Buffered right row indices for one chunk.
+/// - `joined_batches`: Output sink for materialized joined chunks.
+///
+/// Output:
+/// - `Ok(())` after appending one output batch when the chunk is non-empty.
+///
+/// Details:
+/// - Consumes buffered indices and resets the buffers for the next chunk.
+/// - Preserves deterministic row order because chunks are flushed in append order.
+fn flush_join_chunk(
+    left_all: &RecordBatch,
+    right_all: &RecordBatch,
+    joined_schema: Arc<Schema>,
+    left_indices: &mut Vec<u32>,
+    right_indices: &mut Vec<u32>,
+    joined_batches: &mut Vec<RecordBatch>,
+) -> Result<(), String> {
+    if left_indices.is_empty() {
+        return Ok(());
+    }
+
+    let left_take = UInt32Array::from(std::mem::take(left_indices));
+    let right_take = UInt32Array::from(std::mem::take(right_indices));
+
+    let total_columns = left_all.num_columns() + right_all.num_columns();
+    let mut arrays = Vec::<ArrayRef>::with_capacity(total_columns);
+
+    for col in left_all.columns() {
+        let taken = take(col.as_ref(), &left_take, None)
+            .map_err(|e| format!("failed to take left join rows: {}", e))?;
+        arrays.push(taken);
+    }
+
     for col in right_all.columns() {
         let taken = take(col.as_ref(), &right_take, None)
             .map_err(|e| format!("failed to take right join rows: {}", e))?;
         arrays.push(taken);
     }
 
-    let joined_schema = Arc::new(Schema::new(fields));
     let joined = RecordBatch::try_new(joined_schema, arrays)
         .map_err(|e| format!("failed to build joined batch: {}", e))?;
+    joined_batches.push(joined);
 
-    Ok(vec![joined])
+    left_indices.reserve(JOIN_MATCH_CHUNK_SIZE);
+    right_indices.reserve(JOIN_MATCH_CHUNK_SIZE);
+    Ok(())
 }
 
 fn build_empty_join_batch(
@@ -143,7 +223,8 @@ fn build_empty_join_batch(
         .map(|b| b.schema())
         .ok_or_else(|| "right join input is empty".to_string())?;
 
-    let mut fields = Vec::<Field>::new();
+    let total_columns = left_schema.fields().len() + right_schema.fields().len();
+    let mut fields = Vec::<Field>::with_capacity(total_columns);
     for field in left_schema.fields() {
         fields.push(field.as_ref().clone());
     }
@@ -164,7 +245,7 @@ fn build_empty_join_batch(
         fields.push(next);
     }
 
-    let mut arrays = Vec::<ArrayRef>::new();
+    let mut arrays = Vec::<ArrayRef>::with_capacity(fields.len());
     for field in &fields {
         arrays.push(empty_array_for_type(field.data_type()));
     }
@@ -362,3 +443,7 @@ fn empty_array_for_type(data_type: &DataType) -> ArrayRef {
         _ => Arc::new(StringArray::from(Vec::<String>::new())),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/execution_join_tests.rs"]
+mod tests;

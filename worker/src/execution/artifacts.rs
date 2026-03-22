@@ -35,7 +35,7 @@ pub(crate) struct QueryArtifactMetadata {
 /// - `batches`: Stage output batches.
 ///
 /// Output:
-/// - `Ok(())` when parquet artifact and metadata sidecar are written.
+/// - `Ok(size_bytes)` with persisted parquet artifact size when artifact and metadata sidecar are written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_stage_exchange_artifacts(
     shared: &SharedData,
@@ -46,7 +46,7 @@ pub(crate) async fn persist_stage_exchange_artifacts(
     partition_count: u32,
     upstream_stage_ids: &[u32],
     batches: &[RecordBatch],
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let provider = shared.storage_provider.as_ref().ok_or_else(|| {
         "storage provider is not configured for stage exchange persistence".to_string()
     })?;
@@ -56,9 +56,10 @@ pub(crate) async fn persist_stage_exchange_artifacts(
         stage_exchange_metadata_key(query_run_id, session_id, stage_id, partition_index);
 
     let parquet_bytes = encode_batches_to_parquet(batches)?;
+    let parquet_size_bytes = parquet_bytes.len() as u64;
     let artifacts = vec![QueryArtifactMetadata {
         key: data_key.clone(),
-        size_bytes: parquet_bytes.len() as u64,
+        size_bytes: parquet_size_bytes,
         checksum_fnv64: checksum_fnv64_hex(&parquet_bytes),
     }];
 
@@ -94,7 +95,7 @@ pub(crate) async fn persist_stage_exchange_artifacts(
             )
         })?;
 
-    Ok(())
+    Ok(parquet_size_bytes)
 }
 
 /// What: Persist result batches to deterministic task-scoped artifact location.
@@ -107,14 +108,14 @@ pub(crate) async fn persist_stage_exchange_artifacts(
 /// - `batches`: Executed result batches.
 ///
 /// Output:
-/// - `Ok(())` when result parquet file is stored.
+/// - `Ok(size_bytes)` with persisted parquet artifact size when result parquet file is stored.
 pub(crate) async fn persist_query_artifacts(
     shared: &SharedData,
     result_location: &str,
     session_id: &str,
     task_id: &str,
     batches: &[RecordBatch],
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let provider = shared.storage_provider.as_ref().ok_or_else(|| {
         "storage provider is not configured for query result persistence".to_string()
     })?;
@@ -133,10 +134,11 @@ pub(crate) async fn persist_query_artifacts(
     let prefix = format!("{}/staging/{}/{}/", path, session_id, task_id);
     let key = format!("{}part-00000.parquet", prefix);
     let parquet_bytes = encode_batches_to_parquet(batches)?;
+    let parquet_size_bytes = parquet_bytes.len() as u64;
     let metadata_key = format!("{}result_metadata.json", prefix);
     let artifacts = vec![QueryArtifactMetadata {
         key: key.clone(),
-        size_bytes: parquet_bytes.len() as u64,
+        size_bytes: parquet_size_bytes,
         checksum_fnv64: checksum_fnv64_hex(&parquet_bytes),
     }];
     let metadata_bytes = encode_result_metadata(batches, &artifacts)?;
@@ -149,7 +151,9 @@ pub(crate) async fn persist_query_artifacts(
     provider
         .put_object(&metadata_key, metadata_bytes)
         .await
-        .map_err(|e| format!("failed to persist query metadata {}: {}", metadata_key, e))
+        .map_err(|e| format!("failed to persist query metadata {}: {}", metadata_key, e))?;
+
+    Ok(parquet_size_bytes)
 }
 
 /// What: Encode record batches into a single parquet payload.
@@ -199,29 +203,25 @@ pub(crate) fn encode_result_metadata(
         .ok_or_else(|| "cannot encode metadata for empty batch list".to_string())?;
 
     let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-    let fields = first
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "name": f.name(),
-                "data_type": format!("{:?}", f.data_type()),
-                "nullable": f.is_nullable(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let schema = first.schema();
+    let schema_fields = schema.fields();
+    let mut fields = Vec::with_capacity(schema_fields.len());
+    for field in schema_fields {
+        fields.push(serde_json::json!({
+            "name": field.name(),
+            "data_type": format!("{:?}", field.data_type()),
+            "nullable": field.is_nullable(),
+        }));
+    }
 
-    let artifact_values = artifacts
-        .iter()
-        .map(|artifact| {
-            serde_json::json!({
-                "key": artifact.key,
-                "size_bytes": artifact.size_bytes,
-                "checksum_fnv64": artifact.checksum_fnv64,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut artifact_values = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        artifact_values.push(serde_json::json!({
+            "key": artifact.key,
+            "size_bytes": artifact.size_bytes,
+            "checksum_fnv64": artifact.checksum_fnv64,
+        }));
+    }
 
     serde_json::to_vec_pretty(&serde_json::json!({
         "row_count": row_count,

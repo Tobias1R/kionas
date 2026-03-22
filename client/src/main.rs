@@ -537,27 +537,27 @@ async fn execute_and_render_query(
     // if status is not OK, we expect error_code and message to be populated for debugging. If status is OK, error_code should be 0 and message may or may not be populated but should not contain critical error info.
     // print the error code and message in either case for visibility, but the client should primarily rely on the status field for control flow decisions.
 
-    if response.error_code != "0".to_string() {
+    if response.error_code != "0" {
         println!(
             "Query failed with status={} error_code={} message={}",
             response.status, response.error_code, response.message
         );
-        return Ok(false);
+        Ok(false)
     } else {
         if let Some(handle) = query_handle_from_response(&response) {
             // println!("Structured query handle: {}", handle);
             let batches = fetch_doget_batches(&handle).await?;
             print_batches_as_table(&batches)?;
         }
-        if response.status == "OK".to_string() {
+        if response.status == "OK" {
             println!("Query executed successfully");
-            return Ok(true);
+            Ok(true)
         } else {
             println!(
                 "Query completed with status={} error_code={} message={}",
                 response.status, response.error_code, response.message
             );
-            return Ok(false);
+            Ok(false)
         }
     }
 }
@@ -692,6 +692,8 @@ async fn run_query_file(
         .map_err(|e| format!("failed to read query file '{}': {}", query_file, e))?;
     let statements = split_sql_statements(&script);
 
+    let start_time = std::time::Instant::now();
+
     if statements.is_empty() {
         return Err(format!(
             "query file '{}' contains no executable statements",
@@ -711,29 +713,49 @@ async fn run_query_file(
     for (index, statement) in statements.iter().enumerate() {
         let ordinal = index + 1;
         println!("\\n--- Statement {}/{} ---", ordinal, statements.len());
-        println!("{}", statement);
+        //println!("{}", statement);
+        let stament_start = std::time::Instant::now();
 
         match execute_and_render_query(warehouse_client, session_id, token, statement).await {
             Ok(true) => {
                 success_count += 1;
-                println!("statement {}: SUCCESS", ordinal);
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: SUCCESS ({} ms)",
+                    ordinal,
+                    duration.as_millis()
+                );
             }
             Ok(false) => {
                 failed_indices.push(ordinal);
-                println!("statement {}: FAILED (non-success status)", ordinal);
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: FAILED (non-success status, {} ms)",
+                    ordinal,
+                    duration.as_millis()
+                );
             }
             Err(e) => {
                 failed_indices.push(ordinal);
-                println!("statement {}: ERROR ({})", ordinal, e);
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: ERROR ({} ms) ({})",
+                    ordinal,
+                    duration.as_millis(),
+                    e
+                );
             }
         }
     }
+    let total_duration = start_time.elapsed();
 
     println!(
-        "\\nExecution summary: total={} success={} failed={}",
+        "\\nExecution summary: {} \\ntotal={} success={} failed={} ({} ms)",
+        query_file,
         statements.len(),
         success_count,
-        failed_indices.len()
+        failed_indices.len(),
+        total_duration.as_millis()
     );
 
     if failed_indices.is_empty() {

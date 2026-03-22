@@ -31,7 +31,7 @@ pub async fn get_worker_addr_for_session(
     // Try by digested warehouse uuid first
     let worker_uuid = session.get_warehouse_uuid();
     let warehouses_map = state.warehouses.lock().await;
-    log::info!(
+    log::debug!(
         "Resolving worker for session {} -> warehouse='{}' uuid={}",
         session_id,
         session.get_warehouse(),
@@ -39,7 +39,7 @@ pub async fn get_worker_addr_for_session(
     );
     // Dump registered warehouses for diagnostics
     for (k, w) in warehouses_map.iter() {
-        log::info!(
+        log::debug!(
             "Registered warehouse key={} name={} host={} port={}",
             k,
             w.get_name(),
@@ -50,7 +50,7 @@ pub async fn get_worker_addr_for_session(
     // Dump worker pools keys
     let worker_pools_map = state.worker_pools.lock().await;
     for (k, _) in worker_pools_map.iter() {
-        log::info!("Worker pool key={}", k);
+        log::debug!("Worker pool key={}", k);
     }
     if let Some(warehouse) = warehouses_map.get(&worker_uuid) {
         let scheme = if warehouse.get_port() == 443 {
@@ -73,7 +73,7 @@ pub async fn get_worker_addr_for_session(
         let wname = w.get_name();
         let whost = w.get_host();
         if wname == plain || wname.ends_with(&plain) || wname.contains(&plain) || whost == plain {
-            log::info!(
+            log::debug!(
                 "Fuzzy matched warehouse '{}' to session warehouse '{}'",
                 wname,
                 plain

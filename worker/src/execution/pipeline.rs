@@ -261,6 +261,60 @@ pub(crate) fn format_materialization_decision_event(
     )
 }
 
+/// What: Fields required to emit EP-3 stage runtime telemetry.
+///
+/// Inputs:
+/// - `operator_family`: Stable operator-family label.
+/// - `origin`: Stable event origin label.
+/// - `stage_runtime_ms`: End-to-end stage runtime in milliseconds.
+/// - `operator_rows_in`: Input rows observed before operator pipeline transforms.
+/// - `operator_rows_out`: Output rows emitted after normalization.
+/// - `batch_count`: Output batch count after normalization.
+/// - `artifact_bytes`: Persisted artifact bytes for exchange and optional materialization.
+///
+/// Output:
+/// - Struct consumed by `format_stage_runtime_event`.
+pub(crate) struct StageRuntimeTelemetryFields<'a> {
+    pub(crate) operator_family: &'a str,
+    pub(crate) origin: &'a str,
+    pub(crate) stage_runtime_ms: u128,
+    pub(crate) operator_rows_in: usize,
+    pub(crate) operator_rows_out: usize,
+    pub(crate) batch_count: usize,
+    pub(crate) artifact_bytes: u64,
+}
+
+/// What: Format `execution.stage_runtime` telemetry event payload for EP-3.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Stage identifier.
+/// - `task_id`: Task identifier.
+/// - `fields`: Structured telemetry fields emitted for operations.
+///
+/// Output:
+/// - Stable event line suitable for structured log parsing.
+pub(crate) fn format_stage_runtime_event(
+    query_id: &str,
+    stage_id: u32,
+    task_id: &str,
+    fields: &StageRuntimeTelemetryFields<'_>,
+) -> String {
+    format!(
+        "event=execution.stage_runtime query_id={} stage_id={} task_id={} operator_family={} category=execution origin={} stage_runtime_ms={} operator_rows_in={} operator_rows_out={} batch_count={} artifact_bytes={}",
+        query_id,
+        stage_id,
+        task_id,
+        fields.operator_family,
+        fields.origin,
+        fields.stage_runtime_ms,
+        fields.operator_rows_in,
+        fields.operator_rows_out,
+        fields.batch_count,
+        fields.artifact_bytes,
+    )
+}
+
 /// What: Load cached Delta version and file stats for a table when entry is fresh.
 ///
 /// Inputs:
@@ -818,6 +872,8 @@ pub(crate) async fn execute_query_task(
         ));
     }
 
+    let stage_started_at = Instant::now();
+
     let runtime_plan = extract_runtime_plan(task)?;
     let stage_context = stage_execution_context(task)?;
     let query_id = task
@@ -894,6 +950,8 @@ pub(crate) async fn execute_query_task(
         );
     }
 
+    let operator_rows_in = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+
     if let Some(predicate) = runtime_plan.filter_predicate.as_ref() {
         batches = apply_filter_predicate_pipeline(
             &batches,
@@ -953,7 +1011,7 @@ pub(crate) async fn execute_query_task(
 
     let normalized_batches = normalize_batches_for_sort(&batches)?;
 
-    persist_stage_exchange_artifacts(
+    let exchange_artifact_bytes = persist_stage_exchange_artifacts(
         shared,
         session_id,
         &stage_context.query_run_id,
@@ -977,7 +1035,7 @@ pub(crate) async fn execute_query_task(
         )
     );
 
-    if runtime_plan.has_materialize {
+    let materialization_artifact_bytes = if runtime_plan.has_materialize {
         log::info!(
             "{}",
             format_materialization_decision_event(
@@ -995,7 +1053,7 @@ pub(crate) async fn execute_query_task(
             &normalized_batches,
         )
         .await
-        .map_err(|e| format!("{} [{}]", e, context_tag))
+        .map_err(|e| format!("{} [{}]", e, context_tag))?
     } else {
         log::info!(
             "{}",
@@ -1006,8 +1064,33 @@ pub(crate) async fn execute_query_task(
                 "exchange_only",
             )
         );
-        Ok(())
-    }
+        0
+    };
+
+    let operator_rows_out = normalized_batches
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let stage_runtime_ms = stage_started_at.elapsed().as_millis();
+    log::info!(
+        "{}",
+        format_stage_runtime_event(
+            &query_id,
+            stage_context.stage_id,
+            &task.task_id,
+            &StageRuntimeTelemetryFields {
+                operator_family: "stage",
+                origin: "worker_pipeline",
+                stage_runtime_ms,
+                operator_rows_in,
+                operator_rows_out,
+                batch_count: normalized_batches.len(),
+                artifact_bytes: exchange_artifact_bytes + materialization_artifact_bytes,
+            },
+        )
+    );
+
+    Ok(())
 }
 
 fn relation_key(namespace: &QueryNamespace) -> String {
@@ -1072,8 +1155,9 @@ fn apply_relation_column_names(
 fn build_empty_batch_from_relation_columns(
     relation_columns: &[String],
 ) -> Result<RecordBatch, String> {
-    let mut fields = Vec::<Field>::new();
-    let mut arrays = Vec::<std::sync::Arc<dyn arrow::array::Array>>::new();
+    let mut fields = Vec::<Field>::with_capacity(relation_columns.len());
+    let mut arrays =
+        Vec::<std::sync::Arc<dyn arrow::array::Array>>::with_capacity(relation_columns.len());
 
     for column in relation_columns {
         let normalized = column.trim().to_ascii_lowercase();
@@ -1293,6 +1377,8 @@ async fn load_upstream_exchange_batches(
             }
         }
 
+        all_batches.reserve(keys.len());
+
         for key in keys {
             let bytes = provider
                 .get_object(&key)
@@ -1449,7 +1535,7 @@ pub(crate) async fn load_scan_batches(
         ));
     }
 
-    let mut all_batches = Vec::new();
+    let mut all_batches = Vec::with_capacity(retained_files);
     for key in pruning_outcome.keys {
         let bytes = provider
             .get_object(&key)
@@ -1458,6 +1544,7 @@ pub(crate) async fn load_scan_batches(
             .ok_or_else(|| format!("source object not found: {}", key))?;
 
         let decoded = decode_parquet_batches(bytes)?;
+        all_batches.reserve(decoded.len());
         all_batches.extend(decoded);
     }
 
