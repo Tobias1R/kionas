@@ -1,4 +1,4 @@
-use crate::services::worker_service_server::worker_service::Task;
+type Task = crate::services::worker_service_server::worker_service::StagePartitionExecution;
 use crate::state::SharedData;
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -166,7 +166,7 @@ fn parse_insert_payload(task: &Task) -> Result<ParsedInsertPayload, String> {
 /// Details:
 /// - Type inference is per-column: int, bool, otherwise utf8.
 fn parse_insert_column_type_hints(
-    task: &crate::services::worker_service_server::worker_service::Task,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
 ) -> Result<HashMap<String, String>, String> {
     let strict_contract = task
         .params
@@ -984,19 +984,25 @@ pub async fn handle_execute_task(
 
     let stage_id = first_task
         .as_ref()
-        .and_then(|task| task.params.get("stage_id").cloned())
-        .filter(|s| !s.trim().is_empty());
+        .and_then(|task| (task.stage_id > 0).then(|| task.stage_id.to_string()));
     let partition_count = first_task
         .as_ref()
-        .and_then(|task| task.params.get("partition_count"))
-        .and_then(|value| value.parse::<u32>().ok());
+        .and_then(|task| (task.partition_count > 0).then_some(task.partition_count));
     let upstream_stage_ids = first_task
         .as_ref()
-        .and_then(|task| task.params.get("upstream_stage_ids").cloned())
+        .map(|task| {
+            serde_json::to_string(&task.upstream_stage_ids).unwrap_or_else(|_| "[]".to_string())
+        })
         .unwrap_or_else(|| "[]".to_string());
     let partition_spec = first_task
         .as_ref()
-        .and_then(|task| task.params.get("partition_spec").cloned())
+        .map(|task| {
+            if task.partition_spec.trim().is_empty() {
+                "\"Single\"".to_string()
+            } else {
+                task.partition_spec.clone()
+            }
+        })
         .unwrap_or_else(|| "\"Single\"".to_string());
 
     shared

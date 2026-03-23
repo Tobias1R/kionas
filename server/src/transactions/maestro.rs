@@ -29,7 +29,7 @@ pub struct Participant {
     /// Staging prefix where the participant should write staged objects
     pub staging_prefix: String,
     /// Tasks that should be executed as part of prepare for this participant.
-    pub tasks: Vec<crate::services::worker_service_client::worker_service::Task>,
+    pub tasks: Vec<crate::services::worker_service_client::worker_service::StagePartitionExecution>,
 }
 
 /// Lightweight transaction descriptor

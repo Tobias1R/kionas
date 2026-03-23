@@ -46,7 +46,9 @@ struct ParsedColumn {
 ///
 /// Output:
 /// - Canonical `(database_name, schema_name, table_name)` tuple.
-fn resolve_namespace(task: &worker_service::Task) -> Result<(String, String, String), String> {
+fn resolve_namespace(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<(String, String, String), String> {
     let parsed: serde_json::Value = serde_json::from_str(&task.input)
         .map_err(|e| format!("invalid create_table payload: {}", e))?;
 
@@ -93,7 +95,9 @@ fn resolve_namespace(task: &worker_service::Task) -> Result<(String, String, Str
 ///
 /// Output:
 /// - Parsed typed column list used for delta initialization.
-fn resolve_columns(task: &worker_service::Task) -> Result<Vec<ParsedColumn>, String> {
+fn resolve_columns(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<Vec<ParsedColumn>, String> {
     let parsed: serde_json::Value = serde_json::from_str(&task.input)
         .map_err(|e| format!("invalid create_table payload: {}", e))?;
 
@@ -253,7 +257,7 @@ fn resolve_arrow_type_for_declared_type(declared_type: &str) -> Result<DataType,
 /// - `Err(message)` for invalid payload or storage failures.
 pub(crate) async fn execute_create_table_task(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
 ) -> Result<String, String> {
     let (database_name, schema_name, table_name) = resolve_namespace(task)?;
     let columns = resolve_columns(task)?;

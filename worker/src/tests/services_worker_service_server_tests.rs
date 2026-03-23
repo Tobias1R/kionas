@@ -1,7 +1,18 @@
 use super::{normalize_worker_error_for_response, validate_query_task_context, worker_service};
 
-fn build_query_task() -> worker_service::Task {
-    worker_service::Task {
+fn build_query_task() -> worker_service::StagePartitionExecution {
+    worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: "{}".to_string(),
@@ -51,7 +62,8 @@ fn rejects_staged_query_task_without_partition_context() {
     let mut task = build_query_task();
     task.params
         .insert("__query_id".to_string(), "q1".to_string());
-    task.params.insert("stage_id".to_string(), "2".to_string());
+    task.stage_id = 2;
+    task.partition_count = 0;
 
     let err = validate_query_task_context(&task)
         .expect_err("missing partition_index for staged task must fail");
@@ -67,9 +79,9 @@ fn accepts_staged_query_task_with_required_context() {
     let mut task = build_query_task();
     task.params
         .insert("__query_id".to_string(), "q1".to_string());
-    task.params.insert("stage_id".to_string(), "2".to_string());
-    task.params
-        .insert("partition_index".to_string(), "0".to_string());
+    task.stage_id = 2;
+    task.partition_count = 1;
+    task.partition_id = 0;
 
     assert!(validate_query_task_context(&task).is_ok());
 }

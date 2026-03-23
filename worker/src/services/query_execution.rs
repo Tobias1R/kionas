@@ -67,7 +67,7 @@ struct FilterClause {
 #[allow(dead_code)]
 pub(crate) async fn execute_query_task(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
     session_id: &str,
     namespace: &QueryNamespace,
     result_location: &str,

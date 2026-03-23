@@ -364,7 +364,18 @@ fn applies_high_offset_as_empty_result() {
 
 #[test]
 fn extracts_runtime_limit_spec() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t-limit".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -428,7 +439,18 @@ fn extract_runtime_plan_accepts_matching_task_filter_predicate() {
     };
     let plan = make_physical_plan_with_filter(predicate.clone());
 
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t-filter-match".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({ "physical_plan": plan }).to_string(),
@@ -450,7 +472,18 @@ fn extract_runtime_plan_rejects_mismatched_task_filter_predicate() {
     };
     let plan = make_physical_plan_with_filter(predicate);
 
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t-filter-mismatch".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({ "physical_plan": plan }).to_string(),
@@ -465,7 +498,18 @@ fn extract_runtime_plan_rejects_mismatched_task_filter_predicate() {
 
 #[test]
 fn extract_runtime_plan_uses_task_filter_predicate_without_plan_filter() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t-filter-task-only".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({

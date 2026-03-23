@@ -16,7 +16,7 @@ fn is_synthetic_insert_column(name: &str, expected_index: usize) -> bool {
     normalized == format!("c{}", expected_index + 1)
 }
 
-fn parse_table_columns(task: &worker_service::Task) -> Vec<String> {
+fn parse_table_columns(task: &worker_service::StagePartitionExecution) -> Vec<String> {
     let raw = match task.params.get("table_columns_json") {
         Some(value) => value,
         None => return Vec::new(),
@@ -79,7 +79,9 @@ fn resolved_insert_columns(
 ///
 /// Details:
 /// - Missing or malformed params degrade to an empty requirement set.
-pub(crate) fn parse_required_not_null_columns(task: &worker_service::Task) -> Vec<String> {
+pub(crate) fn parse_required_not_null_columns(
+    task: &worker_service::StagePartitionExecution,
+) -> Vec<String> {
     let raw = match task.params.get("not_null_columns_json") {
         Some(value) => value,
         None => return Vec::new(),
@@ -113,7 +115,7 @@ pub(crate) fn parse_required_not_null_columns(task: &worker_service::Task) -> Ve
 /// Details:
 /// - Empty `required_columns` means no enforcement is required.
 pub(crate) fn enforce_not_null_columns(
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
     parsed_insert: &ParsedInsertPayload,
     required_columns: &[String],
 ) -> Result<(), String> {

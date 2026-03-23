@@ -1,6 +1,6 @@
 # PARALLEL Silk Road: Complete Artifact Index
 
-**Status**: ✓ Discovery & Planning Complete | No Code Changes (Discovery Phase Only)
+**Status**: ✓ Discovery & Planning Updated | Revamp Planning Active (Control Plane + Distributed Data Plane)
 
 ---
 
@@ -15,7 +15,9 @@ roadmaps/SILK_ROAD/PARALLEL/
 │   ├── discovery-PARALLEL-PHASE1.md            ← Technical deep-dive: bottlenecks & opportunities
 │   └── discovery-OPPORTUNITY-C-DATAFUSION.md   ← DataFusion streaming model investigation (NEW)
 └── plans/
-    └── plan-PARALLEL-PHASE1.md                 ← Implementation roadmap: 4 workstreams, 16 tasks
+  ├── plan-PARALLEL-PHASE1.md                 ← Phase 1 control-plane roadmap (WS0-WS4)
+  ├── plan-DATAFUSION-MIGRATION-PHASE2.md     ← Legacy Phase 2 migration plan (superseded)
+  └── plan-PHASE2-INTEGRATED-DATAFUSION-DISTRIBUTED.md ← Active integrated Phase 2 plan
 
 roadmaps/
 └── ROADMAP_PARALLEL_PHASE1_MATRIX.md           ← Phase 1 completion tracking template
@@ -58,43 +60,33 @@ roadmaps/
 
 ### Tier 3: Technical Deep-Dive 🔍
 
-#### **[discovery-PARALLEL-PHASE1.md](discovery/discovery-PARALLEL-PHASE1.md)**
-- **Purpose**: Detailed technical investigation of current bottleneck and parallelism opportunities
-- **Length**: ~20 min read (technical)
+#### **[discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md](discovery/discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md)**
+- **Purpose**: Primary technical foundation for distributed execution redesign
+- **Length**: ~20-30 min read (technical)
 - **Contains**:
-  - Current sequential scheduler bottleneck analysis
-  - Why parallelism matters (quantified)
-  - Executive summary with visual timeline comparison
-  - 5 parallelism opportunities identified (A-E)
-  - Architectural components mapped with code references
-  - Current execution patterns analyzed
-  - 12 constraints preventing parallelism (organized by layer)
-  - Architectural decision points for design
-  - All claims linked to source code evidence
+  - Stage extraction at RepartitionExec boundaries
+  - Arrow Flight worker-to-worker transport models
+  - Multi-partition mapping and routing semantics
+  - End-to-end integration model for distributed stage execution
 - **Audience**: Architects, leads, implementation developers
-- **Key Insight**: `run_stage_groups_for_input()` in helpers.rs is primary bottleneck
+- **Key Insight**: Distributed execution must be stage-based and stream-first, not monolithic-plan dispatch
+
+#### **[discovery-PARALLEL-PHASE1.md](discovery/discovery-PARALLEL-PHASE1.md)**
+- **Purpose**: Historical baseline bottleneck analysis
+- **Status**: Superseded by deep-dive-led redesign
 
 ---
 
 #### **[plan-PARALLEL-PHASE1.md](plans/plan-PARALLEL-PHASE1.md)**
-- **Purpose**: Detailed Phase 1 implementation roadmap
+- **Purpose**: Detailed Phase 1 control-plane implementation roadmap
 - **Length**: ~30 min read (comprehensive)
 - **Contains**:
-  - Phase 1 goal (20-40% latency reduction)
-  - 4 workstreams with objectives, approach, tasks:
-    - WS1: Async Scheduler (5 tasks)
-    - WS2: Partial Exchange (5 tasks)
-    - WS3: Correctness Testing (6 tasks)
-    - WS4: Error Handling (4 tasks)
-  - Canonical mode decision table (how different query types behave)
-  - Criteria-to-workstream traceability matrix
-  - Sequence, dependencies, and milestones
-  - 6 identified risks with mitigations
-  - 4 E2E scenarios with expected flows
-  - Implementation guardrails
-  - Success criteria checklist
+  - Breaking task contract redesign (WS0)
+  - Stage extraction and DAG scheduler implementation
+  - In-memory correctness harness and signoff matrix
+  - Error propagation + observability package
 - **Audience**: Implementation teams, project managers, QA leads
-- **Key Insight**: 16 concrete tasks; 5-week timeline; parallel workstreams
+- **Key Insight**: Phase 1 is a correctness gate for distributed execution, not a legacy pipelining phase
 
 ---
 
@@ -117,7 +109,18 @@ roadmaps/
 - **Key Insight**: Eliminates need to maintain parallel operators; true streaming native
 - **Status**: Complete; ready for Phase 2 kickoff
 
-#### **[plan-DATAFUSION-MIGRATION-PHASE2.md](plans/plan-DATAFUSION-MIGRATION-PHASE2.md)** (NEW)
+#### **[plan-PHASE2-INTEGRATED-DATAFUSION-DISTRIBUTED.md](plans/plan-PHASE2-INTEGRATED-DATAFUSION-DISTRIBUTED.md)** (ACTIVE)
+- **Purpose**: Integrated distributed data-plane roadmap after Phase 1 signoff
+- **Length**: ~35-45 min read
+- **Contains**:
+  - 2a planner integration + stage extraction integration
+  - 2b Arrow Flight worker-to-worker streaming
+  - 2c partition routing and fan-out orchestration
+  - 2d integration, chaos testing, and performance validation
+- **Audience**: Implementation teams, project managers, QA leads
+- **Key Insight**: Forward-only distributed architecture; no rollback to monolith
+
+#### **[plan-DATAFUSION-MIGRATION-PHASE2.md](plans/plan-DATAFUSION-MIGRATION-PHASE2.md)** (LEGACY)
 - **Purpose**: Detailed Phase 2 implementation roadmap (DataFusion migration)
 - **Length**: ~40 min read (comprehensive execution guide)
 - **Contains**:
@@ -133,7 +136,7 @@ roadmaps/
   - Deployment strategy (phases: preview, canary, full rollout)
 - **Audience**: Implementation teams, project managers, QA leads
 - **Key Insight**: 26 person-days; fundamental execution model shift; Phase 1 prerequisite
-- **Status**: Ready for Phase 2 implementation kickoff
+- **Status**: Kept for reference; superseded by integrated Phase 2 plan
 
 ### Tier 3c: Opportunity C Archive (Historical) 📦
 
@@ -229,27 +232,28 @@ roadmaps/
 
 ### ✓ Already Created
 - [x] Strategic Silk Road overview (5-phase vision)
-- [x] Phase 1 discovery document (technical analysis)
-- [x] Phase 1 detailed plan (4 workstreams, 16 tasks)
+- [x] Deep-dive discovery (stage extraction + Flight + partition mapping)
+- [x] Phase 1 control-plane plan (WS0-WS4)
+- [x] Integrated Phase 2 distributed plan
 - [x] Phase 1 completion matrix (tracking template)
 - [x] README with quick overview
 
 ### ⏳ To Create During Phase 1 Implementation
 
 **Design Sketches** (Week 1):
-- [ ] `sketches/async_scheduler_design.md` — Scheduler architecture with diagrams
-- [ ] `sketches/partition_checkpoint_design.md` — Checkpoint model and state machine
+- [ ] `sketches/stage_extraction_design.md` — RepartitionExec boundaries and examples
+- [ ] `sketches/dag_scheduler_design.md` — DAG orchestration and failure propagation
 - [ ] `sketches/error_handling_design.md` — Error taxonomy and recovery paths
 
 **Tests** (Week 1-4):
-- [ ] `tests/scheduler_correctness_tests.rs` — Unit tests for scheduler
-- [ ] `tests/exchange_pipelining_tests.rs` — Exchange partial-read tests
-- [ ] `tests/e2e_correctness_tests.rs` — End-to-end correctness validation
+- [ ] `tests/stage_extractor_tests.rs` — Stage extraction test suite
+- [ ] `tests/dag_scheduler_tests.rs` — DAG scheduling and dependency tests
+- [ ] `tests/distributed_e2e_correctness_tests.rs` — End-to-end correctness validation
 
-**Operational Guides** (Week 4-5):
-- [ ] `runbooks/pipelining_troubleshoot.md` — Troubleshooting runbook
-- [ ] `docs/pipelined_execution.md` — Technical documentation
-- [ ] `benchmarks/pipelined_e2e_latency.md` — Performance benchmark report
+**Operational Guides** (Week 4):
+- [ ] `runbooks/stage_execution_troubleshoot.md` — Control-plane troubleshooting runbook
+- [ ] `docs/distributed_control_plane.md` — Technical documentation
+- [ ] `benchmarks/phase1_correctness_gate.md` — Validation and acceptance report
 
 ---
 
@@ -257,30 +261,23 @@ roadmaps/
 
 ### Week 1 Tasks
 
-1. **Review Artifacts** (30 min)
-   - Read [README.md](README.md) for overview
-   - Skim [plan-PARALLEL-PHASE1.md](plans/plan-PARALLEL-PHASE1.md) for workstreams
+1. **Lock Contracts**
+  - Finalize WS0 structs and enums in [plan-PARALLEL-PHASE1.md](plans/plan-PARALLEL-PHASE1.md)
+  - Confirm cluster-wide breaking rollout strategy
 
-2. **Team Alignment** (1-2 hours)
-   - Schedule design review meeting with architects/devs
-   - Review [discovery-PARALLEL-PHASE1.md](discovery/discovery-PARALLEL-PHASE1.md) together
-   - Align on key decisions (async patterns, error handling)
+2. **Kickoff Core Implementation**
+  - Start WS1 stage extraction implementation
+  - Start WS2 DAG scheduler skeleton
 
-3. **Design Sketches** (4-8 hours)
-   - Architect creates [sketches/async_scheduler_design.md](sketches/async_scheduler_design.md)
-   - Architect creates [sketches/partition_checkpoint_design.md](sketches/partition_checkpoint_design.md)
-   - Architect creates [sketches/error_handling_design.md](sketches/error_handling_design.md)
+3. **Create Design Sketches**
+  - Create [sketches/stage_extraction_design.md](sketches/stage_extraction_design.md)
+  - Create [sketches/dag_scheduler_design.md](sketches/dag_scheduler_design.md)
+  - Create [sketches/error_handling_design.md](sketches/error_handling_design.md)
 
-4. **Task Assignment**
-   - Assign WS1 tasks (scheduler) to 1-2 devs
-   - Assign WS2 tasks (exchange) to 1-2 devs
-   - Assign WS3 tasks (testing) to QA lead
-   - Assign WS4 tasks (error handling) to lead dev
-
-5. **Set Up Tracking**
-   - Update [ROADMAP_PARALLEL_PHASE1_MATRIX.md](../../ROADMAP_PARALLEL_PHASE1_MATRIX.md) with owner names
-   - Create GitHub issues for each task (16 total)
-   - Set up weekly sync to review matrix progress
+4. **Set Up Tracking**
+  - Update [ROADMAP_PARALLEL_PHASE1_MATRIX.md](../../ROADMAP_PARALLEL_PHASE1_MATRIX.md) with owners and due dates
+  - Create GitHub issues for WS0-WS4 tasks
+  - Set weekly matrix review cadence
 
 ---
 
@@ -288,30 +285,25 @@ roadmaps/
 
 | Metric | Target | Baseline |
 |--------|--------|----------|
-| **Query Latency** (3-stage agg) | -20% to -40% | 70ms → 42-56ms |
+| **Stage Extraction Correctness** | 100% expected stage boundaries | New |
 | **Regression Pass Rate** | 100% | — |
-| **Code Coverage** (scheduler) | >85% | — |
+| **Code Coverage** (extraction + scheduler) | >85% | — |
 | **Scheduler Overhead** | <2% | — |
+| **Validation Mismatch Rate** | 0% (byte-identical) | New |
 | **Error Scenario Pass Rate** | 100% | — |
 
 ---
 
 ## 🎓 Key Learnings from Discovery
 
-### Bottleneck #1: Sequential Stage Scheduler
-**Current**: `while !done { stage = ready.pop(); run_partitions(stage); BLOCK_WAIT_ALL; }`  
-**Future**: Async futures with concurrent independent stages + partial upstream awareness
+### Stage Boundaries Drive Distribution
+RepartitionExec boundaries provide the most reliable split points for distributed stage tasks.
 
-### Opportunity #1: Partition-Level Checkpoints
-**Current**: Downstream waits for ALL upstream partitions before starting  
-**Future**: Downstream can start reading partition 0 while partition 1-3 still processing
+### Control Plane First Lowers Risk
+Stage extraction + DAG execution validated in-memory reduces Phase 2 networking risk.
 
-### Constraint #1: All-or-Nothing Semantics
-**Current** (Good): Any failure fails entire stage (simple, correct)  
-**Future** (Maintain): Still per-stage; but partial progress possible without partial success
-
-### Scale: Multi-Stage Queries
-**3-Stage Query** shows best opportunity: cumulative stages → overlapped windows
+### Forward-Only Architecture
+The redesign is intentionally breaking and avoids legacy fallback to monolithic task execution.
 
 ---
 
@@ -321,19 +313,19 @@ roadmaps/
 A: Discovery phase establishes understanding and plan before implementation. Code changes come in Phase 1 implementation (Week 1-5).
 
 **Q: How long is Phase 1?**  
-A: ~5 weeks estimated. Workstreams can be parallelized; dependencies tracked in plan.
+A: 3-4 weeks estimated with aggressive WS overlap.
 
 **Q: Will this break existing queries?**  
-A: No. Guardrail: all existing query patterns must pass regression tests unchanged.
+A: Query semantics must remain correct, but infrastructure contracts are intentionally breaking.
 
 **Q: What if Phase 1 doesn't achieve 20-40% latency improvement?**  
-A: Still valuable (foundation); opportunity for tuning in Phase 2-3. Conservative fallback to sequential if needed.
+A: Phase 1 is a correctness gate, not a latency optimization phase.
 
 **Q: Can Phase 2 start before Phase 1 ends?**  
-A: Planning yes; implementation no. Phase 1 core (scheduler + checkpoints) must be done first.
+A: Planning yes; implementation starts after Phase 1 signoff criteria are met.
 
 **Q: What about worker-side changes?**  
-A: Out of scope for Phase 1. Focus: server scheduler + exchange model only.
+A: Worker data movement changes are Phase 2 scope (Flight + routing).
 
 ---
 
@@ -346,7 +338,7 @@ For questions or clarifications:
 | "What's the overall vision?" | [silkroad.md](silkroad.md) |
 | "Why is parallelism needed?" | [README.md](README.md) Executive Summary |
 | "How will we implement it?" | [plan-PARALLEL-PHASE1.md](plans/plan-PARALLEL-PHASE1.md) |
-| "What exactly is the bottleneck?" | [discovery-PARALLEL-PHASE1.md](discovery/discovery-PARALLEL-PHASE1.md) |
+| "What exactly is the architecture pivot?" | [discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md](discovery/discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md) |
 | "Where do I track progress?" | [ROADMAP_PARALLEL_PHASE1_MATRIX.md](../../ROADMAP_PARALLEL_PHASE1_MATRIX.md) |
 | "What are the risks?" | [plan-PARALLEL-PHASE1.md](plans/plan-PARALLEL-PHASE1.md#risks-and-mitigations) |
 
@@ -357,9 +349,10 @@ For questions or clarifications:
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | Mar 22, 2026 | Initial creation: discovery & planning complete |
+| 1.1 | Mar 23, 2026 | Aggressive redesign alignment: control-plane-first Phase 1 + integrated Phase 2 |
 
 ---
 
 **Ready for**: Phase 1 Implementation Kickoff  
-**Next Step**: Schedule design review meeting  
-**Timeline**: Week 1 kickoff → Week 5 phase signoff
+**Next Step**: Lock WS0 contract and start WS1/WS2  
+**Timeline**: Week 1 kickoff → Week 4 phase signoff

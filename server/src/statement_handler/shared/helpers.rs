@@ -1,5 +1,5 @@
 use crate::warehouse::state::SharedData;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::error::Error;
 
 use crate::workers::PooledConn;
@@ -9,13 +9,6 @@ const OUTCOME_PREFIX: &str = "RESULT";
 
 fn format_outcome(category: &str, code: &str, message: &str) -> String {
     format!("{}|{}|{}|{}", OUTCOME_PREFIX, category, code, message)
-}
-
-fn is_staged_query_params(params: &HashMap<String, String>) -> bool {
-    params.contains_key("stage_id")
-        || params.contains_key("partition_index")
-        || params.contains_key("partition_count")
-        || params.contains_key("upstream_stage_ids")
 }
 
 fn parse_u32_param(params: &HashMap<String, String>, key: &str) -> Option<u32> {
@@ -50,6 +43,7 @@ pub(crate) fn format_stage_dispatch_boundary_event(
 fn validate_query_dispatch_context(
     operation: &str,
     params: &HashMap<String, String>,
+    stage_metadata: Option<&crate::tasks::StageTaskMetadata>,
     auth_ctx: Option<&DispatchAuthContext>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     if !operation.eq_ignore_ascii_case("query") {
@@ -71,8 +65,8 @@ fn validate_query_dispatch_context(
         )));
     }
 
-    if is_staged_query_params(params) {
-        if parse_u32_param(params, "stage_id").is_none() {
+    if let Some(stage_metadata) = stage_metadata {
+        if stage_metadata.stage_id == 0 {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format_outcome(
@@ -82,7 +76,9 @@ fn validate_query_dispatch_context(
                 ),
             )));
         }
-        if parse_u32_param(params, "partition_index").is_none() {
+        if stage_metadata.partition_count == 0
+            || stage_metadata.partition_id >= stage_metadata.partition_count
+        {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format_outcome(
@@ -92,6 +88,17 @@ fn validate_query_dispatch_context(
                 ),
             )));
         }
+    } else if parse_u32_param(params, "stage_id").is_some()
+        && parse_u32_param(params, "partition_index").is_none()
+    {
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format_outcome(
+                "EXECUTION",
+                "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
+                "dispatch checkpoint failed: partition_index is missing or invalid",
+            ),
+        )));
     }
 
     Ok(())
@@ -167,6 +174,7 @@ pub async fn build_task_and_schedule(
     operation: &str,
     payload: String,
     params: std::collections::HashMap<String, String>,
+    stage_metadata: Option<crate::tasks::StageTaskMetadata>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let task_manager = {
         let state = shared_data.lock().await;
@@ -181,6 +189,12 @@ pub async fn build_task_and_schedule(
             params,
         )
         .await;
+    if let Some(metadata) = stage_metadata
+        && let Some(task_arc) = task_manager.get_task(&task_id).await
+    {
+        let mut task = task_arc.lock().await;
+        task.stage_metadata = Some(metadata);
+    }
     task_manager
         .set_state(&task_id, crate::tasks::TaskState::Scheduled)
         .await;
@@ -256,22 +270,25 @@ pub async fn run_task_for_input(
         payload,
         std::collections::HashMap::new(),
         None,
+        None,
         timeout_secs,
     )
     .await
 }
 
 /// Same as `run_task_for_input`, but allows passing operation-specific task params.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_task_for_input_with_params(
     shared_data: &SharedData,
     session_id: &str,
     operation: &str,
     payload: String,
     params: std::collections::HashMap<String, String>,
+    stage_metadata: Option<crate::tasks::StageTaskMetadata>,
     auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    validate_query_dispatch_context(operation, &params, auth_ctx)?;
+    validate_query_dispatch_context(operation, &params, stage_metadata.as_ref(), auth_ctx)?;
 
     // Resolve session and worker key
     let (session, key) = resolve_session_and_key(shared_data, session_id).await?;
@@ -282,8 +299,14 @@ pub async fn run_task_for_input_with_params(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mut params = params;
-    let diagnostics_stage_id = parse_u32_param(&params, "stage_id");
-    let diagnostics_partition_count = parse_u32_param(&params, "partition_count")
+    let diagnostics_stage_id = stage_metadata
+        .as_ref()
+        .map(|value| value.stage_id)
+        .or_else(|| parse_u32_param(&params, "stage_id"));
+    let diagnostics_partition_count = stage_metadata
+        .as_ref()
+        .map(|value| value.partition_count)
+        .or_else(|| parse_u32_param(&params, "partition_count"))
         .filter(|v| *v > 0)
         .unwrap_or(1);
     if operation.eq_ignore_ascii_case("query")
@@ -299,6 +322,7 @@ pub async fn run_task_for_input_with_params(
         operation,
         payload,
         params,
+        stage_metadata,
     )
     .await?;
 
@@ -400,131 +424,164 @@ pub async fn run_stage_groups_for_input(
         u32,
         Vec<crate::statement_handler::shared::distributed_dag::StageTaskGroup>,
     >::new();
-    let mut deps_by_stage = HashMap::<u32, Vec<u32>>::new();
     for group in stage_groups {
         groups_by_stage
             .entry(group.stage_id)
             .or_default()
             .push(group.clone());
-        deps_by_stage
-            .entry(group.stage_id)
-            .or_insert_with(|| group.upstream_stage_ids.clone());
     }
 
     for groups in groups_by_stage.values_mut() {
         groups.sort_by_key(|group| group.partition_index);
     }
 
-    let mut completed = HashSet::<u32>::new();
     let mut result_by_stage = HashMap::<u32, String>::new();
-
-    while completed.len() < groups_by_stage.len() {
-        let next_stage_id = groups_by_stage
-            .keys()
-            .filter(|stage_id| !completed.contains(stage_id))
-            .filter(|stage_id| {
-                deps_by_stage
-                    .get(stage_id)
-                    .map(|deps| deps.iter().all(|upstream| completed.contains(upstream)))
-                    .unwrap_or(true)
-            })
-            .copied()
-            .min();
-
-        let stage_id = match next_stage_id {
-            Some(value) => value,
-            None => {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "no schedulable stage found; dependency graph may be cyclic",
-                )));
-            }
-        };
-
-        let stage_partitions = groups_by_stage.get(&stage_id).cloned().ok_or_else(|| {
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("missing stage partition groups for stage {}", stage_id),
-            )) as Box<dyn Error + Send + Sync>
+    let stage_waves =
+        crate::statement_handler::shared::distributed_dag::build_stage_execution_waves(
+            stage_groups,
+        )
+        .map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                as Box<dyn Error + Send + Sync>
         })?;
 
-        let expected_partition_count = stage_partitions
-            .first()
-            .map(|group| group.partition_count)
-            .unwrap_or(0);
-        if expected_partition_count == 0
-            || stage_partitions.len() != expected_partition_count as usize
-        {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "stage {} partition fan-out mismatch: expected {} tasks, found {}",
-                    stage_id,
-                    expected_partition_count,
-                    stage_partitions.len()
-                ),
-            )));
-        }
+    for wave in stage_waves {
+        let mut wave_join_set = tokio::task::JoinSet::new();
 
-        log::info!(
-            "distributed scheduler dispatching stage_id={} partitions={} upstream={:?}",
-            stage_id,
-            expected_partition_count,
-            stage_partitions[0].upstream_stage_ids
-        );
+        for stage_id in wave {
+            let stage_partitions = groups_by_stage.get(&stage_id).cloned().ok_or_else(|| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("missing stage partition groups for stage {}", stage_id),
+                )) as Box<dyn Error + Send + Sync>
+            })?;
 
-        let mut join_set = tokio::task::JoinSet::new();
-        for group in stage_partitions {
+            let expected_partition_count = stage_partitions
+                .first()
+                .map(|group| group.partition_count)
+                .unwrap_or(0);
+            if expected_partition_count == 0
+                || stage_partitions.len() != expected_partition_count as usize
+            {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "stage {} partition fan-out mismatch: expected {} tasks, found {}",
+                        stage_id,
+                        expected_partition_count,
+                        stage_partitions.len()
+                    ),
+                )));
+            }
+
+            log::info!(
+                "distributed scheduler dispatching stage_id={} partitions={} upstream={:?}",
+                stage_id,
+                expected_partition_count,
+                stage_partitions[0].upstream_stage_ids
+            );
+
             let shared_clone = shared_data.clone();
             let session_id_owned = session_id.to_string();
             let auth_ctx_cloned = auth_ctx.cloned();
-            join_set.spawn(async move {
-                let partition_location = run_task_for_input_with_params(
-                    &shared_clone,
-                    &session_id_owned,
-                    &group.operation,
-                    group.payload.clone(),
-                    group.params.clone(),
-                    auth_ctx_cloned.as_ref(),
-                    timeout_secs,
-                )
-                .await;
 
-                (group.partition_index, partition_location)
+            wave_join_set.spawn(async move {
+                let mut join_set = tokio::task::JoinSet::new();
+                for group in stage_partitions {
+                    let shared_clone = shared_clone.clone();
+                    let session_id_owned = session_id_owned.clone();
+                    let auth_ctx_cloned = auth_ctx_cloned.clone();
+                    join_set.spawn(async move {
+                        let partition_location = run_task_for_input_with_params(
+                            &shared_clone,
+                            &session_id_owned,
+                            &group.operation,
+                            group.payload.clone(),
+                            group.params.clone(),
+                            Some(crate::tasks::StageTaskMetadata {
+                                stage_id: group.stage_id,
+                                partition_id: group.partition_index,
+                                partition_count: group.partition_count,
+                                upstream_stage_ids: group.upstream_stage_ids.clone(),
+                                upstream_partition_counts: group.upstream_partition_counts.clone(),
+                                partition_spec: serde_json::to_string(&group.partition_spec)
+                                    .unwrap_or_else(|_| "\"Single\"".to_string()),
+                                query_run_id: None,
+                                execution_mode_hint: match group.execution_mode_hint {
+                                    crate::statement_handler::shared::distributed_dag::ExecutionModeHint::LocalOnly => {
+                                        crate::services::worker_service_client::worker_service::ExecutionModeHint::LocalOnly
+                                            as i32
+                                    }
+                                    crate::statement_handler::shared::distributed_dag::ExecutionModeHint::Distributed => {
+                                        crate::services::worker_service_client::worker_service::ExecutionModeHint::Distributed
+                                            as i32
+                                    }
+                                },
+                                output_destinations: group
+                                    .output_destinations
+                                    .iter()
+                                    .map(|destination| crate::services::worker_service_client::worker_service::OutputDestination {
+                                        downstream_stage_id: destination.downstream_stage_id,
+                                        worker_addresses: destination.worker_addresses.clone(),
+                                        partitioning: serde_json::to_string(&destination.partitioning)
+                                            .unwrap_or_else(|_| "\"Single\"".to_string()),
+                                        downstream_partition_count: destination.downstream_partition_count,
+                                    })
+                                    .collect::<Vec<_>>(),
+                            }),
+                            auth_ctx_cloned.as_ref(),
+                            timeout_secs,
+                        )
+                        .await;
+
+                        (group.partition_index, partition_location)
+                    });
+                }
+
+                let mut stage_locations = Vec::<(u32, String)>::new();
+                while let Some(joined) = join_set.join_next().await {
+                    let (partition_index, partition_result) = joined.map_err(|e| {
+                        std::io::Error::other(format!(
+                            "stage {} partition task panicked: {}",
+                            stage_id, e
+                        ))
+                    })?;
+
+                    let location = partition_result.map_err(|e| {
+                        std::io::Error::other(format!(
+                            "stage {} partition {} dispatch failed: {}",
+                            stage_id, partition_index, e
+                        ))
+                    })?;
+                    stage_locations.push((partition_index, location));
+                }
+
+                stage_locations.sort_by_key(|(partition_index, _)| *partition_index);
+                let stage_result_location = stage_locations
+                    .first()
+                    .map(|(_, location)| location.clone())
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "stage {} completed without partition results",
+                            stage_id
+                        ))
+                    })?;
+
+                Ok::<(u32, String), std::io::Error>((stage_id, stage_result_location))
             });
         }
 
-        let mut stage_locations = Vec::<(u32, String)>::new();
-        while let Some(joined) = join_set.join_next().await {
-            let (partition_index, partition_result) = joined.map_err(|e| {
+        while let Some(joined) = wave_join_set.join_next().await {
+            let stage_result = joined.map_err(|e| {
                 Box::new(std::io::Error::other(format!(
-                    "stage {} partition task panicked: {}",
-                    stage_id, e
+                    "stage wave task panicked: {}",
+                    e
                 ))) as Box<dyn Error + Send + Sync>
             })?;
-
-            let location = partition_result.map_err(|e| {
-                Box::new(std::io::Error::other(format!(
-                    "stage {} partition {} dispatch failed: {}",
-                    stage_id, partition_index, e
-                ))) as Box<dyn Error + Send + Sync>
-            })?;
-            stage_locations.push((partition_index, location));
+            let (stage_id, stage_result_location) =
+                stage_result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            result_by_stage.insert(stage_id, stage_result_location);
         }
-
-        stage_locations.sort_by_key(|(partition_index, _)| *partition_index);
-        let stage_result_location = stage_locations
-            .first()
-            .map(|(_, location)| location.clone())
-            .ok_or_else(|| {
-                Box::new(std::io::Error::other(format!(
-                    "stage {} completed without partition results",
-                    stage_id
-                ))) as Box<dyn Error + Send + Sync>
-            })?;
-
-        completed.insert(stage_id);
-        result_by_stage.insert(stage_id, stage_result_location);
     }
 
     let final_stage = stage_groups

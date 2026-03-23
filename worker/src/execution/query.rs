@@ -400,7 +400,7 @@ fn resolve_query_result_endpoint(default_host: &str, default_worker_port: u32) -
 /// Output:
 /// - Canonical namespace values used for deterministic result paths.
 fn resolve_query_namespace_from_params(
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
 ) -> Result<QueryNamespace, String> {
     let database = task
         .params
@@ -443,11 +443,9 @@ fn resolve_query_namespace_from_params(
 /// - `task`: Query task metadata and params.
 ///
 /// Output:
-/// - `true` when stage params are present.
-fn is_stage_query_task(task: &worker_service::Task) -> bool {
-    task.params
-        .get("stage_id")
-        .is_some_and(|value| !value.trim().is_empty())
+/// - `true` when stage metadata indicates distributed stage execution.
+fn is_stage_query_task(task: &worker_service::StagePartitionExecution) -> bool {
+    task.stage_id > 0
 }
 
 /// What: Parse and validate canonical SELECT query payload.
@@ -465,7 +463,9 @@ fn is_stage_query_task(task: &worker_service::Task) -> bool {
 ///   - `namespace.database/schema/table` must exist and be valid.
 ///   - `logical_plan` must be present as an object.
 ///   - `physical_plan` must be present as an object with a non-empty `operators` array.
-fn resolve_query_namespace(task: &worker_service::Task) -> Result<QueryNamespace, String> {
+fn resolve_query_namespace(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<QueryNamespace, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
 
@@ -554,7 +554,7 @@ fn resolve_query_namespace(task: &worker_service::Task) -> Result<QueryNamespace
 /// - Flight-style deterministic result location string.
 fn build_result_location(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
     session_id: &str,
     namespace: &QueryNamespace,
 ) -> String {
@@ -612,7 +612,7 @@ fn build_result_location(
 /// - Runtime execution supports scan/filter/projection/sort/limit/materialize subset only.
 pub(crate) async fn execute_query_task_stub(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
     session_id: &str,
 ) -> Result<String, String> {
     let namespace = if is_stage_query_task(task) {

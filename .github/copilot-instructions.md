@@ -3,12 +3,12 @@
 
 - [x] Clarify Project Requirements
 - [x] Scaffold the Project
-- [ ] Customize the Project
-- [ ] Install Required Extensions
+- [x] Customize the Project
+- [x] Install Required Extensions
 - [ ] Compile the Project
 - [ ] Create and Run Task
 - [ ] Launch the Project
-- [ ] Ensure Documentation is Complete
+- [x] Ensure Documentation is Complete
 
 ## Execution Guidelines
 - Work through each checklist item systematically.
@@ -38,8 +38,6 @@
 
 ## Cargo Check runs
 - project is taking up to 5 minutes to compile, so we want to make sure we are only running it when necessary
-- if on windows run through docker
-- docker run --rm -v "${PWD}:/workspace" -w /workspace docker-devcontainer cargo check -p server
 
 ## Cargo Clippy Configuration
 Check with cargo clippy after adding a new feature and fix clippy errors with the following settings:

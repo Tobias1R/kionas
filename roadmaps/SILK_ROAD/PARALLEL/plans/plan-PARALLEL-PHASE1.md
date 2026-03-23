@@ -2,10 +2,11 @@
 ## Distributed Execution Foundation - Control Plane
 
 **Date**: March 23, 2026 (Aggressive Redesign)  
-**Status**: Planning (Breaking Changes Approved)  
+**Status**: In Progress (Control-Plane Build Active)  
 **Focus**: Build distributed-first control plane; stage extraction, DAG scheduling, task model redesign
 
 ## Phase Goal
+**KEEP THIS DOCUMENT UPDATED WITH PHASE PROGRESS!**
 
 Establish the **distributed execution control plane** by implementing:
 1. **Stage extraction** at RepartitionExec boundaries (from deep-dive Part 1)
@@ -14,6 +15,18 @@ Establish the **distributed execution control plane** by implementing:
 4. **In-memory validation** proving stage execution correctness before network layer
 
 This phase focuses on **control plane only** (no data movement yet). Phase 2 will add Arrow Flight streaming (data plane).
+
+## Current Progress Snapshot (March 23, 2026)
+
+| Workstream | Status | Progress | Evidence |
+|---|---|---|---|
+| WS0: Task model redesign | In Progress | Core contract and dispatch path implemented with typed stage metadata; remaining polish is documentation/signoff alignment | [kionas/proto/worker_service.proto](../../../../kionas/proto/worker_service.proto), [server/src/tasks/mod.rs](../../../../server/src/tasks/mod.rs), [server/src/tests/tasks_mod_tests.rs](../../../../server/src/tests/tasks_mod_tests.rs) |
+| WS1: Stage extraction algorithm | In Progress | Distributed stage group compilation exists; dedicated RepartitionExec traversal module from this plan is not complete yet | [server/src/statement_handler/shared/distributed_dag.rs](../../../../server/src/statement_handler/shared/distributed_dag.rs) |
+| WS2: Async DAG scheduler | Done (Phase 1 scope) | Topological wave construction and concurrent wave dispatch implemented and tested | [server/src/statement_handler/shared/distributed_dag.rs](../../../../server/src/statement_handler/shared/distributed_dag.rs), [server/src/statement_handler/shared/helpers.rs](../../../../server/src/statement_handler/shared/helpers.rs), [server/src/tests/statement_handler_shared_distributed_dag_tests.rs](../../../../server/src/tests/statement_handler_shared_distributed_dag_tests.rs) |
+| WS3: Output mapping + in-memory validation | In Progress | Output destination mapping implemented; full in-memory execution harness and byte-identical matrix still pending | [server/src/statement_handler/shared/distributed_dag.rs](../../../../server/src/statement_handler/shared/distributed_dag.rs) |
+| WS4: Error handling + observability | In Progress | Stage context validation and failure-path checks implemented; full metrics/runbook package still pending | [server/src/statement_handler/shared/helpers.rs](../../../../server/src/statement_handler/shared/helpers.rs), [worker/src/services/worker_service_server.rs](../../../../worker/src/services/worker_service_server.rs) |
+
+**Overall Estimate**: ~55% complete for the current Phase 1 control-plane scope.
 
 **Success Criteria** (Control Plane Focused):
 - ✅ Stage extraction algorithm proven on 2-3-4 stage queries
@@ -88,7 +101,13 @@ pub struct StagePartitionExecution {
     stage_id: u32,
     partition_id: u32,
     execution_plan: Vec<u8>,  // ONE STAGE, ONE PARTITION (smaller)
-    output_destinations: Vec<OutputDestination>,  // where output goes. Keep in my the possiblity to send a flag to instruct the worker to do this by himself, since he can be the only worker available. Parallelism happen but using Multi-threading instead of multi-node.
+    output_destinations: Vec<OutputDestination>,
+    execution_mode_hint: ExecutionModeHint, // Worker may run local-only when it is the sole node
+}
+
+pub enum ExecutionModeHint {
+    LocalOnly,      // Single-node fallback: multithreaded execution on one worker
+    Distributed,    // Multi-node execution with downstream routing
 }
 
 pub struct OutputDestination {
@@ -106,6 +125,7 @@ pub struct OutputDestination {
 **Tasks**:
 0.1: Define proto/RPC for StagePartitionExecution
 0.2: Define OutputDestination struct and Partitioning enum mapping
+0.2a: Define ExecutionModeHint (`LocalOnly` | `Distributed`) and propagation rules
 0.3: Update server task dispatch code to use new task format
 0.4: Add unit tests for task serialization/deserialization
 0.5: Update documentation; note breaking change
@@ -113,6 +133,7 @@ pub struct OutputDestination {
 **Deliverables**:
 - New task proto/struct definitions
 - Server task dispatch refactored
+- Execution mode hinting rules documented (single-node vs multi-node)
 - Tests proving serialization works
 - Migration guide (all clusters upgrade together)
 
@@ -687,12 +708,12 @@ Scan(t1) → HashJoin(broadcast) → ...
 
 ## Implementation Checklist for Phase 1
 
-- [ ] WS0.1: Proto definitions (StagePartitionExecution, OutputDestination)
-- [ ] WS0.2-0.5: Task model refactored + tests
+- [x] WS0.1: Proto definitions (StagePartitionExecution, OutputDestination)
+- [x] WS0.2-0.5: Task model refactored + tests
 - [ ] WS1.1-1.3: Stage extraction algorithm + basic tests
 - [ ] WS1.4-1.6: Stage extraction comprehensive tests (1-4 stage queries)
-- [ ] WS2.1-2.2: Topological sort implemented + tested
-- [ ] WS2.3-2.6: DAG scheduler + concurrent dispatch implementation and tests
+- [x] WS2.1-2.2: Topological sort implemented + tested
+- [x] WS2.3-2.6: DAG scheduler + concurrent dispatch implementation and tests
 - [ ] WS3.1-3.2: Output destination mapping + in-memory execution harness
 - [ ] WS3.3-3.7: Full query execution E2E tests + validation matrix
 - [ ] WS4.1-4.4: Error handling framework + tracing + metrics
@@ -739,35 +760,36 @@ Scan(t1) → HashJoin(broadcast) → ...
 
 | Deliverable | Owner | Status |
 |-------------|-------|--------|
-| Async scheduler with concurrent dispatch | Dev | To Be Started |
-| Partition checkpoint and conditional reads | Dev | To Be Started |
-| Comprehensive test suite (correctness + pipelining) | QA | To Be Started |
-| Metrics and observability | Ops | To Be Started |
-| Error handling and recovery logic | Dev | To Be Started |
-| Phase 1 completion matrix (ROADMAP_PARALLEL_PHASE1_MATRIX.md) | PM | To Be Started |
-| Runbook: Pipelined Execution Troubleshooting | Ops | To Be Started |
-| Design documentation and diagrams | Arch | To Be Started |
+| WS0 task model redesign (breaking) | Dev | In Progress (core done) |
+| Stage extraction module + tests | Dev | In Progress |
+| Async DAG scheduler + tests | Dev | Done (control-plane scheduler scope) |
+| Output destination mapper + in-memory harness | Dev | In Progress |
+| Validation matrix (byte-identical correctness) | QA | Not Started |
+| Error handling + observability package | Dev/Ops | In Progress |
+| Phase 1 completion matrix (ROADMAP_PARALLEL_PHASE1_MATRIX.md) | PM | In Progress |
+| Design documentation and diagrams | Arch | Not Started |
 
 ---
 
 ## Success Criteria Checklist
 
-- [ ] Async scheduler refactored and tested
-- [ ] Partition checkpoint logic implemented
-- [ ] Downstream task launch supports early start on partial upstream completion
-- [ ] All existing query patterns pass regression tests
-- [ ] Multi-stage query latency reduced by 15-40% (measured)
-- [ ] Observability metrics in place; pipelined execution visible in traces
-- [ ] Error handling graceful for all failure scenarios
-- [ ] No breaking changes; backwards compatible
-- [ ] Runbook and documentation complete
+- [x] Task model redesigned with StagePartitionExecution and ExecutionModeHint
+- [ ] Stage extraction at RepartitionExec boundaries implemented and tested
+- [x] DAG scheduler implemented with dependency-safe async dispatch
+- [x] Output destinations mapped for downstream stage partitions
+- [ ] In-memory execution harness validates full 1-3 stage queries
+- [ ] Results are byte-identical to baseline execution
+- [ ] Error cascade + tracing + metrics complete
+- [ ] Breaking changes documented; full-cluster upgrade path defined
+- [ ] Documentation complete (algorithm, architecture, runbooks)
 - [ ] Phase 1 matrix signoff achieved
 
 ---
 
 ## Evidence Locations
 
-- **Discovery**: [../discovery/discovery-PARALLEL-PHASE1.md](../discovery/discovery-PARALLEL-PHASE1.md)
+**Discovery (Primary)**: [../discovery/discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md](../discovery/discovery-DEEP-DIVE-STAGE-EXTRACTION-FLIGHT-MAPPING.md)
+**Legacy Discovery (Superseded Context)**: [../discovery/discovery-PARALLEL-PHASE1.md](../discovery/discovery-PARALLEL-PHASE1.md)
 - **Design Sketches**: [../sketches/](../sketches/) (to be created)
 - **Implementation PRs**: (to be linked during development)
 - **Test Coverage**: [../tests/](../tests/) (to be created)
@@ -777,8 +799,8 @@ Scan(t1) → HashJoin(broadcast) → ...
 
 ## Next Steps
 
-1. **Immediate**: Schedule design review meeting to align on scheduler async model and error handling
-2. **Week 1**: Begin WS1 (scheduler refactoring) and WS2 (exchange logic) in parallel
-3. **Week 3**: Launch WS3 (correctness testing) and WS4 (validation) once core implementations stabilize
-4. **Week 5**: Complete Phase 1 signoff and prepare phase 1 matrix
-5. **Post-Phase 1**: Plan Phase 2 (Streaming Exchange & Resource-Aware Scheduling)
+1. **Immediate**: Finish WS1 RepartitionExec-based extraction module and connect it to the scheduling path.
+2. **Next**: Implement WS3 in-memory execution harness and create byte-identical validation matrix for 1-3 stage scenarios.
+3. **Then**: Complete WS4 observability package (metrics + traces + runbook links) and error scenario integration tests.
+4. **Before Signoff**: Update Phase 1 matrix with concrete evidence for each mandatory criterion and mark signoff gate.
+5. **Post-Phase 1**: Start Phase 2 data plane (Arrow Flight + routing + backpressure).

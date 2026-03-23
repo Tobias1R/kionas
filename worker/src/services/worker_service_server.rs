@@ -81,14 +81,13 @@ fn normalize_worker_error_for_response(raw_error: &str) -> String {
     format_outcome(category, code, raw_error)
 }
 
-fn is_staged_query_task(task: &worker_service::Task) -> bool {
-    task.params.contains_key("stage_id")
-        || task.params.contains_key("partition_index")
-        || task.params.contains_key("partition_count")
-        || task.params.contains_key("upstream_stage_ids")
+fn is_staged_query_task(task: &worker_service::StagePartitionExecution) -> bool {
+    task.stage_id > 0 || task.partition_count > 1 || !task.upstream_stage_ids.is_empty()
 }
 
-fn validate_query_task_context(task: &worker_service::Task) -> Result<(), tonic::Status> {
+fn validate_query_task_context(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<(), tonic::Status> {
     if task.task_id.trim().is_empty() {
         return Err(tonic::Status::invalid_argument(format_outcome(
             "INFRA",
@@ -111,11 +110,7 @@ fn validate_query_task_context(task: &worker_service::Task) -> Result<(), tonic:
     }
 
     if is_staged_query_task(task) {
-        let stage_id = task
-            .params
-            .get("stage_id")
-            .and_then(|v| v.parse::<u32>().ok());
-        if stage_id.is_none() {
+        if task.stage_id == 0 {
             return Err(tonic::Status::failed_precondition(format_outcome(
                 "EXECUTION",
                 "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING",
@@ -127,18 +122,13 @@ fn validate_query_task_context(task: &worker_service::Task) -> Result<(), tonic:
             )));
         }
 
-        let partition_index = task
-            .params
-            .get("partition_index")
-            .and_then(|v| v.parse::<u32>().ok());
-        if partition_index.is_none() {
+        if task.partition_count == 0 || task.partition_id >= task.partition_count {
             return Err(tonic::Status::failed_precondition(format_outcome(
                 "EXECUTION",
                 "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
                 format!(
                     "partition_index is missing or invalid for task_id={} stage_id={}",
-                    task.task_id,
-                    stage_id.unwrap_or_default()
+                    task.task_id, task.stage_id
                 )
                 .as_str(),
             )));
@@ -161,7 +151,9 @@ fn resolve_flight_endpoint(worker_host: &str, worker_port: u32) -> String {
     format!("http://{}:{}", worker_host, flight_port)
 }
 
-fn parse_scope_relation_from_task(task: &worker_service::Task) -> Option<(String, String, String)> {
+fn parse_scope_relation_from_task(
+    task: &worker_service::StagePartitionExecution,
+) -> Option<(String, String, String)> {
     if let (Some(database), Some(schema), Some(table)) = (
         task.params.get("database_name"),
         task.params.get("schema_name"),

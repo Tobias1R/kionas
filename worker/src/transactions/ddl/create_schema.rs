@@ -38,7 +38,9 @@ fn is_valid_namespace_name(name: &str) -> bool {
 ///
 /// Output:
 /// - Canonical `(database_name, schema_name)` tuple.
-fn resolve_namespace(task: &worker_service::Task) -> Result<(String, String), String> {
+fn resolve_namespace(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<(String, String), String> {
     let parsed: serde_json::Value = serde_json::from_str(&task.input)
         .map_err(|e| format!("invalid create_schema payload: {}", e))?;
 
@@ -89,7 +91,7 @@ fn resolve_namespace(task: &worker_service::Task) -> Result<(String, String), St
 /// - Existing markers are treated as idempotent success.
 pub(crate) async fn execute_create_schema_task(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
 ) -> Result<String, String> {
     let (database_name, schema_name) = resolve_namespace(task)?;
     let marker_key = format!(

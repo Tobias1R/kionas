@@ -1,3 +1,4 @@
+use crate::planner::stage_extractor::extract_stages;
 use crate::providers::{KionasRelationMetadata, build_session_context_with_kionas_providers};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
@@ -188,6 +189,11 @@ pub async fn translate_datafusion_to_kionas_physical_plan_with_providers(
     };
 
     let intent = derive_intent_from_exec_plan(&physical_plan);
+    let extracted_stages = extract_stages(Arc::clone(&physical_plan));
+    log::debug!(
+        "datafusion stage extraction completed with {} stages",
+        extracted_stages.len()
+    );
     build_kionas_plan_from_intent(model, intent)
 }
 

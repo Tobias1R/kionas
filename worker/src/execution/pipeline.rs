@@ -1204,7 +1204,7 @@ async fn maybe_prune_scan_keys(
 /// - `Err(message)` when runtime execution or storage operations fail.
 pub(crate) async fn execute_query_task(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
     session_id: &str,
     namespace: &QueryNamespace,
     result_location: &str,
@@ -1469,7 +1469,9 @@ fn relation_key(namespace: &QueryNamespace) -> String {
     )
 }
 
-fn parse_relation_columns_map(task: &worker_service::Task) -> HashMap<String, Vec<String>> {
+fn parse_relation_columns_map(
+    task: &worker_service::StagePartitionExecution,
+) -> HashMap<String, Vec<String>> {
     task.params
         .get("relation_columns_json")
         .and_then(|value| serde_json::from_str::<HashMap<String, Vec<String>>>(value).ok())

@@ -5,7 +5,18 @@ use super::{
 
 #[test]
 fn accepts_unit_variant_string_operator_shape() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -56,7 +67,18 @@ fn endpoint_resolution_prefers_proxy_overrides_when_present() {
 
 #[test]
 fn rejects_non_select_statement() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -89,12 +111,22 @@ fn rejects_non_select_statement() {
 #[test]
 fn resolves_namespace_from_stage_params() {
     let mut params = std::collections::HashMap::new();
-    params.insert("stage_id".to_string(), "2".to_string());
     params.insert("database_name".to_string(), "Sales".to_string());
     params.insert("schema_name".to_string(), "Public".to_string());
     params.insert("table_name".to_string(), "Users".to_string());
 
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 2,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: "[]".to_string(),
@@ -113,7 +145,18 @@ fn resolves_namespace_from_stage_params() {
 
 #[test]
 fn accepts_valid_select_namespace() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
             task_id: "t1".to_string(),
             operation: "query".to_string(),
             input: serde_json::json!({
@@ -147,7 +190,18 @@ fn accepts_valid_select_namespace() {
 
 #[test]
 fn rejects_missing_logical_plan_for_v2() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -171,7 +225,18 @@ fn rejects_missing_logical_plan_for_v2() {
 
 #[test]
 fn rejects_missing_physical_plan_for_v2() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -196,7 +261,18 @@ fn rejects_missing_physical_plan_for_v2() {
 
 #[test]
 fn rejects_empty_physical_plan_operators_for_v2() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -225,7 +301,18 @@ fn rejects_empty_physical_plan_operators_for_v2() {
 
 #[test]
 fn rejects_physical_plan_without_tablescan_first() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -257,7 +344,18 @@ fn rejects_physical_plan_without_tablescan_first() {
 
 #[test]
 fn rejects_physical_plan_without_materialize_last() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -289,7 +387,18 @@ fn rejects_physical_plan_without_materialize_last() {
 
 #[test]
 fn rejects_physical_plan_without_single_projection() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -320,7 +429,18 @@ fn rejects_physical_plan_without_single_projection() {
 
 #[test]
 fn accepts_hash_join_operator_variant_in_worker_payload() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
             task_id: "t1".to_string(),
             operation: "query".to_string(),
             input: serde_json::json!({
@@ -354,7 +474,18 @@ fn accepts_hash_join_operator_variant_in_worker_payload() {
 
 #[test]
 fn rejects_deferred_predicate_variant_in_worker_payload() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -389,7 +520,18 @@ fn rejects_deferred_predicate_variant_in_worker_payload() {
 
 #[test]
 fn accepts_limit_after_sort_pipeline() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({
@@ -423,7 +565,18 @@ fn accepts_limit_after_sort_pipeline() {
 
 #[test]
 fn rejects_limit_before_sort_pipeline() {
-    let task = crate::services::worker_service_server::worker_service::Task {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
         task_id: "t1".to_string(),
         operation: "query".to_string(),
         input: serde_json::json!({

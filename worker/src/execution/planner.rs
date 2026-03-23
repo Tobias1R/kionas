@@ -410,7 +410,9 @@ fn parse_pruning_eligibility(pruning_hints_json: Option<&str>) -> (bool, Option<
 /// Details:
 /// - Schema metadata is extracted for Phase 9b type coercion validation.
 /// - If schema_metadata absent, filter execution skips type checking (interim behavior).
-pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<RuntimePlan, String> {
+pub(crate) fn extract_runtime_plan(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<RuntimePlan, String> {
     let payload: serde_json::Value =
         serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
 
@@ -534,7 +536,9 @@ pub(crate) fn extract_runtime_plan(task: &worker_service::Task) -> Result<Runtim
 ///
 /// Output:
 /// - Ordered executable physical operators.
-fn extract_runtime_operators(task: &worker_service::Task) -> Result<Vec<PhysicalOperator>, String> {
+fn extract_runtime_operators(
+    task: &worker_service::StagePartitionExecution,
+) -> Result<Vec<PhysicalOperator>, String> {
     let payload: serde_json::Value =
         serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
 
@@ -569,88 +573,53 @@ fn extract_runtime_operators(task: &worker_service::Task) -> Result<Vec<Physical
 /// Output:
 /// - Stage execution context with deterministic defaults or contextual validation failure.
 pub(crate) fn stage_execution_context(
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
 ) -> Result<StageExecutionContext, String> {
-    let is_staged_task = task.params.contains_key("stage_id")
-        || task.params.contains_key("partition_index")
-        || task.params.contains_key("partition_count")
-        || task.params.contains_key("upstream_stage_ids");
+    let is_staged_task = task.stage_id > 0
+        || task.partition_id > 0
+        || task.partition_count > 1
+        || !task.upstream_stage_ids.is_empty();
 
     let stage_id = if is_staged_task {
-        task.params
-            .get("stage_id")
-            .ok_or_else(|| {
-                format!(
-                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id missing for task_id={}",
-                    task.task_id
-                )
-            })?
-            .parse::<u32>()
-            .map_err(|_| {
-                format!(
-                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id invalid for task_id={}",
-                    task.task_id
-                )
-            })?
+        if task.stage_id == 0 {
+            return Err(format!(
+                "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id missing for task_id={}",
+                task.task_id
+            ));
+        }
+        task.stage_id
     } else {
         0
     };
-    let upstream_stage_ids = task
-        .params
-        .get("upstream_stage_ids")
-        .and_then(|value| serde_json::from_str::<Vec<u32>>(value).ok())
-        .unwrap_or_default();
+    let upstream_stage_ids = task.upstream_stage_ids.clone();
     let partition_count = if is_staged_task {
-        task.params
-            .get("partition_count")
-            .ok_or_else(|| {
-                format!(
-                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: partition_count missing for task_id={} stage_id={}",
-                    task.task_id, stage_id
-                )
-            })?
-            .parse::<u32>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| {
-                format!(
-                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: partition_count invalid for task_id={} stage_id={}",
-                    task.task_id, stage_id
-                )
-            })?
+        if task.partition_count == 0 {
+            return Err(format!(
+                "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: partition_count missing for task_id={} stage_id={}",
+                task.task_id, stage_id
+            ));
+        }
+        task.partition_count
     } else {
         1
     };
-    let upstream_partition_counts = task
-        .params
-        .get("upstream_partition_counts")
-        .and_then(|value| serde_json::from_str::<HashMap<u32, u32>>(value).ok())
-        .unwrap_or_default();
+    let upstream_partition_counts = task.upstream_partition_counts.clone();
     let partition_index = if is_staged_task {
-        task.params
-            .get("partition_index")
-            .ok_or_else(|| {
-                format!(
-                    "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING: partition_index missing for task_id={} stage_id={}",
-                    task.task_id, stage_id
-                )
-            })?
-            .parse::<u32>()
-            .map_err(|_| {
-                format!(
-                    "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING: partition_index invalid for task_id={} stage_id={}",
-                    task.task_id, stage_id
-                )
-            })?
+        if task.partition_id >= partition_count {
+            return Err(format!(
+                "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING: partition_index invalid for task_id={} stage_id={}",
+                task.task_id, stage_id
+            ));
+        }
+        task.partition_id
     } else {
         0
     };
-    let query_run_id = task
-        .params
-        .get("query_run_id")
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("legacy-task-{}", task.task_id));
+    let query_run_id = if task.query_run_id.trim().is_empty() {
+        format!("legacy-task-{}", task.task_id)
+    } else {
+        task.query_run_id.clone()
+    };
     let scan_hints = RuntimeScanHints {
         mode: RuntimeScanMode::parse_or_default(task.params.get("scan_mode").map(String::as_str)),
         pruning_hints_json: task

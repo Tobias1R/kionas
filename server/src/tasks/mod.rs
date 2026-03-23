@@ -19,6 +19,20 @@ pub enum TaskState {
 }
 
 #[derive(Debug, Clone)]
+pub struct StageTaskMetadata {
+    pub stage_id: u32,
+    pub partition_id: u32,
+    pub partition_count: u32,
+    pub upstream_stage_ids: Vec<u32>,
+    pub upstream_partition_counts: HashMap<u32, u32>,
+    pub partition_spec: String,
+    pub query_run_id: Option<String>,
+    pub execution_mode_hint: i32,
+    pub output_destinations:
+        Vec<crate::services::worker_service_client::worker_service::OutputDestination>,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Task {
     pub id: String,
@@ -27,6 +41,7 @@ pub struct Task {
     pub operation: String,
     pub payload: String,
     pub params: HashMap<String, String>,
+    pub stage_metadata: Option<StageTaskMetadata>,
     pub state: TaskState,
     pub attempts: u32,
     pub max_retries: u32,
@@ -52,6 +67,7 @@ impl Task {
             operation,
             payload,
             params,
+            stage_metadata: None,
             state: TaskState::Pending,
             attempts: 0,
             max_retries: 3,
@@ -565,20 +581,62 @@ fn predicate_expr_to_proto(
 pub fn task_to_request(
     task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
+    use crate::services::worker_service_client::worker_service::{
+        self as ws, StagePartitionExecution,
+    };
+
     let filter_predicate = extract_structured_predicate_from_payload(task)
         .and_then(|predicate| predicate_expr_to_proto(&predicate));
+    let stage_metadata = task.stage_metadata.as_ref();
+    let stage_id = stage_metadata.map_or(0, |value| value.stage_id);
+    let partition_id = stage_metadata.map_or(0, |value| value.partition_id);
+    let execution_mode_hint = stage_metadata.map_or(0, |value| value.execution_mode_hint);
+    let output_destinations = stage_metadata
+        .map(|value| value.output_destinations.clone())
+        .unwrap_or_default();
+    let partition_count = stage_metadata.map_or(1, |value| value.partition_count);
+    let upstream_stage_ids = stage_metadata
+        .map(|value| value.upstream_stage_ids.clone())
+        .unwrap_or_default();
+    let upstream_partition_counts = stage_metadata
+        .map(|value| value.upstream_partition_counts.clone())
+        .unwrap_or_default();
+    let partition_spec = stage_metadata
+        .map(|value| value.partition_spec.clone())
+        .unwrap_or_else(|| "\"Single\"".to_string());
+    let query_run_id = task
+        .stage_metadata
+        .as_ref()
+        .and_then(|value| value.query_run_id.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if task.query_id.trim().is_empty() {
+                format!("legacy-task-{}", task.id)
+            } else {
+                task.query_id.clone()
+            }
+        });
 
-    crate::services::worker_service_client::worker_service::TaskRequest {
+    ws::TaskRequest {
         session_id: task.session_id.clone(),
-        tasks: vec![
-            crate::services::worker_service_client::worker_service::Task {
-                task_id: task.id.clone(),
-                input: task.payload.clone(),
-                operation: task.operation.clone(),
-                output: String::new(),
-                params: task.params.clone(),
-                filter_predicate,
-            },
-        ],
+        tasks: vec![StagePartitionExecution {
+            task_id: task.id.clone(),
+            input: task.payload.clone(),
+            operation: task.operation.clone(),
+            output: String::new(),
+            params: task.params.clone(),
+            filter_predicate,
+            query_id: task.query_id.clone(),
+            stage_id,
+            partition_id,
+            execution_plan: task.payload.as_bytes().to_vec(),
+            output_destinations,
+            execution_mode_hint,
+            partition_count,
+            upstream_stage_ids,
+            upstream_partition_counts,
+            partition_spec,
+            query_run_id,
+        }],
     }
 }

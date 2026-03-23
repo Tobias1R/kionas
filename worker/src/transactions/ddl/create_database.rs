@@ -47,7 +47,7 @@ fn is_valid_database_name(name: &str) -> bool {
 ///
 /// Details:
 /// - Prefers `db_name.normalized`, then falls back to `db_name.raw` or `database_name`.
-fn resolve_database_name(task: &worker_service::Task) -> Result<String, String> {
+fn resolve_database_name(task: &worker_service::StagePartitionExecution) -> Result<String, String> {
     let parsed: serde_json::Value = serde_json::from_str(&task.input)
         .map_err(|e| format!("invalid create_database payload: {}", e))?;
 
@@ -100,7 +100,7 @@ fn resolve_database_name(task: &worker_service::Task) -> Result<String, String> 
 /// - A marker file is used as the durable signal that the database path was initialized.
 pub(crate) async fn execute_create_database_task(
     shared: &SharedData,
-    task: &worker_service::Task,
+    task: &worker_service::StagePartitionExecution,
 ) -> Result<String, String> {
     let database_name = resolve_database_name(task)?;
     let marker_key = format!("databases/{}/_kionas_database.json", database_name);

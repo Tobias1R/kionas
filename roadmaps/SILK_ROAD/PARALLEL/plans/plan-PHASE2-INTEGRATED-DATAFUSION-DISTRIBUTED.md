@@ -6,7 +6,7 @@
 **Focus**: Unified roadmap combining DataFusion ExecutionPlan + Stage Extraction + Worker-to-Worker Streaming
 
 ---
-
+**KEEP THIS DOCUMENT UPDATED WITH PHASE PROGRESS!**
 ## Executive Summary
 
 ### Strategic Shift
@@ -71,9 +71,10 @@ Result: Multi-worker parallelism + pipelined execution
 ### Phase 0: Prerequisites (Completed in Phase 1)
 
 **Must complete before Phase 2 begins**:
-- ✅ Async scheduler (server-side stage orchestration)
-- ✅ Tokio runtime integration (worker-side async execution)
-- ✅ Partition checkpoint logic (for recovery)
+- ✅ Stage extraction at RepartitionExec boundaries
+- ✅ DAG-aware async scheduler for stage orchestration
+- ✅ Task model redesign with stage and routing metadata
+- ✅ In-memory correctness harness (byte-identical baseline validation)
 
 **Status**: Assumed complete; Phase 2 builds on this.
 
@@ -95,8 +96,8 @@ Result: Multi-worker parallelism + pipelined execution
 
 **Deliverable**:
 - Server generates DataFusion ExecutionPlans
-- Task model extended (but not yet using stage extraction)
-- All existing queries still work (backward compatible)
+- Stage extraction integrated into planning path
+- Task model consumed as the default contract (breaking change accepted)
 
 **Risk**: DataFusion planner behaviour differs from Kionas  
 **Mitigation**: Start with simple queries; add complexity gradually; extensive validation
@@ -299,7 +300,7 @@ Result: Multi-worker parallelism + pipelined execution
 
 ```
 Phase 0 (Prerequisite - Phase 1):
-└─ Async scheduler + Tokio integration (5 weeks, completed before Phase 2)
+└─ Control plane foundation complete (stage extraction + DAG scheduler + task model, 3-4 weeks)
 
 Phase 2a: DataFusion + Stage Extraction
 ├─ 2a.1: Server planner integration (2 weeks, 6-7d)
@@ -423,15 +424,15 @@ GRAND TOTAL: 10-14 weeks (~25-28 person-days across 4-5 engineers)
 
 **If critical issues discovered**:
 
-1. **Phase 2a-2b merged failure**: Revert to monolithic ExecutionPlan model (no stage extraction)
-   - Keep: DataFusion planner
-   - Revert: Worker-to-worker Flight routing
-   - Impact: Lose parallelism, keep planner benefits
+1. **Phase 2a-2b instability**: Keep distributed architecture, reduce blast radius
+  - Keep: stage extraction + distributed task model + Flight integration
+  - Limit: cap max workers per query; temporarily reduce stage fan-out
+  - Impact: lower throughput during stabilization, no architectural backtracking
 
-2. **Phase 2c failure**: Use SinglePartition by default
-   - All data converges to single output partition
-   - No data loss; just inefficient
-   - Impact: No parallelism for complex joins
+2. **Phase 2c routing instability**: Freeze to supported routing subset
+  - Keep: Hash + SinglePartition only until fixes land
+  - Defer: Range and advanced fan-out paths
+  - Impact: reduced flexibility, preserves distributed execution direction
 
 ---
 

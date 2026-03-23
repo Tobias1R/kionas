@@ -391,6 +391,7 @@ pub(crate) async fn handle_insert_statement(
         payload,
         params,
         None,
+        None,
         30,
     )
     .await
