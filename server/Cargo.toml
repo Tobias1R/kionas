@@ -31,7 +31,7 @@ chrono.workspace = true
 rustls.workspace = true
 uuid = "1.22.0"
 deltalake = { version = "0.31.1", features = ["s3"] }
-datafusion = "52.2.0"
+datafusion = { version = "52.2.0", features = ["parquet", "sql"] }
 url = "2"
 sysinfo = "0.29"
 
