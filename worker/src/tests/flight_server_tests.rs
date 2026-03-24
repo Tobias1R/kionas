@@ -691,6 +691,7 @@ async fn do_exchange_rejects_stream_that_exceeds_ingest_wire_byte_backpressure_l
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn upstream_worker_death_mid_stream_fails_fast() {
     // What: Verify that when an upstream worker dies mid-stream (closes connection),
     // the downstream worker detects this quickly and returns an appropriate error.
