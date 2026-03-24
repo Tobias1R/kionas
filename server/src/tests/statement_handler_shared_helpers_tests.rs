@@ -1,7 +1,7 @@
 use super::{
     DispatchAuthContext, format_stage_dispatch_boundary_event, validate_query_dispatch_context,
 };
-use crate::statement_handler::shared::distributed_dag::{ExecutionModeHint, StageTaskGroup};
+use crate::statement_handler::shared::distributed_dag::{self, ExecutionModeHint, StageTaskGroup};
 use kionas::planner::PartitionSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,6 +113,136 @@ fn auth_ctx_with_query_id(query_id: &str) -> DispatchAuthContext {
         scope: "select:*.*.*".to_string(),
         query_id: query_id.to_string(),
     }
+}
+
+fn insert_distributed_observability_params(
+    params: &mut HashMap<String, String>,
+    stage_count: usize,
+) {
+    params.insert(
+        distributed_dag::OBS_DAG_METRICS_JSON_PARAM.to_string(),
+        format!("{{\"stage_count\":{}}}", stage_count),
+    );
+    params.insert(
+        distributed_dag::OBS_PLAN_VALIDATION_STATUS_PARAM.to_string(),
+        distributed_dag::OBS_PLAN_VALIDATION_STATUS_PASSED.to_string(),
+    );
+    params.insert(
+        distributed_dag::OBS_STAGE_EXTRACTION_MISMATCH_PARAM.to_string(),
+        "false".to_string(),
+    );
+    params.insert(
+        distributed_dag::OBS_DATAFUSION_STAGE_COUNT_PARAM.to_string(),
+        stage_count.to_string(),
+    );
+    params.insert(
+        distributed_dag::OBS_DISTRIBUTED_STAGE_COUNT_PARAM.to_string(),
+        stage_count.to_string(),
+    );
+}
+
+fn assert_distributed_observability_params(params: &HashMap<String, String>, stage_count: usize) {
+    let expected_metrics = format!("{{\"stage_count\":{}}}", stage_count);
+    let expected_stage_count = stage_count.to_string();
+
+    assert_eq!(
+        params.get(distributed_dag::OBS_DAG_METRICS_JSON_PARAM),
+        Some(&expected_metrics)
+    );
+    assert_eq!(
+        params.get(distributed_dag::OBS_PLAN_VALIDATION_STATUS_PARAM),
+        Some(&distributed_dag::OBS_PLAN_VALIDATION_STATUS_PASSED.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::OBS_STAGE_EXTRACTION_MISMATCH_PARAM),
+        Some(&"false".to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::OBS_DATAFUSION_STAGE_COUNT_PARAM),
+        Some(&expected_stage_count)
+    );
+    assert_eq!(
+        params.get(distributed_dag::OBS_DISTRIBUTED_STAGE_COUNT_PARAM),
+        Some(&expected_stage_count)
+    );
+}
+
+fn insert_distributed_routing_observability_params(
+    params: &mut HashMap<String, String>,
+    routing_source: &str,
+    runtime_worker_count: usize,
+    effective_worker_count: usize,
+    env_fallback_applied: bool,
+    fallback_kind: &str,
+    fallback_active: bool,
+) {
+    params.insert(
+        distributed_dag::ROUTING_WORKER_SOURCE_PARAM.to_string(),
+        routing_source.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_WORKER_COUNT_PARAM.to_string(),
+        effective_worker_count.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_RUNTIME_WORKER_COUNT_PARAM.to_string(),
+        runtime_worker_count.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_EFFECTIVE_WORKER_COUNT_PARAM.to_string(),
+        effective_worker_count.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_ENV_FALLBACK_APPLIED_PARAM.to_string(),
+        env_fallback_applied.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_FALLBACK_KIND_PARAM.to_string(),
+        fallback_kind.to_string(),
+    );
+    params.insert(
+        distributed_dag::ROUTING_FALLBACK_ACTIVE_PARAM.to_string(),
+        fallback_active.to_string(),
+    );
+}
+
+fn assert_distributed_routing_observability_params(
+    params: &HashMap<String, String>,
+    routing_source: &str,
+    runtime_worker_count: usize,
+    effective_worker_count: usize,
+    env_fallback_applied: bool,
+    fallback_kind: &str,
+    fallback_active: bool,
+) {
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_WORKER_SOURCE_PARAM),
+        Some(&routing_source.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_WORKER_COUNT_PARAM),
+        Some(&effective_worker_count.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_RUNTIME_WORKER_COUNT_PARAM),
+        Some(&runtime_worker_count.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_EFFECTIVE_WORKER_COUNT_PARAM),
+        Some(&effective_worker_count.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_ENV_FALLBACK_APPLIED_PARAM),
+        Some(&env_fallback_applied.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_FALLBACK_KIND_PARAM),
+        Some(&fallback_kind.to_string())
+    );
+    assert_eq!(
+        params.get(distributed_dag::ROUTING_FALLBACK_ACTIVE_PARAM),
+        Some(&fallback_active.to_string())
+    );
 }
 
 #[test]
@@ -612,23 +742,16 @@ async fn scheduler_preserves_observability_params_on_dispatched_partitions() {
     let mut stage2 = stage_group(2, 0, 1, vec![1]);
 
     for group in [&mut stage0, &mut stage1, &mut stage2] {
-        group.params.insert(
-            "distributed_dag_metrics_json".to_string(),
-            "{\"stage_count\":2}".to_string(),
+        insert_distributed_observability_params(&mut group.params, 2);
+        insert_distributed_routing_observability_params(
+            &mut group.params,
+            "fallback",
+            0,
+            1,
+            true,
+            distributed_dag::ROUTING_POOL_SOURCE_DEFAULT,
+            true,
         );
-        group.params.insert(
-            "distributed_plan_validation_status".to_string(),
-            "passed".to_string(),
-        );
-        group
-            .params
-            .insert("stage_extraction_mismatch".to_string(), "false".to_string());
-        group
-            .params
-            .insert("datafusion_stage_count".to_string(), "2".to_string());
-        group
-            .params
-            .insert("distributed_stage_count".to_string(), "2".to_string());
     }
 
     let stage_groups = vec![stage0, stage1, stage2];
@@ -663,22 +786,15 @@ async fn scheduler_preserves_observability_params_on_dispatched_partitions() {
     let captured = seen_params.lock().await;
     assert_eq!(captured.len(), 3);
     for params in captured.iter() {
-        assert_eq!(
-            params.get("distributed_dag_metrics_json"),
-            Some(&"{\"stage_count\":2}".to_string())
-        );
-        assert_eq!(
-            params.get("distributed_plan_validation_status"),
-            Some(&"passed".to_string())
-        );
-        assert_eq!(
-            params.get("stage_extraction_mismatch"),
-            Some(&"false".to_string())
-        );
-        assert_eq!(params.get("datafusion_stage_count"), Some(&"2".to_string()));
-        assert_eq!(
-            params.get("distributed_stage_count"),
-            Some(&"2".to_string())
+        assert_distributed_observability_params(params, 2);
+        assert_distributed_routing_observability_params(
+            params,
+            "fallback",
+            0,
+            1,
+            true,
+            distributed_dag::ROUTING_POOL_SOURCE_DEFAULT,
+            true,
         );
     }
 }

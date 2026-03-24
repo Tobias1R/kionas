@@ -2,6 +2,29 @@ use kionas::planner::{DistributedPhysicalPlan, DistributedStage, PartitionSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) const ROUTING_WORKER_SOURCE_PARAM: &str = "distributed_routing_worker_source";
+pub(crate) const ROUTING_WORKER_COUNT_PARAM: &str = "distributed_routing_worker_count";
+pub(crate) const ROUTING_RUNTIME_WORKER_COUNT_PARAM: &str =
+    "distributed_routing_runtime_worker_count";
+pub(crate) const ROUTING_EFFECTIVE_WORKER_COUNT_PARAM: &str =
+    "distributed_routing_effective_worker_count";
+pub(crate) const ROUTING_ENV_FALLBACK_APPLIED_PARAM: &str =
+    "distributed_routing_env_fallback_applied";
+pub(crate) const ROUTING_FALLBACK_KIND_PARAM: &str = "distributed_routing_fallback_kind";
+pub(crate) const ROUTING_FALLBACK_ACTIVE_PARAM: &str = "distributed_routing_fallback_active";
+pub(crate) const ROUTING_POOL_SOURCE_RUNTIME: &str = "runtime";
+pub(crate) const ROUTING_POOL_SOURCE_ENV: &str = "env";
+pub(crate) const ROUTING_POOL_SOURCE_DEFAULT: &str = "default";
+pub(crate) const ROUTING_RUNTIME_SOURCE_WORKERS: &str = "workers";
+pub(crate) const ROUTING_RUNTIME_SOURCE_WAREHOUSES: &str = "warehouses";
+pub(crate) const ROUTING_RUNTIME_SOURCE_FALLBACK: &str = "fallback";
+pub(crate) const OBS_DAG_METRICS_JSON_PARAM: &str = "distributed_dag_metrics_json";
+pub(crate) const OBS_PLAN_VALIDATION_STATUS_PARAM: &str = "distributed_plan_validation_status";
+pub(crate) const OBS_PLAN_VALIDATION_STATUS_PASSED: &str = "passed";
+pub(crate) const OBS_STAGE_EXTRACTION_MISMATCH_PARAM: &str = "stage_extraction_mismatch";
+pub(crate) const OBS_DATAFUSION_STAGE_COUNT_PARAM: &str = "datafusion_stage_count";
+pub(crate) const OBS_DISTRIBUTED_STAGE_COUNT_PARAM: &str = "distributed_stage_count";
+
 /// What: Stage-scoped task group produced by distributed DAG compilation.
 ///
 /// Inputs:
@@ -167,44 +190,21 @@ fn parse_worker_addresses(raw: &str) -> Vec<String> {
 /// Details:
 /// - Uses `KIONAS_DISTRIBUTED_WORKER_ADDRESSES` when configured.
 /// - Falls back to `localhost` to preserve existing behavior.
+#[cfg(test)]
 fn resolve_worker_address_pool() -> Vec<String> {
+    resolve_worker_address_pool_with_source().0
+}
+
+fn resolve_worker_address_pool_with_source() -> (Vec<String>, &'static str) {
     let configured = std::env::var("KIONAS_DISTRIBUTED_WORKER_ADDRESSES")
         .ok()
         .map(|raw| parse_worker_addresses(&raw))
         .unwrap_or_default();
 
     if configured.is_empty() {
-        vec!["localhost".to_string()]
+        (vec!["localhost".to_string()], ROUTING_POOL_SOURCE_DEFAULT)
     } else {
-        configured
-    }
-}
-
-/// What: Normalize a runtime-provided worker pool for deterministic routing metadata.
-///
-/// Inputs:
-/// - `worker_pool`: Candidate worker addresses supplied by caller context.
-///
-/// Output:
-/// - Non-empty normalized worker address pool.
-///
-/// Details:
-/// - Trims entries, removes empties, deduplicates in first-seen order.
-/// - Falls back to environment/default pool when runtime input is empty.
-fn normalize_runtime_worker_pool(worker_pool: &[String]) -> Vec<String> {
-    let mut normalized = Vec::<String>::new();
-    for entry in worker_pool {
-        let candidate = entry.trim().to_string();
-        if candidate.is_empty() || normalized.iter().any(|existing| existing == &candidate) {
-            continue;
-        }
-        normalized.push(candidate);
-    }
-
-    if normalized.is_empty() {
-        resolve_worker_address_pool()
-    } else {
-        normalized
+        (configured, ROUTING_POOL_SOURCE_ENV)
     }
 }
 
@@ -219,7 +219,38 @@ fn normalize_runtime_worker_pool(worker_pool: &[String]) -> Vec<String> {
 /// Details:
 /// - Applies runtime normalization, then falls back to env/default pool when runtime input is empty.
 pub(crate) fn resolve_effective_routing_worker_pool(worker_pool: &[String]) -> Vec<String> {
-    normalize_runtime_worker_pool(worker_pool)
+    resolve_effective_routing_worker_pool_with_source(worker_pool).0
+}
+
+/// What: Resolve effective routing worker pool and its source classification.
+///
+/// Inputs:
+/// - `worker_pool`: Candidate runtime worker addresses supplied by caller context.
+///
+/// Output:
+/// - Tuple with normalized non-empty worker pool and source label.
+///
+/// Details:
+/// - Source is `runtime` when normalized runtime addresses are present.
+/// - Source is `env` when fallback pool comes from configured env worker addresses.
+/// - Source is `default` when fallback pool uses localhost default.
+pub(crate) fn resolve_effective_routing_worker_pool_with_source(
+    worker_pool: &[String],
+) -> (Vec<String>, &'static str) {
+    let mut normalized = Vec::<String>::new();
+    for entry in worker_pool {
+        let candidate = entry.trim().to_string();
+        if candidate.is_empty() || normalized.iter().any(|existing| existing == &candidate) {
+            continue;
+        }
+        normalized.push(candidate);
+    }
+
+    if normalized.is_empty() {
+        resolve_worker_address_pool_with_source()
+    } else {
+        (normalized, ROUTING_POOL_SOURCE_RUNTIME)
+    }
 }
 
 /// What: Build deterministic worker routing map for downstream partitions.

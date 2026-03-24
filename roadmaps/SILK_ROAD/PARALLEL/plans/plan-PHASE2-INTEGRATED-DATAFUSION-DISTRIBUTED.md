@@ -100,6 +100,63 @@ Result: Multi-worker parallelism + pipelined execution
   - Server query dispatch now records routing source/worker count plus `fallback_active` metadata on staged task params, and warns when distributed execution relies on fallback routing.
   - Server routing observability emission is now centralized through dedicated helper paths to keep distributed routing logs and staged params contract-consistent.
   - Server routing worker-count observability now reports the effective pool used for DAG routing (runtime or env/default fallback), avoiding runtime-only undercount when fallback pool is selected.
+  - Server routing telemetry now emits both runtime and effective worker-count fields plus an env-fallback-applied marker to make fallback pool selection explicit in stage params and logs.
+  - Server distributed routing telemetry keys are now centralized as shared constants in the DAG module and consumed by select dispatch to reduce key-drift risk.
+  - Server distributed observability param keys (DAG metrics/validation/extraction counts) are now centralized as shared constants and consumed by select dispatch for contract stability.
+  - Server test assertions for distributed observability params now consume the same shared constants used by dispatch producers, reducing producer/test key drift risk.
+  - Server distributed observability validation-status value (`passed`) is now centralized as a shared constant and reused by both dispatch producer code and server tests.
+  - Server observability-heavy tests now use local helper functions for telemetry param insertion and assertions, reducing duplication and simplifying future telemetry-key evolution.
+  - Server routing observability now includes fallback-kind classification (`runtime`/`env`/`default`) sourced from a source-aware effective worker-pool resolver, improving fallback diagnostics without altering routing behavior.
+  - Server DAG tests now validate source-aware effective routing worker-pool resolution for runtime pools and fallback-path invariants (`env`/`default`).
+  - Server select-handler tests now assert routing observability param propagation, including `distributed_routing_fallback_kind`, across compiled stage groups.
+  - Server scheduler preservation tests now assert routing observability param retention (including `distributed_routing_fallback_kind`) across dispatched partitions.
+  - Server runtime routing source labels (`workers`/`warehouses`/`fallback`) are now centralized as shared constants and consumed by select dispatch fallback-activation checks to reduce string-contract drift.
+  - Server fallback-active warning diagnostics now include source/effective-pool/fallback-kind context, and select dispatch now consumes runtime worker-address resolution via move-destructuring to avoid an unnecessary address-vector clone.
+  - Server routing observability stage-param attachment now precomputes formatted value strings once per dispatch before stage-group iteration, reducing repeated per-group formatting allocations while preserving telemetry contract keys.
+  - Server fallback-active semantics now trigger on effective routing fallback usage (`env` or `default` pool substitution) for multi-stage queries, aligning warning/param signals with actual routing behavior.
+  - Server select-path SQL observability logs now use a compact, capped preview (whitespace-collapsed with truncation metadata) for routing-fallback and stage-extraction mismatch warnings to reduce high-noise log payloads while preserving diagnostics.
+  - Server stage-group observability attachment now precomputes both telemetry keys and formatted values once per dispatch loop, reducing repeated per-group allocations; the legacy helper remains test-scoped to preserve unit coverage entry points without production dead code.
+  - Server select stage-group metadata param attachment now precomputes common key/value strings (database/schema/table/query/scan metadata) once per dispatch before per-group insertion, reducing repeated allocation churn while preserving emitted param contracts.
+  - Server select stage metadata/query param key names are now centralized as module constants (`database_name`, `schema_name`, `table_name`, `query_kind`, `query_run_id`, scan/relation metadata keys), reducing string-contract drift risk during future dispatch-param evolution.
+  - Server Delta storage-option assembly now uses centralized AWS/storage key constants and shared trimmed-value locals (`region`, `access_key`, `secret_key`, `endpoint`) to reduce string-key drift and repeated trimming work while preserving emitted storage options.
+  - Server select outcome category/code literals (`SUCCESS`/`VALIDATION`/`INFRA`, `WORKER_QUERY_FAILED`, `QUERY_DISPATCHED`) are now centralized as module constants and reused across dispatch-path outcome emission to reduce string-contract drift risk.
+  - Server select path now centralizes additional stable literals as constants (default namespace `default/public`, plan engine `datafusion`, stage operation `query`, scan modes `metadata_pruned/full`) to reduce contract drift and keep dispatch/planning strings consistent.
+  - Server select path now centralizes repeated operational magic values as constants (metastore resolver concurrency, dispatch timeout seconds, delta-pin sentinel value) and reuses them across resolver calls, dispatch execution, and scan-pin fallback checks for contract clarity.
+  - Server scan-delta sentinel warning text is now centralized and emitted via the shared sentinel constant in both failure and metadata-pruned warning paths, preventing hardcoded sentinel-value drift in diagnostics.
+  - Server metastore resolver initialization is now consolidated behind a shared helper (`build_metastore_resolver`) reused by relation-location, relation-columns, and main select-planning paths, reducing duplicate construction/error-shaping logic.
+  - Server SQL log preview compaction now collapses whitespace via a single-pass helper (no intermediate token-vector join), reducing allocation overhead while preserving preview/truncation semantics.
+  - Server scan-hint generation now returns both serialized hint payload and eligibility flag together, removing select-path JSON re-parse (`serde_json::from_str`) during scan-mode derivation while preserving fallback semantics when payload serialization fails.
+  - Server select path now centralizes `INFRA|WORKER_QUERY_FAILED` outcome emission through a shared helper (`format_worker_query_failed_outcome`), reducing repeated error-envelope construction and keeping failure-code contracts consistent across parse/plan/dispatch failures.
+  - Server scan-hint payload literals (hint version, source tag, eligibility/unsupported reason strings) are now centralized as constants, reducing contract drift risk for worker-visible hint metadata.
+  - Server DataFusion fallback diagnostics message prefixes (logical/optimized diagnostics unavailable and logical-plan build failure) are now centralized as constants, reducing string drift across relation-resolution fallback and validation-outcome paths.
+  - Server select path now centralizes `VALIDATION` outcome envelope construction through a shared helper (`format_validation_outcome`), reducing repeated category/code wrapping across query-model, planner, and plan-artifact validation failures.
+  - Server relation-metadata warning prefixes (planner-path vs runtime-path) are now centralized as constants and reused in both warning call sites, reducing drift risk in observability messaging across metadata-resolution paths.
+  - Server select path now centralizes prefixed diagnostic message composition behind a shared helper (`format_prefixed_diagnostic_message`), reducing duplicate `<prefix>: <detail>` formatting across DataFusion fallback diagnostics and validation messages.
+  - Server session default namespace resolution is now extracted into a shared helper (`resolve_session_namespace_defaults`), reducing handler-body nesting while preserving `default/public` fallback semantics and empty-`USE` database handling.
+  - Server relation-location and relation-columns metastore helpers now share a single relation-metadata resolver (`resolve_relation_metadata`), reducing duplicate resolver construction/lookup paths while preserving existing empty-location and empty-columns validation errors.
+  - Server planner relation metadata assembly is now extracted into a shared helper (`load_planner_relation_metadata`), centralizing relation-resolution warning behavior and relation-column key construction while preserving existing skip-on-metadata-miss fallback semantics.
+  - Server runtime relation namespace collection is now extracted into a shared helper (`collect_runtime_relation_set`), centralizing base/hash-join relation gathering from the physical plan while preserving relation-column hydration scope.
+  - Server runtime relation-columns hydration is now centralized in a shared helper (`load_runtime_relation_columns`), preserving planner-first column reuse, runtime metastore fallback, and runtime metadata warning behavior while reducing handler-body loop duplication.
+  - Server planning relation namespace collection is now centralized in a shared helper (`collect_planning_relation_set`), preserving base-plus-join-right relation discovery while reducing inline handler setup logic before planner metadata resolution.
+  - Server canonical payload physical-plan decoding is now centralized in a shared helper (`decode_physical_plan_from_payload`), preserving existing parse/missing-field/decode error strings while reducing inline payload decode branching in the select handler.
+  - Server distributed-plan assembly/validation is now centralized in a shared helper (`build_and_validate_distributed_plan`), preserving stage-extraction mismatch warning text and distributed-plan validation error contracts while reducing inline handler control-flow branching.
+  - Server query metadata stage-param attachment is now centralized in a shared helper (`attach_query_metadata_to_stage_groups`) with a typed parameter bundle (`QueryStageMetadataParams`), preserving existing stage param keys/values and optional scan/relation metadata propagation while reducing handler-body duplication.
+  - Server scan metadata resolution is now centralized in a shared helper (`resolve_query_scan_metadata`) returning a typed bundle (`QueryScanMetadata`), preserving pruning-hint eligibility semantics and existing delta-pin fallback warning contracts while reducing inline scan-mode/pin branching.
+  - Server SELECT dispatch auth context construction is now centralized in a shared helper (`build_select_dispatch_auth_context`), preserving `select:<db>.<schema>.<table>` scope formatting and existing RBAC/query-id propagation while reducing handler-tail duplication.
+  - Server distributed DAG metrics compute/log/serialization is now centralized in a shared helper (`compute_dag_metrics_json`), preserving existing metrics info-log and compute-failure error contracts while reducing inline post-compilation branching.
+  - Server query stage-group dispatch execution is now centralized in a shared helper (`run_query_stage_groups`), preserving `worker query dispatch failed: ...` error contract and timeout/auth propagation while reducing inline handler-tail dispatch branching.
+  - Server SELECT dispatch success log/outcome emission is now centralized in a shared helper (`emit_select_dispatch_success_outcome`), preserving existing success log template and `QUERY_DISPATCHED` outcome message shape while reducing handler-tail duplication.
+  - Server runtime relation-columns JSON payload emission is now centralized in a shared helper (`relation_columns_json_payload`), preserving empty/serialization-failure `None` fallback semantics while reducing inline handler branching.
+  - Server routing observability context construction is now centralized in a shared helper (`build_routing_observability_context`), preserving fallback-activation and source-kind contracts while reducing inline runtime/effective worker-pool branching in the handler.
+  - Server distributed stage-group compilation is now centralized in a shared helper (`compile_query_stage_groups`), preserving `failed to compile distributed stage groups: ...` error contract while reducing inline handler branching around routing-pool compilation.
+  - Server stage-extraction observability counts are now centralized in a typed helper (`resolve_stage_extraction_observability_counts` with `StageExtractionObservabilityCounts`), preserving mismatch/count telemetry semantics while reducing inline count-derivation branching.
+  - Server physical-plan operator pipeline name derivation is now centralized in a shared helper (`physical_pipeline_names`), preserving diagnostics payload ordering while reducing inline payload-assembly iterator noise.
+  - Server query routing resolution is now centralized in a shared helper (`resolve_query_routing_context`), preserving runtime/effective worker-pool source contracts and routing observability context semantics while reducing inline async routing setup branching.
+  - Server canonical SELECT payload JSON construction is now centralized in a shared helper (`build_canonical_query_payload_json`), preserving payload schema and diagnostics field contracts while reducing large inline payload assembly in the handler.
+  - Server runtime relation-columns payload resolution is now centralized in a shared helper (`resolve_relation_columns_json_payload`), preserving planner-first reuse and runtime metastore fallback semantics while reducing inline relation-set/serialization branching.
+  - Server planner relation-input resolution is now centralized in a shared helper (`resolve_planner_relation_inputs`), preserving resolver-initialization error contract and planner metadata fallback semantics while reducing inline handler setup branching.
+  - Server routing observability logging plus DAG metrics payload resolution is now centralized in a shared helper (`resolve_routing_and_dag_metrics_json`), preserving routing-warning and metrics-failure contracts while reducing inline post-compilation branching.
+  - Server payload-to-plan resolution is now centralized in a shared helper (`resolve_distributed_plan_from_payload`) that returns both decoded physical and validated distributed plans, preserving decode/validation error contracts while reducing inline handler decode/validation branching.
   - Worker exchange-input routing now applies deterministic downstream partition selection across upstream exchange artifacts for multi-partition stage fanout.
   - Worker many-to-one exchange distribution is validated through persisted artifact reads in pipeline tests (not helper-only selection), including downstream-partition completeness and no-overlap coverage.
 - Remaining critical path (in order):
@@ -493,16 +550,7 @@ GRAND TOTAL: 9-12.5 weeks (~23-28 person-days across 4-5 engineers)
 ## Rollback Plan
 
 **If critical issues discovered**:
-
-1. **Phase 2a-2b instability**: Keep distributed architecture, reduce blast radius
-  - Keep: stage extraction + distributed task model + Flight integration
-  - Limit: cap max workers per query; temporarily reduce stage fan-out
-  - Impact: lower throughput during stabilization, no architectural backtracking
-
-2. **Phase 2c routing instability**: Freeze to supported routing subset
-  - Keep: Hash + SinglePartition only until fixes land
-  - Defer: Range and advanced fan-out paths
-  - Impact: reduced flexibility, preserves distributed execution direction
+We pause and discover how to fix!
 
 ---
 

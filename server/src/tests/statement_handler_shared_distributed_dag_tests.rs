@@ -1,7 +1,7 @@
 use super::{
     ExecutionModeHint, build_stage_execution_waves, compile_stage_task_groups,
-    compute_distributed_dag_metrics, resolve_partition_count_for_stage,
-    route_downstream_partitions_to_workers,
+    compute_distributed_dag_metrics, resolve_effective_routing_worker_pool_with_source,
+    resolve_partition_count_for_stage, route_downstream_partitions_to_workers,
 };
 use kionas::planner::{
     DistributedPhysicalPlan, DistributedStage, LogicalRelation, PartitionSpec, PhysicalOperator,
@@ -571,4 +571,36 @@ fn routes_downstream_partitions_falls_back_to_localhost_for_empty_worker_pool() 
             "localhost".to_string(),
         ]
     );
+}
+
+#[test]
+fn resolve_effective_worker_pool_with_source_marks_runtime_pool() {
+    let runtime_pool = vec![
+        "worker-a:32001".to_string(),
+        "worker-b:32001".to_string(),
+        "worker-a:32001".to_string(),
+        "  ".to_string(),
+    ];
+
+    let (resolved, source) = resolve_effective_routing_worker_pool_with_source(&runtime_pool);
+
+    assert_eq!(source, super::ROUTING_POOL_SOURCE_RUNTIME);
+    assert_eq!(
+        resolved,
+        vec!["worker-a:32001".to_string(), "worker-b:32001".to_string()]
+    );
+}
+
+#[test]
+fn resolve_effective_worker_pool_with_source_fallback_is_env_or_default() {
+    let (resolved, source) = resolve_effective_routing_worker_pool_with_source(&[]);
+
+    assert!(!resolved.is_empty());
+    assert!(
+        source == super::ROUTING_POOL_SOURCE_ENV || source == super::ROUTING_POOL_SOURCE_DEFAULT
+    );
+
+    if source == super::ROUTING_POOL_SOURCE_DEFAULT {
+        assert_eq!(resolved, vec!["localhost".to_string()]);
+    }
 }
