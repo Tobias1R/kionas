@@ -8,7 +8,7 @@
 - [ ] Compile the Project
 - [ ] Create and Run Task
 - [ ] Launch the Project
-- [x] Ensure Documentation is Complete
+- [ ] Ensure Documentation is Complete
 
 ## Execution Guidelines
 - Work through each checklist item systematically.
@@ -110,8 +110,6 @@ If you add or change config keys:
 - **Do NOT create or update *.md files, unless explicitly asked**
 - **Do NOT update wiki pages, unless explicitly asked**
 - **Do NOT update README, unless explicitly asked**
-- **ROADMAPS** Are the only exception: update `ROADMAP.md` and create corresponding `ROADMAP_PHASEX_MATRIX.md` files as needed for phase signoff documentation.
-- Focus on code implementation and inline documentation (rustdoc comments)
 
 
 ## Complexity Thresholds
@@ -127,61 +125,3 @@ If you add or change config keys:
 - All changes must respect `--dry-run` flag
 - All changes must degrade gracefully if system tools are unavailable
 
-## Roadmping
-- We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files. Put the matrix files in the same directory as the roadmap for easy reference and linking.
-- Each roadmap phase should have a clear scope, mandatory criteria for completion, optional hardening items, and a signoff decision process.
-- The roadmap should be updated iteratively as we progress through phases, ensuring that all relevant files and documentation are maintained in sync with the current state of the project.
-- Each phase is composed by:
-  - **DISCOVERY**:
-    - From now on we are going to persist our discovery findings in roadmaps/<ROADMAP_NAME>/discovery/discovery-phaseX.md files, and link them in the discovery section of the roadmap.
-  - **IMPLEMENTATION**:
-    - save planning in roadmaps/<ROADMAP_NAME>/plans/plan-phaseX.md files, and link them in the implementation section of the roadmap.
-  - **COMPLETION MATRIX**:
-    - For each phase, create a ROADMAP_PHASEX_MATRIX.md file with the structure defined in the template below. This file will be used to track the completion of mandatory criteria and optional hardening items for the phase, along with evidence references and notes.
-
-## Roadmap Phase Signoff Matrix Requirements
-For each roadmap phase, create a corresponding `ROADMAP_PHASEX_MATRIX.md` file with the following structure:
-```markdown
-# Phase X Completion Matrix
-
-## Scope
-Describe the exact phase scope from [ROADMAP.md](ROADMAP.md).
-
-## Completion Matrix
-| Item | Status | Evidence | Notes |
-|---|---|---|---|
-| Mandatory criterion 1 | Not Started | N/A | |
-| Mandatory criterion 2 | Not Started | N/A | |
-| Mandatory criterion 3 | Not Started | N/A | |
-| Optional hardening 1 | Deferred | N/A | Non-blocking for phase signoff. |
-| Optional hardening 2 | Deferred | N/A | Non-blocking for phase signoff. |
-
-Status values:
-- `Done`
-- `Deferred`
-- `Blocked`
-- `Not Started`
-
-## Signoff Decision
-- Phase signoff: `Pending`
-- Blocking items:
-  - List mandatory criteria not marked `Done`.
-  - List optional hardening items not marked `Done`.
-
-## Gate Checklist
-1. All mandatory criteria are marked `Done`.
-2. Each `Done` item includes concrete evidence reference.
-3. `Deferred` items include rationale and are explicitly non-blocking.
-4. Final signoff decision is recorded in this file.
-
-## Environment and Parameters
-- Inform all environment variables required for the phase, if any. And where in the codebase they are expected to be used.
-- Inform any parameters that are expected to be used for the phase, if any. And where in the codebase they are expected to be used.
-```
-
-## Silk Road Methodology
-- Silk road discovery and implementation files should be created in `roadmaps/SILK_ROAD/` with the following structure:
-  - `roadmaps/SILK_ROAD/silkroad.md`: This file will contain the overall Silk Road methodology, including the roadmap to indexing and constraints.
-  - `roadmaps/SILK_ROAD/<ROAD_NAME>/discovery/discovery-<ROAD_NAME>-<PHASE>.md`: This file will capture the discovery findings for the specific road (e.g., indexing, constraints). Must contains high-level summaries of blockers, technical deep dives, and any relevant diagrams or references. No code is produced in this phase, but the output should be only the discovery findings and the next steps for implementation.
-  - Once discovery is completed, we build a roadmap for the ROAD_NAME.  
-  - A plan must be created in `roadmaps/SILK_ROAD/<ROAD_NAME>/plans/plan-<ROAD_NAME>-<PHASE>.md` and linked in the discovery file on the next iteration after the discovery is completed.

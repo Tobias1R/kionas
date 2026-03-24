@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::execution::artifacts::persist_query_artifacts;
+use crate::flight::client_pool::FlightClientPool;
 use crate::state::{SharedData, WorkerInformation};
 use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field, TimeUnit};
@@ -20,6 +21,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
 
@@ -105,11 +107,64 @@ fn dispatch_context_from_flight_metadata(
 #[derive(Clone)]
 pub(crate) struct WorkerFlightService {
     shared_data: SharedData,
+    /// Pooled Flight client connections to downstream workers
+    client_pool: Arc<FlightClientPool>,
 }
 
 impl WorkerFlightService {
+    /// What: Create new worker Flight service with client pool.
+    ///
+    /// Inputs:
+    /// - `shared_data`: Worker shared state.
+    ///
+    /// Output:
+    /// - Initialized service with lazy-load client pool.
     pub(crate) fn new(shared_data: SharedData) -> Self {
-        Self { shared_data }
+        Self {
+            shared_data,
+            // Initialize pool: max 8 connections per endpoint, 5s connection timeout
+            client_pool: Arc::new(FlightClientPool::new(8, Duration::from_secs(5))),
+        }
+    }
+
+    /// What: Get a Flight client channel to a downstream worker.
+    ///
+    /// Inputs:
+    /// - `endpoint_uri`: Destination worker Flight endpoint.
+    ///
+    /// Output:
+    /// - Pooled gRPC channel or error if connection fails.
+    ///
+    /// Details:
+    /// - Reuses channels per endpoint to reduce TLS overhead
+    /// - Returns error if endpoint is unreachable (upstream death scenario)
+    pub(crate) async fn get_downstream_channel(
+        &self,
+        endpoint_uri: &str,
+    ) -> Result<tonic14::transport::Channel, Status> {
+        self.client_pool
+            .get_channel(endpoint_uri)
+            .await
+            .map_err(|e| {
+                let code = match e {
+                    crate::flight::client_pool::FlightClientPoolError::ConnectionTimeout => {
+                        tonic14::Code::DeadlineExceeded
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::PoolExhausted => {
+                        tonic14::Code::ResourceExhausted
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::InvalidEndpoint => {
+                        tonic14::Code::InvalidArgument
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::TlsError(_) => {
+                        tonic14::Code::Unauthenticated
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::ChannelError(_) => {
+                        tonic14::Code::Unavailable
+                    }
+                };
+                Status::new(code, e.to_string())
+            })
     }
 }
 
