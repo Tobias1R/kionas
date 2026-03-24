@@ -1,1 +1,0 @@
-run_id,timestamp_utc,profile_id,dataset_tier,row_count_per_table,table_count,warmup_runs,measured_runs,wall_time_ms,rows_processed,rows_per_second,artifact_size_bytes,stage_runtime_ms,batch_count,result_row_count,notes
