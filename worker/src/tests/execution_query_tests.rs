@@ -607,3 +607,78 @@ fn rejects_limit_before_sort_pipeline() {
     let err = resolve_query_namespace(&task).expect_err("must reject invalid limit placement");
     assert!(err.contains("Limit must appear after Sort"));
 }
+
+#[test]
+fn detects_staged_query_task_with_zero_based_stage_id_and_partition_fanout() {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 2,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
+        task_id: "t1".to_string(),
+        operation: "query".to_string(),
+        input: "[]".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: None,
+    };
+
+    assert!(is_stage_query_task(&task));
+}
+
+#[test]
+fn detects_staged_query_task_with_zero_based_stage_id_and_upstream_dependencies() {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 1,
+        upstream_stage_ids: vec![0],
+        upstream_partition_counts: std::collections::HashMap::from([(0_u32, 1_u32)]),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
+        task_id: "t1".to_string(),
+        operation: "query".to_string(),
+        input: "[]".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: None,
+    };
+
+    assert!(is_stage_query_task(&task));
+}
+
+#[test]
+fn treats_zero_based_task_as_legacy_when_no_stage_signals_are_present() {
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: Vec::new(),
+        partition_count: 0,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: String::new(),
+        query_run_id: String::new(),
+        query_id: String::new(),
+        stage_id: 0,
+        partition_id: 0,
+        task_id: "t1".to_string(),
+        operation: "query".to_string(),
+        input: "[]".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::new(),
+        filter_predicate: None,
+    };
+
+    assert!(!is_stage_query_task(&task));
+}

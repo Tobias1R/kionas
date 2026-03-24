@@ -1629,6 +1629,76 @@ pub(crate) fn validate_upstream_exchange_partition_set(
     Ok(())
 }
 
+/// What: Select exchange artifacts for one downstream partition from an upstream stage.
+///
+/// Inputs:
+/// - `upstream_stage_id`: Upstream stage identifier.
+/// - `keys`: Candidate upstream exchange artifact keys.
+/// - `upstream_partition_count`: Declared upstream partition count.
+/// - `downstream_partition_count`: Declared downstream partition count.
+/// - `downstream_partition_index`: Current downstream partition index.
+///
+/// Output:
+/// - Ordered subset of upstream keys assigned to the downstream partition.
+///
+/// Details:
+/// - Uses one-to-one mapping when upstream fanout is less than or equal to downstream fanout.
+/// - Uses modulo mapping when upstream fanout is greater than downstream fanout.
+pub(crate) fn select_exchange_keys_for_downstream_partition(
+    upstream_stage_id: u32,
+    keys: &[String],
+    upstream_partition_count: u32,
+    downstream_partition_count: u32,
+    downstream_partition_index: u32,
+) -> Result<Vec<String>, String> {
+    if downstream_partition_count == 0 {
+        return Err(format!(
+            "downstream stage for upstream stage {} has invalid partition count 0",
+            upstream_stage_id
+        ));
+    }
+    if downstream_partition_index >= downstream_partition_count {
+        return Err(format!(
+            "downstream partition {} out of range [0, {}) for upstream stage {}",
+            downstream_partition_index, downstream_partition_count, upstream_stage_id
+        ));
+    }
+
+    if upstream_partition_count <= downstream_partition_count {
+        let suffix = format!("part-{:05}.parquet", downstream_partition_index);
+        return Ok(keys
+            .iter()
+            .filter(|key| key.ends_with(&suffix))
+            .cloned()
+            .collect::<Vec<_>>());
+    }
+
+    let mut selected = Vec::<String>::new();
+    for key in keys {
+        let upstream_partition_index =
+            parse_partition_index_from_exchange_key(key).ok_or_else(|| {
+                format!(
+                    "upstream stage {} exchange artifact has invalid key format: {}",
+                    upstream_stage_id, key
+                )
+            })?;
+
+        if upstream_partition_index >= upstream_partition_count {
+            return Err(format!(
+                "upstream stage {} exchange artifact partition {} out of range [0, {})",
+                upstream_stage_id, upstream_partition_index, upstream_partition_count
+            ));
+        }
+
+        if upstream_partition_index % downstream_partition_count == downstream_partition_index {
+            selected.push(key.clone());
+        }
+    }
+
+    selected.sort();
+    Ok(selected)
+}
+
 /// What: Load input batches from base table scan or upstream stage exchange artifacts.
 ///
 /// Inputs:
@@ -1730,8 +1800,28 @@ async fn load_upstream_exchange_batches(
         }
 
         if stage_context.partition_count > 1 {
-            let suffix = format!("part-{:05}.parquet", stage_context.partition_index);
-            keys.retain(|key| key.ends_with(&suffix));
+            if let Some(expected_partition_count) = stage_context
+                .upstream_partition_counts
+                .get(upstream_stage_id)
+                .copied()
+            {
+                validate_upstream_exchange_partition_set(
+                    *upstream_stage_id,
+                    &keys,
+                    expected_partition_count,
+                )?;
+                keys = select_exchange_keys_for_downstream_partition(
+                    *upstream_stage_id,
+                    &keys,
+                    expected_partition_count,
+                    stage_context.partition_count,
+                    stage_context.partition_index,
+                )?;
+            } else {
+                let suffix = format!("part-{:05}.parquet", stage_context.partition_index);
+                keys.retain(|key| key.ends_with(&suffix));
+            }
+
             if keys.is_empty() {
                 return Err(format!(
                     "missing exchange artifact for upstream stage {} partition {}",

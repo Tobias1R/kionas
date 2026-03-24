@@ -1,16 +1,14 @@
 use crate::parser::datafusion_sql::sqlparser::ast::{Query as SqlQuery, Statement};
-use crate::planner::{
-    DataFusionPlanArtifacts, build_datafusion_plan_artifacts_with_providers,
-    translate_datafusion_to_kionas_physical_plan_with_providers,
-};
+use crate::planner::{DataFusionPlanArtifacts, DataFusionQueryPlanner};
 use crate::providers::{KionasMetastoreResolver, KionasRelationMetadata};
 use crate::services::request_context::RequestContext;
 use crate::statement_handler::shared::distributed_dag;
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
 use deltalake::open_table_with_storage_options;
+use kionas::planner::DistributedPhysicalPlan;
 use kionas::planner::render_predicate_expr;
-use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+use kionas::planner::{PhysicalExpr, PhysicalOperator, PhysicalPlan, StageDependency};
 use kionas::planner::{distributed_from_physical_plan, validate_distributed_physical_plan};
 use kionas::sql::query_model::{
     VALIDATION_CODE_UNSUPPORTED_OPERATOR, VALIDATION_CODE_UNSUPPORTED_PIPELINE,
@@ -97,6 +95,136 @@ fn relation_key(database: &str, schema: &str, table: &str) -> String {
         schema.to_ascii_lowercase(),
         table.to_ascii_lowercase()
     )
+}
+
+/// What: Emit routing observability logs for distributed worker address selection.
+///
+/// Inputs:
+/// - `routing_source`: Runtime source used to resolve worker addresses.
+/// - `runtime_address_count`: Number of resolved runtime worker addresses.
+/// - `fallback_active`: Whether fallback routing is active for a multi-stage query.
+/// - `distributed_stage_count`: Number of distributed stages in the compiled plan.
+/// - `sql`: Original SQL text used for context in warning logs.
+///
+/// Output:
+/// - Side effect only. Emits info and warning logs for distributed routing diagnostics.
+///
+/// Details:
+/// - Emits a warning only when fallback routing is active for multi-stage plans.
+fn log_distributed_routing_observability(
+    routing_source: &str,
+    runtime_address_count: usize,
+    fallback_active: bool,
+    distributed_stage_count: usize,
+    sql: &str,
+) {
+    log::info!(
+        "query_select distributed_routing_worker_pool: source={} runtime_addresses={} fallback_active={}",
+        routing_source,
+        runtime_address_count,
+        fallback_active
+    );
+
+    if fallback_active {
+        log::warn!(
+            "query_select distributed_routing_fallback_active: stage_count={} runtime_addresses={} sql={}",
+            distributed_stage_count,
+            runtime_address_count,
+            sql
+        );
+    }
+}
+
+/// What: Attach routing observability fields to each distributed stage group.
+///
+/// Inputs:
+/// - `stage_groups`: Mutable stage groups to annotate.
+/// - `routing_source`: Runtime source used to resolve worker addresses.
+/// - `runtime_address_count`: Number of resolved runtime worker addresses.
+/// - `fallback_active`: Whether fallback routing is active for a multi-stage query.
+///
+/// Output:
+/// - Side effect only. Each stage group receives stable routing observability params.
+///
+/// Details:
+/// - Uses stable key names so downstream worker diagnostics can rely on a fixed contract.
+fn attach_distributed_routing_observability_to_stage_groups(
+    stage_groups: &mut [distributed_dag::StageTaskGroup],
+    routing_source: &str,
+    runtime_address_count: usize,
+    fallback_active: bool,
+) {
+    for group in stage_groups {
+        group.params.insert(
+            "distributed_routing_worker_source".to_string(),
+            routing_source.to_string(),
+        );
+        group.params.insert(
+            "distributed_routing_worker_count".to_string(),
+            runtime_address_count.to_string(),
+        );
+        group.params.insert(
+            "distributed_routing_fallback_active".to_string(),
+            fallback_active.to_string(),
+        );
+    }
+}
+
+struct RuntimeWorkerAddressResolution {
+    addresses: Vec<String>,
+    source: &'static str,
+}
+
+/// What: Resolve runtime worker addresses with source diagnostics for distributed routing metadata.
+///
+/// Inputs:
+/// - `shared_data`: Shared server state with registered workers and warehouses.
+///
+/// Output:
+/// - Address resolution containing deduplicated `host:port` list and selected source label.
+///
+/// Details:
+/// - Source is `workers` when worker entries are present.
+/// - Source is `warehouses` when worker entries are empty but warehouses are present.
+/// - Source is `fallback` when neither runtime source provides addresses.
+async fn resolve_runtime_worker_address_resolution(
+    shared_data: &SharedData,
+) -> RuntimeWorkerAddressResolution {
+    let shared = shared_data.lock().await;
+    let workers = shared.workers.lock().await;
+    let warehouses = shared.warehouses.lock().await;
+
+    let mut addresses = workers
+        .values()
+        .map(|entry| {
+            format!(
+                "{}:{}",
+                entry.warehouse.get_host(),
+                entry.warehouse.get_port()
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let source = if !addresses.is_empty() {
+        "workers"
+    } else {
+        addresses.extend(
+            warehouses
+                .values()
+                .map(|warehouse| format!("{}:{}", warehouse.get_host(), warehouse.get_port())),
+        );
+
+        if addresses.is_empty() {
+            "fallback"
+        } else {
+            "warehouses"
+        }
+    };
+
+    addresses.sort();
+    addresses.dedup();
+
+    RuntimeWorkerAddressResolution { addresses, source }
 }
 
 #[derive(Clone)]
@@ -203,6 +331,178 @@ fn predicate_ast_to_json(ast: &PredicateAst) -> serde_json::Value {
             "kind": "and",
             "terms": terms.iter().map(predicate_ast_to_json).collect::<Vec<_>>(),
         }),
+    }
+}
+
+/// What: Replace distributed stage dependencies with extractor-derived topology when compatible.
+///
+/// Inputs:
+/// - `plan`: Distributed plan produced from the Kionas physical plan.
+/// - `stage_extraction`: DataFusion stage extraction diagnostics from planner engine.
+///
+/// Output:
+/// - Distributed plan whose dependency edges mirror DataFusion stage extraction.
+///
+/// Details:
+/// - Applies only when extracted stage ids and stage count align with the distributed plan.
+/// - Falls back to original plan shape if any id mismatch is detected.
+fn apply_stage_extraction_topology(
+    mut plan: DistributedPhysicalPlan,
+    stage_extraction: &crate::planner::DataFusionStageExtractionDiagnostics,
+) -> DistributedPhysicalPlan {
+    if stage_extraction.stage_count != plan.stages.len() {
+        return plan;
+    }
+
+    let stage_ids = plan
+        .stages
+        .iter()
+        .map(|stage| stage.stage_id)
+        .collect::<BTreeSet<_>>();
+
+    if stage_extraction
+        .stages
+        .iter()
+        .any(|stage| !stage_ids.contains(&stage.stage_id))
+    {
+        return plan;
+    }
+
+    let extracted_partitioning_by_stage = stage_extraction
+        .stages
+        .iter()
+        .map(|stage| {
+            (
+                stage.stage_id,
+                (
+                    stage.output_partitioning.as_str(),
+                    stage.output_partitioning_keys.clone(),
+                    stage.partitions_out as u32,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for stage in &mut plan.stages {
+        if let Some((partitioning_kind, output_partitioning_keys, extracted_partitions_out)) =
+            extracted_partitioning_by_stage.get(&stage.stage_id)
+        {
+            stage.partition_spec = match *partitioning_kind {
+                "single" => kionas::planner::PartitionSpec::Single,
+                "hash" => {
+                    if !output_partitioning_keys.is_empty() {
+                        kionas::planner::PartitionSpec::Hash {
+                            keys: output_partitioning_keys.clone(),
+                        }
+                    } else {
+                        match &stage.partition_spec {
+                            kionas::planner::PartitionSpec::Hash { .. } => {
+                                stage.partition_spec.clone()
+                            }
+                            _ => kionas::planner::PartitionSpec::Hash {
+                                keys: vec!["__datafusion_hash_partition".to_string()],
+                            },
+                        }
+                    }
+                }
+                "round_robin_batch" => kionas::planner::PartitionSpec::Single,
+                _ => stage.partition_spec.clone(),
+            };
+
+            stage.output_partition_count = Some((*extracted_partitions_out).max(1));
+        }
+    }
+
+    let mut dependency_edges = BTreeSet::<(u32, u32)>::new();
+    for stage in &stage_extraction.stages {
+        for input_stage_id in &stage.input_stage_ids {
+            if !stage_ids.contains(input_stage_id) || *input_stage_id == stage.stage_id {
+                return plan;
+            }
+            dependency_edges.insert((*input_stage_id, stage.stage_id));
+        }
+    }
+
+    plan.dependencies = dependency_edges
+        .into_iter()
+        .map(|(from_stage_id, to_stage_id)| StageDependency {
+            from_stage_id,
+            to_stage_id,
+        })
+        .collect::<Vec<_>>();
+
+    plan
+}
+
+/// What: Attach distributed observability telemetry keys into stage dispatch params.
+///
+/// Inputs:
+/// - `params`: Mutable stage task params map.
+/// - `dag_metrics_json`: Serialized DAG metrics payload.
+/// - `stage_extraction_mismatch`: Whether extractor and distributed stage counts diverged.
+/// - `datafusion_stage_count`: Stage count produced by DataFusion extractor.
+/// - `distributed_stage_count`: Stage count used by distributed plan compilation.
+///
+/// Output:
+/// - Mutates `params` to include stable observability telemetry keys.
+fn attach_distributed_observability_params(
+    params: &mut HashMap<String, String>,
+    dag_metrics_json: &str,
+    stage_extraction_mismatch: bool,
+    datafusion_stage_count: usize,
+    distributed_stage_count: usize,
+) {
+    params.insert(
+        "distributed_dag_metrics_json".to_string(),
+        dag_metrics_json.to_string(),
+    );
+    params.insert(
+        "distributed_plan_validation_status".to_string(),
+        "passed".to_string(),
+    );
+    params.insert(
+        "stage_extraction_mismatch".to_string(),
+        stage_extraction_mismatch.to_string(),
+    );
+    params.insert(
+        "datafusion_stage_count".to_string(),
+        datafusion_stage_count.to_string(),
+    );
+    params.insert(
+        "distributed_stage_count".to_string(),
+        distributed_stage_count.to_string(),
+    );
+}
+
+/// What: Attach distributed observability telemetry to every compiled stage task group.
+///
+/// Inputs:
+/// - `stage_groups`: Mutable stage task groups prepared for worker dispatch.
+/// - `dag_metrics_json`: Serialized DAG metrics payload.
+/// - `stage_extraction_mismatch`: Whether extractor and distributed stage counts diverged.
+/// - `datafusion_stage_count`: Stage count produced by DataFusion extractor.
+/// - `distributed_stage_count`: Stage count used by distributed plan compilation.
+///
+/// Output:
+/// - Mutates each stage group's params to include stable observability telemetry keys.
+///
+/// Details:
+/// - Keeps telemetry insertion deterministic across all stage groups in one dispatch.
+fn attach_observability_to_stage_groups(
+    stage_groups: &mut [distributed_dag::StageTaskGroup],
+    dag_metrics_json: &str,
+    stage_extraction_mismatch: bool,
+    datafusion_stage_count: usize,
+    distributed_stage_count: usize,
+) {
+    for group in stage_groups {
+        attach_distributed_observability_params(
+            &mut group.params,
+            dag_metrics_json,
+            stage_extraction_mismatch,
+            datafusion_stage_count,
+            distributed_stage_count,
+        );
     }
 }
 
@@ -530,11 +830,11 @@ pub(crate) async fn handle_select_query(
         }
     }
 
-    let physical_plan = match translate_datafusion_to_kionas_physical_plan_with_providers(
-        &model,
-        &planner_relation_inputs,
-    )
-    .await
+    let planner = DataFusionQueryPlanner::new();
+
+    let physical_plan = match planner
+        .translate_to_kionas_plan(&model, &planner_relation_inputs)
+        .await
     {
         Ok(plan) => plan,
         Err(e) => {
@@ -547,34 +847,38 @@ pub(crate) async fn handle_select_query(
     };
     let physical_plan_text = kionas::planner::explain::explain_physical_plan(&physical_plan);
 
-    let datafusion_artifacts =
-        match build_datafusion_plan_artifacts_with_providers(&model.sql, &planner_relation_inputs)
-            .await
-        {
-            Ok(artifacts) => artifacts,
-            Err(err) => {
-                let message = err.to_string();
-                if is_relation_resolution_error(&message) {
-                    DataFusionPlanArtifacts {
-                        logical_plan_text: format!(
-                            "DataFusion logical diagnostics unavailable: {}",
-                            message
-                        ),
-                        optimized_logical_plan_text: format!(
-                            "DataFusion optimized logical diagnostics unavailable: {}",
-                            message
-                        ),
-                        physical_plan_text: physical_plan_text.clone(),
-                    }
-                } else {
-                    return format_outcome(
-                        "VALIDATION",
-                        VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
-                        format!("failed to build logical plan: {}", message),
-                    );
+    let datafusion_artifacts = match planner
+        .build_plan_artifacts(&model.sql, &planner_relation_inputs)
+        .await
+    {
+        Ok(artifacts) => artifacts,
+        Err(err) => {
+            let message = err.to_string();
+            if is_relation_resolution_error(&message) {
+                DataFusionPlanArtifacts {
+                    logical_plan_text: format!(
+                        "DataFusion logical diagnostics unavailable: {}",
+                        message
+                    ),
+                    optimized_logical_plan_text: format!(
+                        "DataFusion optimized logical diagnostics unavailable: {}",
+                        message
+                    ),
+                    physical_plan_text: physical_plan_text.clone(),
+                    stage_extraction: crate::planner::DataFusionStageExtractionDiagnostics {
+                        stage_count: 0,
+                        stages: Vec::<crate::planner::DataFusionExtractedStage>::new(),
+                    },
                 }
+            } else {
+                return format_outcome(
+                    "VALIDATION",
+                    VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+                    format!("failed to build logical plan: {}", message),
+                );
             }
-        };
+        }
+    };
 
     let physical_pipeline = physical_plan
         .operators
@@ -605,6 +909,22 @@ pub(crate) async fn handle_select_query(
             "physical_plan_text": datafusion_artifacts.physical_plan_text,
             "physical_plan_legacy_text": physical_plan_text,
             "physical_pipeline": physical_pipeline,
+            "stage_extraction": {
+                "stage_count": datafusion_artifacts.stage_extraction.stage_count,
+                "stages": datafusion_artifacts
+                    .stage_extraction
+                    .stages
+                    .iter()
+                    .map(|stage| json!({
+                        "stage_id": stage.stage_id,
+                        "input_stage_ids": stage.input_stage_ids,
+                        "partitions_out": stage.partitions_out,
+                        "output_partitioning": stage.output_partitioning,
+                        "output_partitioning_keys": stage.output_partitioning_keys,
+                        "node_names": stage.node_names,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
         },
     })
     .to_string();
@@ -642,7 +962,21 @@ pub(crate) async fn handle_select_query(
         }
     };
 
-    let distributed_plan = distributed_from_physical_plan(&physical_plan);
+    let distributed_plan = apply_stage_extraction_topology(
+        distributed_from_physical_plan(&physical_plan),
+        &datafusion_artifacts.stage_extraction,
+    );
+    let extracted_stage_count = datafusion_artifacts.stage_extraction.stage_count;
+    let distributed_stage_count = distributed_plan.stages.len();
+    let stage_extraction_mismatch = extracted_stage_count != distributed_stage_count;
+    if stage_extraction_mismatch {
+        log::warn!(
+            "query_select stage extraction mismatch: datafusion_stages={} distributed_plan_stages={} sql={} (using distributed plan shape)",
+            extracted_stage_count,
+            distributed_stage_count,
+            model.sql
+        );
+    }
     if let Err(e) = validate_distributed_physical_plan(&distributed_plan) {
         return format_outcome(
             "INFRA",
@@ -651,17 +985,55 @@ pub(crate) async fn handle_select_query(
         );
     }
 
-    let mut stage_groups =
-        match distributed_dag::compile_stage_task_groups(&distributed_plan, "query") {
-            Ok(groups) => groups,
+    let runtime_worker_resolution = resolve_runtime_worker_address_resolution(shared_data).await;
+    let runtime_worker_addresses = runtime_worker_resolution.addresses.clone();
+    let effective_routing_worker_pool =
+        distributed_dag::resolve_effective_routing_worker_pool(&runtime_worker_addresses);
+    let fallback_active =
+        runtime_worker_resolution.source == "fallback" && distributed_stage_count > 1;
+    let mut stage_groups = match distributed_dag::compile_stage_task_groups_with_worker_pool(
+        &distributed_plan,
+        "query",
+        &effective_routing_worker_pool,
+    ) {
+        Ok(groups) => groups,
+        Err(e) => {
+            return format_outcome(
+                "INFRA",
+                "WORKER_QUERY_FAILED",
+                format!("failed to compile distributed stage groups: {}", e),
+            );
+        }
+    };
+    log_distributed_routing_observability(
+        runtime_worker_resolution.source,
+        effective_routing_worker_pool.len(),
+        fallback_active,
+        distributed_stage_count,
+        model.sql.as_str(),
+    );
+    let dag_metrics =
+        match distributed_dag::compute_distributed_dag_metrics(&distributed_plan, &stage_groups) {
+            Ok(metrics) => metrics,
             Err(e) => {
                 return format_outcome(
                     "INFRA",
                     "WORKER_QUERY_FAILED",
-                    format!("failed to compile distributed stage groups: {}", e),
+                    format!("failed to compute distributed dag metrics: {}", e),
                 );
             }
         };
+    let dag_metrics_json = serde_json::to_string(&dag_metrics).unwrap_or_else(|_| {
+        "{\"error\":\"failed_to_serialize_distributed_dag_metrics\"}".to_string()
+    });
+    log::info!(
+        "query_select distributed_dag_metrics: stage_count={} dependency_count={} wave_count={} max_wave_width={} total_partitions={}",
+        dag_metrics.stage_count,
+        dag_metrics.dependency_count,
+        dag_metrics.wave_count,
+        dag_metrics.max_wave_width,
+        dag_metrics.total_partitions
+    );
 
     let mut relation_set = BTreeSet::<(String, String, String)>::new();
     relation_set.insert((database.clone(), schema.clone(), table.clone()));
@@ -790,6 +1162,19 @@ pub(crate) async fn handle_select_query(
                 .insert("relation_columns_json".to_string(), mapping_json.clone());
         }
     }
+    attach_observability_to_stage_groups(
+        &mut stage_groups,
+        dag_metrics_json.as_str(),
+        stage_extraction_mismatch,
+        extracted_stage_count,
+        distributed_stage_count,
+    );
+    attach_distributed_routing_observability_to_stage_groups(
+        &mut stage_groups,
+        runtime_worker_resolution.source,
+        effective_routing_worker_pool.len(),
+        fallback_active,
+    );
 
     let auth_scope = format!("select:{}.{}.{}", database, schema, table);
     let dispatch_auth_ctx = helpers::DispatchAuthContext {

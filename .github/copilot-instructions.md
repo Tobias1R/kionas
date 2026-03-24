@@ -128,7 +128,7 @@ If you add or change config keys:
 - All changes must degrade gracefully if system tools are unavailable
 
 ## Roadmping
-- We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files.
+- We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files. Put the matrix files in the same directory as the roadmap for easy reference and linking.
 - Each roadmap phase should have a clear scope, mandatory criteria for completion, optional hardening items, and a signoff decision process.
 - The roadmap should be updated iteratively as we progress through phases, ensuring that all relevant files and documentation are maintained in sync with the current state of the project.
 - Each phase is composed by:

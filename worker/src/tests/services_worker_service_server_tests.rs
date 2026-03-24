@@ -85,3 +85,46 @@ fn accepts_staged_query_task_with_required_context() {
 
     assert!(validate_query_task_context(&task).is_ok());
 }
+
+#[test]
+fn accepts_staged_query_task_with_zero_based_stage_id() {
+    let mut task = build_query_task();
+    task.params
+        .insert("__query_id".to_string(), "q1".to_string());
+    task.stage_id = 0;
+    task.partition_count = 2;
+    task.partition_id = 0;
+
+    assert!(validate_query_task_context(&task).is_ok());
+}
+
+#[test]
+fn accepts_legacy_query_task_without_stage_partition_context() {
+    let mut task = build_query_task();
+    task.params
+        .insert("__query_id".to_string(), "q1".to_string());
+    task.stage_id = 0;
+    task.partition_count = 0;
+    task.partition_id = 0;
+    task.upstream_stage_ids = Vec::new();
+
+    assert!(validate_query_task_context(&task).is_ok());
+}
+
+#[test]
+fn rejects_zero_based_stage_task_when_partition_index_exceeds_partition_count() {
+    let mut task = build_query_task();
+    task.params
+        .insert("__query_id".to_string(), "q1".to_string());
+    task.stage_id = 0;
+    task.partition_count = 2;
+    task.partition_id = 2;
+
+    let err = validate_query_task_context(&task)
+        .expect_err("staged zero-based task must fail when partition_id is out of range");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .starts_with("RESULT|EXECUTION|EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING|")
+    );
+}

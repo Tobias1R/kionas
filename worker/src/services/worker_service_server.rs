@@ -109,30 +109,18 @@ fn validate_query_task_context(
         )));
     }
 
-    if is_staged_query_task(task) {
-        if task.stage_id == 0 {
-            return Err(tonic::Status::failed_precondition(format_outcome(
-                "EXECUTION",
-                "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING",
-                format!(
-                    "stage_id is missing or invalid for task_id={}",
-                    task.task_id
-                )
-                .as_str(),
-            )));
-        }
-
-        if task.partition_count == 0 || task.partition_id >= task.partition_count {
-            return Err(tonic::Status::failed_precondition(format_outcome(
-                "EXECUTION",
-                "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
-                format!(
-                    "partition_index is missing or invalid for task_id={} stage_id={}",
-                    task.task_id, task.stage_id
-                )
-                .as_str(),
-            )));
-        }
+    if is_staged_query_task(task)
+        && (task.partition_count == 0 || task.partition_id >= task.partition_count)
+    {
+        return Err(tonic::Status::failed_precondition(format_outcome(
+            "EXECUTION",
+            "EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING",
+            format!(
+                "partition_index is missing or invalid for task_id={} stage_id={}",
+                task.task_id, task.stage_id
+            )
+            .as_str(),
+        )));
     }
 
     Ok(())

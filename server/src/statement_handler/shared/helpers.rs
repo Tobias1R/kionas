@@ -1,6 +1,9 @@
 use crate::warehouse::state::SharedData;
 use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::workers::PooledConn;
 use uuid::Uuid;
@@ -66,16 +69,6 @@ fn validate_query_dispatch_context(
     }
 
     if let Some(stage_metadata) = stage_metadata {
-        if stage_metadata.stage_id == 0 {
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format_outcome(
-                    "EXECUTION",
-                    "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING",
-                    "dispatch checkpoint failed: stage_id is missing or invalid",
-                ),
-            )));
-        }
         if stage_metadata.partition_count == 0
             || stage_metadata.partition_id >= stage_metadata.partition_count
         {
@@ -404,6 +397,103 @@ pub async fn run_stage_groups_for_input(
     auth_ctx: Option<&DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let shared_clone = shared_data.clone();
+    let session_id_owned = session_id.to_string();
+
+    let execute_partition: StagePartitionExecutor = Arc::new(
+        move |group, auth_ctx_cloned, timeout_secs| {
+            let shared_clone = shared_clone.clone();
+            let session_id_owned = session_id_owned.clone();
+            Box::pin(async move {
+                run_task_for_input_with_params(
+                &shared_clone,
+                &session_id_owned,
+                &group.operation,
+                group.payload.clone(),
+                group.params.clone(),
+                Some(crate::tasks::StageTaskMetadata {
+                    stage_id: group.stage_id,
+                    partition_id: group.partition_index,
+                    partition_count: group.partition_count,
+                    upstream_stage_ids: group.upstream_stage_ids.clone(),
+                    upstream_partition_counts: group.upstream_partition_counts.clone(),
+                    partition_spec: serde_json::to_string(&group.partition_spec)
+                        .unwrap_or_else(|_| "\"Single\"".to_string()),
+                    query_run_id: None,
+                    execution_mode_hint: match group.execution_mode_hint {
+                        crate::statement_handler::shared::distributed_dag::ExecutionModeHint::LocalOnly => {
+                            crate::services::worker_service_client::worker_service::ExecutionModeHint::LocalOnly
+                                as i32
+                        }
+                        crate::statement_handler::shared::distributed_dag::ExecutionModeHint::Distributed => {
+                            crate::services::worker_service_client::worker_service::ExecutionModeHint::Distributed
+                                as i32
+                        }
+                    },
+                    output_destinations: group
+                        .output_destinations
+                        .iter()
+                        .map(|destination| {
+                            crate::services::worker_service_client::worker_service::OutputDestination {
+                                downstream_stage_id: destination.downstream_stage_id,
+                                worker_addresses: destination.worker_addresses.clone(),
+                                partitioning: serde_json::to_string(&destination.partitioning)
+                                    .unwrap_or_else(|_| "\"Single\"".to_string()),
+                                downstream_partition_count: destination.downstream_partition_count,
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+                auth_ctx_cloned.as_ref(),
+                timeout_secs,
+            )
+            .await
+            })
+        },
+    );
+
+    run_stage_groups_with_partition_executor(
+        stage_groups,
+        auth_ctx,
+        timeout_secs,
+        execute_partition,
+    )
+    .await
+}
+
+type StagePartitionFuture =
+    Pin<Box<dyn Future<Output = Result<String, Box<dyn Error + Send + Sync>>> + Send>>;
+
+type StagePartitionExecutor = Arc<
+    dyn Fn(
+            crate::statement_handler::shared::distributed_dag::StageTaskGroup,
+            Option<DispatchAuthContext>,
+            u64,
+        ) -> StagePartitionFuture
+        + Send
+        + Sync,
+>;
+
+/// What: Execute distributed stage groups through an injectable partition executor.
+///
+/// Inputs:
+/// - `stage_groups`: Compiled stage groups with dependency metadata.
+/// - `auth_ctx`: Optional dispatch auth context used by query-mode execution checks.
+/// - `timeout_secs`: Per-partition execution timeout.
+/// - `execute_partition`: Async executor for one stage partition task.
+///
+/// Output:
+/// - Final stage result location when stage execution succeeds.
+/// - Error when no schedulable stage remains or a partition execution fails.
+///
+/// Details:
+/// - Used by production dispatch and in-memory tests to validate stage wave semantics.
+async fn run_stage_groups_with_partition_executor(
+    stage_groups: &[crate::statement_handler::shared::distributed_dag::StageTaskGroup],
+    auth_ctx: Option<&DispatchAuthContext>,
+    timeout_secs: u64,
+    execute_partition: StagePartitionExecutor,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     if stage_groups.is_empty() {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -480,59 +570,18 @@ pub async fn run_stage_groups_for_input(
                 expected_partition_count,
                 stage_partitions[0].upstream_stage_ids
             );
-
-            let shared_clone = shared_data.clone();
-            let session_id_owned = session_id.to_string();
             let auth_ctx_cloned = auth_ctx.cloned();
+            let execute_partition = execute_partition.clone();
 
             wave_join_set.spawn(async move {
                 let mut join_set = tokio::task::JoinSet::new();
                 for group in stage_partitions {
-                    let shared_clone = shared_clone.clone();
-                    let session_id_owned = session_id_owned.clone();
                     let auth_ctx_cloned = auth_ctx_cloned.clone();
+                    let execute_partition = execute_partition.clone();
                     join_set.spawn(async move {
-                        let partition_location = run_task_for_input_with_params(
-                            &shared_clone,
-                            &session_id_owned,
-                            &group.operation,
-                            group.payload.clone(),
-                            group.params.clone(),
-                            Some(crate::tasks::StageTaskMetadata {
-                                stage_id: group.stage_id,
-                                partition_id: group.partition_index,
-                                partition_count: group.partition_count,
-                                upstream_stage_ids: group.upstream_stage_ids.clone(),
-                                upstream_partition_counts: group.upstream_partition_counts.clone(),
-                                partition_spec: serde_json::to_string(&group.partition_spec)
-                                    .unwrap_or_else(|_| "\"Single\"".to_string()),
-                                query_run_id: None,
-                                execution_mode_hint: match group.execution_mode_hint {
-                                    crate::statement_handler::shared::distributed_dag::ExecutionModeHint::LocalOnly => {
-                                        crate::services::worker_service_client::worker_service::ExecutionModeHint::LocalOnly
-                                            as i32
-                                    }
-                                    crate::statement_handler::shared::distributed_dag::ExecutionModeHint::Distributed => {
-                                        crate::services::worker_service_client::worker_service::ExecutionModeHint::Distributed
-                                            as i32
-                                    }
-                                },
-                                output_destinations: group
-                                    .output_destinations
-                                    .iter()
-                                    .map(|destination| crate::services::worker_service_client::worker_service::OutputDestination {
-                                        downstream_stage_id: destination.downstream_stage_id,
-                                        worker_addresses: destination.worker_addresses.clone(),
-                                        partitioning: serde_json::to_string(&destination.partitioning)
-                                            .unwrap_or_else(|_| "\"Single\"".to_string()),
-                                        downstream_partition_count: destination.downstream_partition_count,
-                                    })
-                                    .collect::<Vec<_>>(),
-                            }),
-                            auth_ctx_cloned.as_ref(),
-                            timeout_secs,
-                        )
-                        .await;
+                        let partition_location =
+                            execute_partition(group.clone(), auth_ctx_cloned.clone(), timeout_secs)
+                                .await;
 
                         (group.partition_index, partition_location)
                     });

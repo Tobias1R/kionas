@@ -6,6 +6,10 @@ use kionas::planner::{
 use kionas::sql::datatypes::ColumnDatatypeSpec;
 use std::collections::HashMap;
 
+#[cfg(test)]
+#[path = "../tests/execution_planner_tests.rs"]
+mod tests;
+
 /// What: Convert protobuf scalar filter value to planner predicate value.
 ///
 /// Inputs:
@@ -580,17 +584,7 @@ pub(crate) fn stage_execution_context(
         || task.partition_count > 1
         || !task.upstream_stage_ids.is_empty();
 
-    let stage_id = if is_staged_task {
-        if task.stage_id == 0 {
-            return Err(format!(
-                "EXECUTION_WORKER_EXECUTION_STAGE_CONTEXT_MISSING: stage_id missing for task_id={}",
-                task.task_id
-            ));
-        }
-        task.stage_id
-    } else {
-        0
-    };
+    let stage_id = if is_staged_task { task.stage_id } else { 0 };
     let upstream_stage_ids = task.upstream_stage_ids.clone();
     let partition_count = if is_staged_task {
         if task.partition_count == 0 {

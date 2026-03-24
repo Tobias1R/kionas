@@ -1,4 +1,4 @@
-use crate::planner::stage_extractor::extract_stages;
+use crate::planner::stage_extractor::{StagePartitioningKind, extract_stages};
 use crate::providers::{KionasRelationMetadata, build_session_context_with_kionas_providers};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
@@ -10,6 +10,65 @@ use kionas::planner::{
 };
 use kionas::sql::query_model::SelectQueryModel;
 use std::sync::Arc;
+
+/// What: Thin server-side wrapper for DataFusion planning operations.
+///
+/// Inputs:
+/// - Optional relation providers passed per planning request.
+///
+/// Output:
+/// - Consistent entrypoints for logical/physical diagnostics and Kionas translation.
+///
+/// Details:
+/// - This wrapper consolidates planner calls used by query handlers so integration
+///   points stay explicit during Phase 2 migration.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DataFusionQueryPlanner;
+
+impl DataFusionQueryPlanner {
+    /// What: Construct a new DataFusion query planner wrapper.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Stateless planner wrapper instance.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// What: Build DataFusion planning diagnostics with relation providers.
+    ///
+    /// Inputs:
+    /// - `sql`: Canonical SQL statement.
+    /// - `relations`: Relation providers registered in DataFusion session context.
+    ///
+    /// Output:
+    /// - Logical/optimized/physical diagnostics plus stage extraction metadata.
+    pub async fn build_plan_artifacts(
+        &self,
+        sql: &str,
+        relations: &[KionasRelationMetadata],
+    ) -> Result<DataFusionPlanArtifacts, PlannerError> {
+        build_datafusion_plan_artifacts_with_providers(sql, relations).await
+    }
+
+    /// What: Translate a canonical query model to Kionas physical operators.
+    ///
+    /// Inputs:
+    /// - `model`: Canonical select query model.
+    /// - `relations`: Relation providers for DataFusion planning.
+    ///
+    /// Output:
+    /// - Kionas physical plan compatible with worker execution contract.
+    pub async fn translate_to_kionas_plan(
+        &self,
+        model: &SelectQueryModel,
+        relations: &[KionasRelationMetadata],
+    ) -> Result<PhysicalPlan, PlannerError> {
+        translate_datafusion_to_kionas_physical_plan_with_providers(model, relations).await
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PlannerIntentFlags {
@@ -39,6 +98,40 @@ pub struct DataFusionPlanArtifacts {
     pub logical_plan_text: String,
     pub optimized_logical_plan_text: String,
     pub physical_plan_text: String,
+    pub stage_extraction: DataFusionStageExtractionDiagnostics,
+}
+
+/// What: Stage extraction diagnostics derived from the DataFusion physical plan.
+///
+/// Inputs:
+/// - Output from server-side `extract_stages` traversal.
+///
+/// Output:
+/// - Deterministic stage diagnostics attached to planning artifacts.
+///
+/// Details:
+/// - This shape is consumed by query dispatch diagnostics and scheduling telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataFusionStageExtractionDiagnostics {
+    pub stage_count: usize,
+    pub stages: Vec<DataFusionExtractedStage>,
+}
+
+/// What: One extracted stage diagnostic row.
+///
+/// Inputs:
+/// - Stage metadata produced by extraction traversal.
+///
+/// Output:
+/// - Compact diagnostics record for logs and payload diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataFusionExtractedStage {
+    pub stage_id: u32,
+    pub input_stage_ids: Vec<u32>,
+    pub partitions_out: usize,
+    pub output_partitioning: String,
+    pub output_partitioning_keys: Vec<String>,
+    pub node_names: Vec<String>,
 }
 
 /// What: Build a DataFusion logical plan and return a stable text rendering.
@@ -111,11 +204,36 @@ pub async fn build_datafusion_plan_artifacts_with_providers(
         .create_physical_plan(&optimized_logical_plan)
         .await
         .map_err(|err| PlannerError::InvalidPhysicalPipeline(err.to_string()))?;
+    let extracted_stages = extract_stages(Arc::clone(&physical_plan));
+    let stage_extraction = DataFusionStageExtractionDiagnostics {
+        stage_count: extracted_stages.len(),
+        stages: extracted_stages
+            .into_iter()
+            .map(|stage| {
+                let output_partitioning = match stage.output_partitioning.kind {
+                    StagePartitioningKind::Single => "single".to_string(),
+                    StagePartitioningKind::RoundRobinBatch => "round_robin_batch".to_string(),
+                    StagePartitioningKind::Hash => "hash".to_string(),
+                    StagePartitioningKind::Unknown => "unknown".to_string(),
+                };
+
+                DataFusionExtractedStage {
+                    stage_id: stage.stage_id,
+                    input_stage_ids: stage.input_stage_ids,
+                    partitions_out: stage.partitions_out,
+                    output_partitioning,
+                    output_partitioning_keys: stage.output_partitioning.hash_keys,
+                    node_names: stage.node_names,
+                }
+            })
+            .collect::<Vec<_>>(),
+    };
 
     Ok(DataFusionPlanArtifacts {
         logical_plan_text: logical_plan.display_indent_schema().to_string(),
         optimized_logical_plan_text: optimized_logical_plan.display_indent_schema().to_string(),
         physical_plan_text: displayable(physical_plan.as_ref()).indent(true).to_string(),
+        stage_extraction,
     })
 }
 
@@ -767,24 +885,5 @@ fn build_kionas_plan_from_intent(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::is_fallback_eligible_datafusion_error;
-
-    #[test]
-    fn fallback_error_classifier_accepts_object_store_resolution_failures() {
-        let object_store_error = "Internal error: No suitable object store found for s3://warehouse/path. See RuntimeEnv::register_object_store";
-        assert!(is_fallback_eligible_datafusion_error(object_store_error));
-    }
-
-    #[test]
-    fn fallback_error_classifier_accepts_missing_table_failures() {
-        let table_missing_error = "table 'abc.schema1.table1' not found";
-        assert!(is_fallback_eligible_datafusion_error(table_missing_error));
-    }
-
-    #[test]
-    fn fallback_error_classifier_rejects_unrelated_errors() {
-        let unrelated_error = "aggregate translation mismatch: datafusion_has_aggregate=true model_has_aggregate=false";
-        assert!(!is_fallback_eligible_datafusion_error(unrelated_error));
-    }
-}
+#[path = "../tests/planner_engine_tests.rs"]
+mod tests;

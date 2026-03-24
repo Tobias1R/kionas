@@ -37,6 +37,7 @@ pub struct StageOutputPartitioning {
     pub kind: StagePartitioningKind,
     pub partition_count: usize,
     pub display: String,
+    pub hash_keys: Vec<String>,
 }
 
 /// What: Extracted stage metadata derived from DataFusion physical plan traversal.
@@ -78,6 +79,7 @@ pub fn extract_stages(root: Arc<dyn ExecutionPlan>) -> Vec<ExecutionStage> {
             kind: StagePartitioningKind::Single,
             partition_count: 1,
             display: "SinglePartition".to_string(),
+            hash_keys: Vec::new(),
         },
         node_names: Vec::new(),
     }];
@@ -166,16 +168,22 @@ fn from_datafusion_partitioning(partitioning: &Partitioning) -> StageOutputParti
             kind: StagePartitioningKind::RoundRobinBatch,
             partition_count: *count,
             display: partitioning.to_string(),
+            hash_keys: Vec::new(),
         },
-        Partitioning::Hash(_, count) => StageOutputPartitioning {
+        Partitioning::Hash(expressions, count) => StageOutputPartitioning {
             kind: StagePartitioningKind::Hash,
             partition_count: *count,
             display: partitioning.to_string(),
+            hash_keys: expressions
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
         },
         Partitioning::UnknownPartitioning(count) => StageOutputPartitioning {
             kind: StagePartitioningKind::Unknown,
             partition_count: *count,
             display: partitioning.to_string(),
+            hash_keys: Vec::new(),
         },
     }
 }

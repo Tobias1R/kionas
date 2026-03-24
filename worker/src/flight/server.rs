@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
-use crate::state::SharedData;
+use crate::execution::artifacts::persist_query_artifacts;
+use crate::state::{SharedData, WorkerInformation};
 use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -11,7 +13,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, Location, PutResult, SchemaResult, Ticket,
 };
 use bytes::Bytes;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
 use std::error::Error;
@@ -161,6 +163,265 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
 fn resolve_flight_endpoint(host: &str, default_worker_port: u32) -> String {
     let flight_port = resolve_worker_flight_port(default_worker_port);
     format!("http://{}:{}", host, flight_port)
+}
+
+/// What: Backpressure limits applied to one ingest request.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Limit bundle used by ingest stream validation.
+///
+/// Details:
+/// - Caps decoded batches and rows so a single client stream cannot exhaust worker memory.
+#[derive(Debug, Clone, Copy)]
+struct IngestBackpressureLimits {
+    max_batches: usize,
+    max_rows: usize,
+    max_wire_bytes: usize,
+}
+
+/// What: Resolve ingest backpressure limits for worker Flight streams.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Static limits used by `do_put` and `do_exchange` ingest validation.
+///
+/// Details:
+/// - Limits are intentionally conservative for now and can be made configurable later.
+fn ingest_backpressure_limits() -> IngestBackpressureLimits {
+    IngestBackpressureLimits {
+        max_batches: 128,
+        max_rows: 1_000_000,
+        max_wire_bytes: 32 * 1024 * 1024,
+    }
+}
+
+/// What: Estimate one FlightData frame wire footprint in bytes.
+///
+/// Inputs:
+/// - `frame`: Flight frame to size.
+///
+/// Output:
+/// - Approximate on-wire byte size used for request guardrails.
+///
+/// Details:
+/// - Includes descriptor cmd/path strings and body/header/app metadata payloads.
+fn flight_data_wire_size_bytes(frame: &FlightData) -> usize {
+    let mut total = 0usize;
+    total = total.saturating_add(frame.data_header.len());
+    total = total.saturating_add(frame.data_body.len());
+    total = total.saturating_add(frame.app_metadata.len());
+
+    if let Some(descriptor) = frame.flight_descriptor.as_ref() {
+        total = total.saturating_add(descriptor.cmd.len());
+        for segment in &descriptor.path {
+            total = total.saturating_add(segment.len());
+        }
+    }
+
+    total
+}
+
+/// What: Build a deterministic result location for Flight do_put ingestion.
+///
+/// Inputs:
+/// - `worker_info`: Worker metadata used for URI composition.
+/// - `session_id`: Ingest session identifier.
+/// - `task_id`: Ingest task identifier.
+///
+/// Output:
+/// - Result location URI compatible with task-scoped staging prefixes.
+fn build_ingest_result_location(
+    worker_info: &WorkerInformation,
+    session_id: &str,
+    task_id: &str,
+) -> String {
+    format!(
+        "flight://{}:{}/query/flight/{}/{}/{}",
+        worker_info.host, worker_info.port, session_id, task_id, worker_info.worker_id
+    )
+}
+
+/// What: Resolve existing task result location or create one for Flight ingestion.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state.
+/// - `session_id`: Session identifier.
+/// - `task_id`: Task identifier.
+///
+/// Output:
+/// - Existing or newly provisioned result location URI.
+async fn resolve_or_create_ingest_result_location(
+    shared_data: &SharedData,
+    session_id: &str,
+    task_id: &str,
+) -> String {
+    if let Some(existing) = shared_data
+        .get_task_result_location(session_id, task_id)
+        .await
+    {
+        return existing;
+    }
+
+    let created = build_ingest_result_location(&shared_data.worker_info, session_id, task_id);
+    shared_data
+        .set_task_result_location(session_id, task_id, &created)
+        .await;
+    created
+}
+
+/// What: Validate, decode, and persist one Flight ingest stream.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state with optional storage provider.
+/// - `request`: Streaming FlightData request.
+/// - `stream_name`: Stream label used for user-facing error messages.
+///
+/// Output:
+/// - `Ok(())` when at least one IPC record batch is decoded and persisted.
+/// - `Err(Status)` for auth, scope, decode, or persistence failures.
+async fn ingest_flight_stream(
+    shared_data: &SharedData,
+    request: Request<Streaming<FlightData>>,
+    stream_name: &str,
+) -> Result<(), Status> {
+    let stream_name_owned = stream_name.to_string();
+    let authz = crate::authz::WorkerAuthorizer::new();
+    let metadata = request.metadata().clone();
+    let mut input = request.into_inner();
+
+    let first_message = input
+        .message()
+        .await
+        .map_err(|e| {
+            Status::internal(format!(
+                "failed to read {} stream: {}",
+                stream_name_owned, e
+            ))
+        })?
+        .ok_or_else(|| {
+            Status::invalid_argument(format!("{} stream is empty", stream_name_owned))
+        })?;
+
+    let descriptor = first_message.flight_descriptor.as_ref().ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "first {} FlightData must include flight descriptor",
+            stream_name_owned
+        ))
+    })?;
+    let (session_id, task_id) = parse_descriptor_scope(descriptor)?;
+    let dispatch_ctx = dispatch_context_from_flight_metadata(&metadata, &session_id)?;
+    authz
+        .validate_dispatch_context(&dispatch_ctx)
+        .await
+        .map_err(map_tonic_status)?;
+
+    if dispatch_ctx.session_id != session_id {
+        return Err(Status::permission_denied(
+            "flight descriptor session_id does not match auth context",
+        ));
+    }
+
+    let limits = ingest_backpressure_limits();
+    let initial_wire_bytes = flight_data_wire_size_bytes(&first_message);
+    if initial_wire_bytes > limits.max_wire_bytes {
+        return Err(Status::resource_exhausted(format!(
+            "{} stream exceeded wire byte limit: max_wire_bytes={}",
+            stream_name_owned, limits.max_wire_bytes
+        )));
+    }
+
+    let stream_name_for_remaining = stream_name_owned.clone();
+    let remaining = stream::try_unfold((input, initial_wire_bytes), move |state| {
+        let (mut stream_input, accumulated_wire_bytes) = state;
+        let stream_name_for_remaining = stream_name_for_remaining.clone();
+        async move {
+            match stream_input.message().await {
+                Ok(Some(data)) => {
+                    let next_wire_bytes =
+                        accumulated_wire_bytes.saturating_add(flight_data_wire_size_bytes(&data));
+                    if next_wire_bytes > limits.max_wire_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "{} stream exceeded wire byte limit: max_wire_bytes={}",
+                            stream_name_for_remaining, limits.max_wire_bytes
+                        )));
+                    }
+                    Ok(Some((data, (stream_input, next_wire_bytes))))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(Status::internal(format!(
+                    "failed to read {} stream: {}",
+                    stream_name_for_remaining, e
+                ))),
+            }
+        }
+    });
+
+    let flight_data_stream = stream::once(async move { Ok::<FlightData, Status>(first_message) })
+        .chain(remaining)
+        .map_err(Into::into);
+
+    let mut decoder = FlightRecordBatchStream::new_from_flight_data(flight_data_stream);
+    let mut decoded_batches = Vec::<RecordBatch>::new();
+    let mut decoded_rows = 0usize;
+
+    while let Some(batch) = decoder.next().await {
+        let batch = batch.map_err(|e| {
+            Status::invalid_argument(format!(
+                "failed to decode {} FlightData stream: {}",
+                stream_name_owned, e
+            ))
+        })?;
+
+        if decoded_batches.len() >= limits.max_batches {
+            return Err(Status::resource_exhausted(format!(
+                "{} stream exceeded batch limit: max_batches={}",
+                stream_name_owned, limits.max_batches
+            )));
+        }
+
+        decoded_rows = decoded_rows.saturating_add(batch.num_rows());
+        if decoded_rows > limits.max_rows {
+            return Err(Status::resource_exhausted(format!(
+                "{} stream exceeded row limit: max_rows={}",
+                stream_name_owned, limits.max_rows
+            )));
+        }
+
+        decoded_batches.push(batch);
+    }
+
+    if decoded_batches.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{} stream must include at least one IPC record batch",
+            stream_name_owned
+        )));
+    }
+
+    let result_location =
+        resolve_or_create_ingest_result_location(shared_data, &session_id, &task_id).await;
+
+    persist_query_artifacts(
+        shared_data,
+        &result_location,
+        &session_id,
+        &task_id,
+        &decoded_batches,
+    )
+    .await
+    .map_err(|e| {
+        if e.contains("storage provider is not configured") {
+            Status::failed_precondition(e)
+        } else {
+            Status::internal(e)
+        }
+    })?;
+
+    Ok(())
 }
 
 /// What: Parse session and task identifiers from a Flight descriptor.
@@ -947,20 +1208,24 @@ impl FlightService for WorkerFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "worker Flight do_put is not implemented yet",
-        ))
+        ingest_flight_stream(&self.shared_data, request, "do_put").await?;
+
+        let output = stream::iter(vec![Ok(PutResult {
+            app_metadata: bytes::Bytes::new(),
+        })]);
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented(
-            "worker Flight do_exchange is not implemented yet",
-        ))
+        ingest_flight_stream(&self.shared_data, request, "do_exchange").await?;
+
+        let output = stream::empty::<Result<FlightData, Status>>();
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_action(

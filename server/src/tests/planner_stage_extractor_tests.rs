@@ -4,6 +4,7 @@ use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::union::UnionExec;
 use std::sync::Arc;
 
 /// What: Build a minimal empty plan node used as a deterministic leaf for extractor tests.
@@ -81,6 +82,66 @@ fn extract_stages_handles_multiple_repartition_boundaries_in_order() {
     );
 
     assert_eq!(stages[2].partitions_out, 3);
+    assert_eq!(
+        stages[2].output_partitioning.kind,
+        StagePartitioningKind::Unknown
+    );
+}
+
+#[test]
+fn extract_stages_handles_branching_plan_with_single_repartition_branch() {
+    let left: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(build_empty_plan(), Partitioning::RoundRobinBatch(5))
+            .expect("left repartition should be constructible"),
+    );
+    let right = build_empty_plan();
+    let root = UnionExec::try_new(vec![left, right]).expect("union should be constructible");
+
+    let stages = extract_stages(root);
+
+    assert_eq!(stages.len(), 2);
+    assert_eq!(stages[0].stage_id, 0);
+    assert_eq!(stages[0].input_stage_ids, vec![1]);
+    assert!(stages[0].node_names.iter().any(|name| name == "UnionExec"));
+
+    assert_eq!(stages[1].stage_id, 1);
+    assert!(stages[1].input_stage_ids.is_empty());
+    assert_eq!(stages[1].partitions_out, 5);
+    assert_eq!(
+        stages[1].output_partitioning.kind,
+        StagePartitioningKind::RoundRobinBatch
+    );
+}
+
+#[test]
+fn extract_stages_handles_branching_plan_with_two_repartition_branches() {
+    let left: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(build_empty_plan(), Partitioning::RoundRobinBatch(2))
+            .expect("left repartition should be constructible"),
+    );
+    let right: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(build_empty_plan(), Partitioning::UnknownPartitioning(7))
+            .expect("right repartition should be constructible"),
+    );
+    let root = UnionExec::try_new(vec![left, right]).expect("union should be constructible");
+
+    let stages = extract_stages(root);
+
+    assert_eq!(stages.len(), 3);
+    assert_eq!(stages[0].stage_id, 0);
+    assert_eq!(stages[0].input_stage_ids, vec![1, 2]);
+
+    assert_eq!(stages[1].stage_id, 1);
+    assert!(stages[1].input_stage_ids.is_empty());
+    assert_eq!(stages[1].partitions_out, 2);
+    assert_eq!(
+        stages[1].output_partitioning.kind,
+        StagePartitioningKind::RoundRobinBatch
+    );
+
+    assert_eq!(stages[2].stage_id, 2);
+    assert!(stages[2].input_stage_ids.is_empty());
+    assert_eq!(stages[2].partitions_out, 7);
     assert_eq!(
         stages[2].output_partitioning.kind,
         StagePartitioningKind::Unknown

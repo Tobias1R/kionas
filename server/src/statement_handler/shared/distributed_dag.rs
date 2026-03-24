@@ -1,4 +1,4 @@
-use kionas::planner::{DistributedPhysicalPlan, PartitionSpec};
+use kionas::planner::{DistributedPhysicalPlan, DistributedStage, PartitionSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -69,15 +69,42 @@ pub(crate) struct OutputDestination {
     pub(crate) downstream_partition_count: u32,
 }
 
+/// What: Aggregated observability metrics for a compiled distributed DAG.
+///
+/// Inputs:
+/// - Derived from one distributed physical plan and its compiled stage task groups.
+///
+/// Output:
+/// - Serializable metrics payload for logs, diagnostics, and task params.
+///
+/// Details:
+/// - Metrics are deterministic and computed from already materialized scheduler inputs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DistributedDagMetrics {
+    pub(crate) stage_count: usize,
+    pub(crate) dependency_count: usize,
+    pub(crate) wave_count: usize,
+    pub(crate) max_wave_width: usize,
+    pub(crate) total_task_groups: usize,
+    pub(crate) total_partitions: usize,
+    pub(crate) max_partitions_per_stage: usize,
+}
+
 /// What: Resolve partition fan-out count for one distributed stage.
 ///
 /// Inputs:
-/// - `partition_spec`: Stage output partitioning strategy.
+/// - `stage`: Distributed stage carrying partitioning strategy and optional explicit fan-out.
 ///
 /// Output:
 /// - Positive partition fan-out count used for task expansion.
-fn resolve_partition_count_for_stage(partition_spec: &PartitionSpec) -> u32 {
-    match partition_spec {
+fn resolve_partition_count_for_stage(stage: &DistributedStage) -> u32 {
+    if let Some(explicit_count) = stage.output_partition_count
+        && explicit_count > 0
+    {
+        return explicit_count;
+    }
+
+    match &stage.partition_spec {
         PartitionSpec::Single | PartitionSpec::Broadcast => 1,
         PartitionSpec::Hash { .. } => std::env::var("KIONAS_STAGE_PARTITION_FANOUT")
             .ok()
@@ -98,7 +125,7 @@ fn resolve_execution_mode_hint(plan: &DistributedPhysicalPlan) -> ExecutionModeH
         || plan
             .stages
             .iter()
-            .any(|stage| resolve_partition_count_for_stage(&stage.partition_spec) > 1)
+            .any(|stage| resolve_partition_count_for_stage(stage) > 1)
     {
         ExecutionModeHint::Distributed
     } else {
@@ -106,11 +133,134 @@ fn resolve_execution_mode_hint(plan: &DistributedPhysicalPlan) -> ExecutionModeH
     }
 }
 
+fn parse_worker_addresses(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let parsed = if trimmed.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default()
+    } else {
+        trimmed
+            .split(',')
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    let mut deduped = Vec::<String>::new();
+    for entry in parsed {
+        let normalized = entry.trim().to_string();
+        if normalized.is_empty() || deduped.iter().any(|existing| existing == &normalized) {
+            continue;
+        }
+        deduped.push(normalized);
+    }
+
+    deduped
+}
+
+/// What: Resolve worker address pool used for downstream partition routing metadata.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Non-empty worker address pool in deterministic order.
+///
+/// Details:
+/// - Uses `KIONAS_DISTRIBUTED_WORKER_ADDRESSES` when configured.
+/// - Falls back to `localhost` to preserve existing behavior.
+fn resolve_worker_address_pool() -> Vec<String> {
+    let configured = std::env::var("KIONAS_DISTRIBUTED_WORKER_ADDRESSES")
+        .ok()
+        .map(|raw| parse_worker_addresses(&raw))
+        .unwrap_or_default();
+
+    if configured.is_empty() {
+        vec!["localhost".to_string()]
+    } else {
+        configured
+    }
+}
+
+/// What: Normalize a runtime-provided worker pool for deterministic routing metadata.
+///
+/// Inputs:
+/// - `worker_pool`: Candidate worker addresses supplied by caller context.
+///
+/// Output:
+/// - Non-empty normalized worker address pool.
+///
+/// Details:
+/// - Trims entries, removes empties, deduplicates in first-seen order.
+/// - Falls back to environment/default pool when runtime input is empty.
+fn normalize_runtime_worker_pool(worker_pool: &[String]) -> Vec<String> {
+    let mut normalized = Vec::<String>::new();
+    for entry in worker_pool {
+        let candidate = entry.trim().to_string();
+        if candidate.is_empty() || normalized.iter().any(|existing| existing == &candidate) {
+            continue;
+        }
+        normalized.push(candidate);
+    }
+
+    if normalized.is_empty() {
+        resolve_worker_address_pool()
+    } else {
+        normalized
+    }
+}
+
+/// What: Resolve the effective worker pool used for downstream routing metadata.
+///
+/// Inputs:
+/// - `worker_pool`: Candidate runtime worker addresses supplied by caller context.
+///
+/// Output:
+/// - Normalized, non-empty worker pool that will be used for routing decisions.
+///
+/// Details:
+/// - Applies runtime normalization, then falls back to env/default pool when runtime input is empty.
+pub(crate) fn resolve_effective_routing_worker_pool(worker_pool: &[String]) -> Vec<String> {
+    normalize_runtime_worker_pool(worker_pool)
+}
+
+/// What: Build deterministic worker routing map for downstream partitions.
+///
+/// Inputs:
+/// - `downstream_partition_count`: Number of downstream partitions to route.
+/// - `worker_pool`: Candidate worker addresses.
+///
+/// Output:
+/// - Ordered worker addresses where index aligns with downstream partition index.
+///
+/// Details:
+/// - Applies round-robin assignment over the provided worker pool.
+fn route_downstream_partitions_to_workers(
+    downstream_partition_count: u32,
+    worker_pool: &[String],
+) -> Vec<String> {
+    let normalized_pool = if worker_pool.is_empty() {
+        vec!["localhost".to_string()]
+    } else {
+        worker_pool.to_vec()
+    };
+
+    if downstream_partition_count == 0 {
+        return Vec::new();
+    }
+
+    (0..downstream_partition_count)
+        .map(|partition_index| {
+            let worker_index = (partition_index as usize) % normalized_pool.len();
+            normalized_pool[worker_index].clone()
+        })
+        .collect::<Vec<_>>()
+}
+
 fn resolve_output_destinations(
     stage_id: u32,
     dependencies: &HashMap<u32, Vec<u32>>,
     partition_count_by_stage: &HashMap<u32, u32>,
     partition_spec_by_stage: &HashMap<u32, PartitionSpec>,
+    worker_pool: &[String],
 ) -> Vec<OutputDestination> {
     let mut downstream = dependencies.get(&stage_id).cloned().unwrap_or_default();
     downstream.sort_unstable();
@@ -126,10 +276,12 @@ fn resolve_output_destinations(
                 .get(&downstream_stage_id)
                 .cloned()
                 .unwrap_or(PartitionSpec::Single);
+            let worker_addresses =
+                route_downstream_partitions_to_workers(downstream_partition_count, worker_pool);
 
             OutputDestination {
                 downstream_stage_id,
-                worker_addresses: vec!["localhost".to_string()],
+                worker_addresses,
                 partitioning,
                 downstream_partition_count,
             }
@@ -185,6 +337,47 @@ pub(crate) fn build_stage_execution_waves(
     Ok(waves)
 }
 
+/// What: Compute observability metrics for one distributed DAG compilation result.
+///
+/// Inputs:
+/// - `plan`: Distributed physical plan graph.
+/// - `stage_groups`: Compiled stage task groups derived from `plan`.
+///
+/// Output:
+/// - Deterministic DAG metrics including dependency, wave, and partition fan-out characteristics.
+///
+/// Details:
+/// - Returns error only when stage wave derivation fails.
+pub(crate) fn compute_distributed_dag_metrics(
+    plan: &DistributedPhysicalPlan,
+    stage_groups: &[StageTaskGroup],
+) -> Result<DistributedDagMetrics, String> {
+    let waves = build_stage_execution_waves(stage_groups)?;
+    let mut partition_count_by_stage = HashMap::<u32, usize>::new();
+    for group in stage_groups {
+        partition_count_by_stage
+            .entry(group.stage_id)
+            .or_insert(group.partition_count as usize);
+    }
+
+    let max_wave_width = waves.iter().map(std::vec::Vec::len).max().unwrap_or(0);
+    let max_partitions_per_stage = partition_count_by_stage
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
+
+    Ok(DistributedDagMetrics {
+        stage_count: plan.stages.len(),
+        dependency_count: plan.dependencies.len(),
+        wave_count: waves.len(),
+        max_wave_width,
+        total_task_groups: stage_groups.len(),
+        total_partitions: partition_count_by_stage.values().sum::<usize>(),
+        max_partitions_per_stage,
+    })
+}
+
 /// What: Compile a distributed physical plan into stage task groups.
 ///
 /// Inputs:
@@ -197,9 +390,33 @@ pub(crate) fn build_stage_execution_waves(
 ///
 /// Details:
 /// - Dependencies are encoded in params as JSON for compatibility with existing string-based task params.
+#[cfg(test)]
 pub(crate) fn compile_stage_task_groups(
     plan: &DistributedPhysicalPlan,
     operation: &str,
+) -> Result<Vec<StageTaskGroup>, String> {
+    let worker_pool = resolve_worker_address_pool();
+    compile_stage_task_groups_with_worker_pool(plan, operation, &worker_pool)
+}
+
+/// What: Compile a distributed physical plan into stage task groups using an explicit worker pool.
+///
+/// Inputs:
+/// - `plan`: Distributed physical plan with stages and dependencies.
+/// - `operation`: Worker operation to execute for each stage task group.
+/// - `worker_pool`: Candidate worker addresses used for output destination routing metadata.
+///
+/// Output:
+/// - Ordered stage task groups sorted by stage id.
+/// - Error when payload serialization fails.
+///
+/// Details:
+/// - Runtime worker pools can be passed from cluster/session state.
+/// - Falls back to env/default worker pool when runtime pool is empty.
+pub(crate) fn compile_stage_task_groups_with_worker_pool(
+    plan: &DistributedPhysicalPlan,
+    operation: &str,
+    worker_pool: &[String],
 ) -> Result<Vec<StageTaskGroup>, String> {
     let mut upstream_by_stage = HashMap::<u32, Vec<u32>>::new();
     let mut downstream_by_stage = HashMap::<u32, Vec<u32>>::new();
@@ -220,14 +437,12 @@ pub(crate) fn compile_stage_task_groups(
     let mut partition_count_by_stage = HashMap::<u32, u32>::new();
     let mut partition_spec_by_stage = HashMap::<u32, PartitionSpec>::new();
     for stage in &plan.stages {
-        partition_count_by_stage.insert(
-            stage.stage_id,
-            resolve_partition_count_for_stage(&stage.partition_spec),
-        );
+        partition_count_by_stage.insert(stage.stage_id, resolve_partition_count_for_stage(stage));
         partition_spec_by_stage.insert(stage.stage_id, stage.partition_spec.clone());
     }
 
     let execution_mode_hint = resolve_execution_mode_hint(plan);
+    let normalized_worker_pool = resolve_effective_routing_worker_pool(worker_pool);
 
     let mut groups = Vec::with_capacity(plan.stages.len());
     for stage in &plan.stages {
@@ -257,6 +472,7 @@ pub(crate) fn compile_stage_task_groups(
             &downstream_by_stage,
             &partition_count_by_stage,
             &partition_spec_by_stage,
+            &normalized_worker_pool,
         );
         for partition_index in 0..partition_count {
             let params = HashMap::new();

@@ -2,7 +2,7 @@
 ## DataFusion Full Migration + Distributed Streaming Architecture
 
 **Date**: March 23, 2026  
-**Status**: Planning (Revised Architecture)  
+**Status**: Execution In Progress (Validation + Integration Slices Active)  
 **Focus**: Unified roadmap combining DataFusion ExecutionPlan + Stage Extraction + Worker-to-Worker Streaming
 
 ---
@@ -68,6 +68,51 @@ Result: Multi-worker parallelism + pipelined execution
 
 ## Implementation Phases (Revised)
 
+## Phase Progress Snapshot (Current)
+
+| Workstream | Status | Evidence | Notes |
+|---|---|---|---|
+| Phase 2a.1 Server-Side DataFusion Integration | In Progress | [server/src/planner/engine.rs](server/src/planner/engine.rs), [server/src/statement_handler/query/select.rs](server/src/statement_handler/query/select.rs), [server/src/tests/planner_engine_tests.rs](server/src/tests/planner_engine_tests.rs) | DataFusionQueryPlanner wrapper introduced and wired into select handling; artifact and translation parity tests now cover wrapper equivalence with direct planner functions. |
+| Phase 2a.2 Integrate Phase 1 Extraction into DataFusion Path | In Progress | [server/src/tests/planner_engine_tests.rs](server/src/tests/planner_engine_tests.rs), [server/src/tests/statement_handler_query_select_tests.rs](server/src/tests/statement_handler_query_select_tests.rs) | Graph consistency, partitioning metadata integrity, and topology fallback safety tests added. |
+| Phase 2b.1 Worker Flight Server + Client | In Progress | [worker/src/flight/server.rs](worker/src/flight/server.rs), [worker/src/tests/flight_server_tests.rs](worker/src/tests/flight_server_tests.rs), [flight_proxy/src/main.rs](flight_proxy/src/main.rs) | worker do_put/do_exchange now share validated ingest flow, proxy do_put/do_exchange now forward request streams and upstream responses to worker endpoints using descriptor worker scope routing, and proxy stream-validation tests now cover empty/missing-descriptor request rejection paths. |
+| Phase 2b.2 RecordBatch <-> Arrow IPC Conversion | In Progress | [worker/src/flight/server.rs](worker/src/flight/server.rs), [worker/src/tests/flight_server_tests.rs](worker/src/tests/flight_server_tests.rs) | do_put and do_exchange decode Flight IPC payloads into RecordBatch values, reject malformed or descriptor-only streams, and persist parquet+metadata sidecars. |
+| Phase 2b.3 Stage Partition Execution + Typed Contract Validation | In Progress | [worker/src/services/worker_service_server.rs](worker/src/services/worker_service_server.rs), [worker/src/execution/planner.rs](worker/src/execution/planner.rs), [worker/src/tests/services_worker_service_server_tests.rs](worker/src/tests/services_worker_service_server_tests.rs), [worker/src/tests/execution_planner_tests.rs](worker/src/tests/execution_planner_tests.rs), [worker/src/tests/execution_query_tests.rs](worker/src/tests/execution_query_tests.rs) | Zero-based stage-id acceptance fixed and mixed legacy/staged contract detection tests added. |
+| Phase 2b.4 Backpressure & Flow Control | In Progress | [worker/src/flight/server.rs](worker/src/flight/server.rs), [worker/src/tests/flight_server_tests.rs](worker/src/tests/flight_server_tests.rs) | Worker Flight ingest now enforces per-request decoded batch/row limits plus aggregate wire-byte limits and returns `ResourceExhausted` when streams exceed limits; do_put/do_exchange regression tests cover both batch-limit and wire-byte-limit enforcement. |
+| Phase 2c.1 Partition Routing Logic | In Progress | [server/src/statement_handler/shared/distributed_dag.rs](server/src/statement_handler/shared/distributed_dag.rs), [server/src/statement_handler/query/select.rs](server/src/statement_handler/query/select.rs), [server/src/tests/statement_handler_shared_distributed_dag_tests.rs](server/src/tests/statement_handler_shared_distributed_dag_tests.rs) | Distributed DAG compilation now emits deterministic downstream partition-to-worker routing metadata (round-robin worker assignment over configured worker pool) with explicit unit tests for routing/fallback behavior and output-destination worker-address cardinality/order guarantees per downstream partition count; routing now consumes runtime worker addresses from shared state (workers first, warehouses fallback), falls back to CSV/JSON env parsing with deterministic deduplication when runtime pool is unavailable, emits routing-source diagnostics (`workers`/`warehouses`/`fallback`) in dispatch logs and stage params, includes a low-noise `fallback_active` marker in logs/params, and warns when fallback routing is active for multi-stage distributed plans. |
+| Phase 2c.2 Multi-Worker Partition Distribution | In Progress | [worker/src/execution/pipeline.rs](worker/src/execution/pipeline.rs), [worker/src/tests/execution_pipeline_tests.rs](worker/src/tests/execution_pipeline_tests.rs) | Worker exchange-input loading now supports many-to-one upstream-to-downstream partition assignment via deterministic modulo mapping when upstream fanout exceeds downstream fanout, while retaining one-to-one behavior for compatible fanouts; tests cover mapping helpers, persisted-artifact load-path validation, and cross-partition completeness/no-overlap guarantees across downstream partitions. |
+| Phase 2d.1 Full Pipeline + Contract + Upgrade Validation | In Progress | [server/src/tests/statement_handler_shared_helpers_tests.rs](server/src/tests/statement_handler_shared_helpers_tests.rs) | Added mixed-version fail-fast and post-upgrade success scheduler-path tests. |
+| Phase 2d.2 Performance Benchmarking | Not Started | N/A | Benchmarking work has not started in this sequence. |
+| Phase 2d.3 Telemetry Key Validation | In Progress | [server/src/tests/statement_handler_query_select_tests.rs](server/src/tests/statement_handler_query_select_tests.rs), [server/src/tests/statement_handler_shared_helpers_tests.rs](server/src/tests/statement_handler_shared_helpers_tests.rs) | Telemetry key presence validated in helper and scheduler execution paths. |
+| Phase 2d.4 Documentation & Deployment | Not Started | N/A | Pending implementation completion before deployment docs signoff. |
+
+### Current Gate Summary
+
+- Completed in this execution sequence:
+  - Worker zero-based stage-id contract fix and regression coverage.
+  - Scheduler mixed-version upgrade-path validation tests.
+  - Telemetry key propagation validation tests.
+  - DataFusion stage extraction integration safety tests.
+  - Worker Flight do_put scaffolding implemented with auth/descriptors, IPC decode validation, and task-scoped parquet+metadata persistence.
+  - Worker Flight ingest backpressure guards added (decoded batch/row limits + wire-byte limits) with ResourceExhausted coverage tests for do_put and do_exchange.
+  - Server distributed DAG routing metadata now includes deterministic downstream partition-to-worker assignments for partition fanout.
+  - Server routing contract tests now assert output destination worker-address vectors align with downstream partition counts and deterministic ordering.
+  - Server routing now prefers runtime worker pools from shared state (workers then warehouses) and retains CSV/JSON env parsing with deterministic deduplication as fallback.
+  - Server query dispatch now records routing source/worker count plus `fallback_active` metadata on staged task params, and warns when distributed execution relies on fallback routing.
+  - Server routing observability emission is now centralized through dedicated helper paths to keep distributed routing logs and staged params contract-consistent.
+  - Server routing worker-count observability now reports the effective pool used for DAG routing (runtime or env/default fallback), avoiding runtime-only undercount when fallback pool is selected.
+  - Worker exchange-input routing now applies deterministic downstream partition selection across upstream exchange artifacts for multi-partition stage fanout.
+  - Worker many-to-one exchange distribution is validated through persisted artifact reads in pipeline tests (not helper-only selection), including downstream-partition completeness and no-overlap coverage.
+- Remaining critical path (in order):
+  - 2a.1 implementation
+  - 2b.1-2b.4 transport layer hardening completion
+  - 2c end-to-end multi-worker distribution validation and hardening
+  - 2d.2 performance validation and 2d.4 deployment runbook completion
+- Quality gate note:
+  - `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings` are being executed per slice.
+  - `cargo test` and `cargo check` may be constrained by local execution policy in this environment.
+
+---
+
 ### Phase 0: Prerequisites (Completed in Phase 1)
 
 **Must complete before Phase 2 begins**:
@@ -104,36 +149,23 @@ Result: Multi-worker parallelism + pipelined execution
 
 ---
 
-#### Workstream 2a.2: Stage Extraction Algorithm (Weeks 2-3)
+#### Workstream 2a.2: Integrate Phase 1 Stage Extraction into DataFusion Planner (Weeks 2-3)
+
+**Note**: Stage extraction, task model, and mapping infrastructure are **already complete from Phase 1** ([server/src/planner/stage_extractor.rs](server/src/planner/stage_extractor.rs), [server/src/tasks/mod.rs](server/src/tasks/mod.rs), [server/src/statement_handler/shared/distributed_dag.rs](server/src/statement_handler/shared/distributed_dag.rs)). This workstream integrates existing components into the DataFusion planner path.
 
 **Tasks**:
-1. **A2.1**: Implement RepartitionExec traversal logic (2d)
-2. **A2.2**: Build ExecutionStage struct + extract_stages() function (2d)
-3. **A2.3**: Handle edge cases (single-stage plans, multiple repartitions) (1d)
-4. **A2.4**: Unit tests for stage extraction (1.5d)
+1. **A2.1**: Verify RepartitionExec extraction works with DataFusion-generated plans (1d)
+2. **A2.2**: Wire stage extraction into DataFusion planner output path (1.5d)
+3. **A2.3**: Validate task model compatibility with DataFusion ExecutionPlan serialization (1d)
+4. **A2.4**: Integration tests (DataFusion query → stages → tasks) (1d)
 
 **Deliverable**:
-- Stage extraction algorithm proven on test plans
-- ExecutionStage structure finalized
-- Ready for server integration
+- DataFusion planner output feeds directly into existing stage extraction pipeline
+- Task generation uses existing typed metadata model
+- No reimplementation; integration only
 
-**Risk**: Incorrect stage boundaries → execution failures  
-**Mitigation**: Comprehensive unit tests; validate on known-good plans
-
----
-
-#### Workstream 2a.3: Task Generation with Mapping (Week 3-4)
-
-**Tasks**:
-1. **A3.1**: Extend Task model with stage_id, output_destinations, input_connections (1d)
-2. **A3.2**: Implement server-side partition mapping calculation (2d)
-3. **A3.3**: Task serialization (bincode) (0.5d)
-4. **A3.4**: Integration tests (query → stages → tasks) (1d)
-
-**Deliverable**:
-- Server generates full task pipeline per query
-- Each task knows where output goes
-- Ready for worker deployment
+**Risk**: DataFusion plan structure incompatible with RepartitionExec extraction assumptions  
+**Mitigation**: Early integration testing; validate on suite of DataFusion query plans
 
 ---
 
@@ -176,21 +208,25 @@ Result: Multi-worker parallelism + pipelined execution
 
 ---
 
-#### Workstream 2b.3: Stage Partition Execution (Weeks 2-3)
+#### Workstream 2b.3: Stage Partition Execution + Typed Contract Validation (Weeks 2-3)
 
 **Tasks**:
 1. **B3.1**: Deserialize ExecutionPlan from task.execution_plan bytes (1d)
 2. **B3.2**: Execute stage partition locally (DataFrame execution) (2d)
 3. **B3.3**: Stream results to output_destinations via Flight (1.5d)
-4. **B3.4**: Tests (single-stage, multi-partition) (1d)
+4. **B3.4**: Validate typed stage partition contract: stage_id + partition_id + output_destinations correct (1d)
+5. **B3.5**: Tests (single-stage, multi-partition) + contract validation scenarios (1.5d)
 
 **Deliverable**:
-- Workers execute individual stage partitions
+- Workers execute individual stage partitions with correct typed metadata
 - Results streamed via Flight
+- Stage partition contract validation proves typed metadata flows correctly end-to-end
 - No S3 materialization for inter-stage data
 
-**Risk**: Performance regression vs. current model  
-**Mitigation**: Profile early; optimize hot paths (batch size tuning)
+**Note**: Task B3.4 ensures workers correctly interpret StagePartitionExecution contract from Phase 1; critical for upgrade path safety.
+
+**Risk**: Performance regression vs. current model; typed contract misinterpretation  
+**Mitigation**: Profile early; optimize hot paths (batch size tuning); comprehensive contract validation tests
 
 ---
 
@@ -250,18 +286,24 @@ Result: Multi-worker parallelism + pipelined execution
 
 **Goal**: Prove all components work together; validate correctness + performance.
 
-#### Workstream 2d.1: Full Pipeline Testing (Week 1)
+#### Workstream 2d.1: Full Pipeline Testing + Contract & Upgrade Validation (Week 1-2)
 
 **Tasks**:
 1. **D1.1**: End-to-end test: Scan → RepartitionExec → Join → Aggregate (2d)
 2. **D1.2**: Validate result correctness (byte-for-byte vs. local execution) (1d)
 3. **D1.3**: Test with 4 workers, 3 stages (1d)
 4. **D1.4**: Chaos testing (worker failure mid-stream) (1d)
+5. **D1.5**: **Breaking-change contract validation**: Verify typed stage metadata (stage_id, partition_id, output_destinations) flows correctly across server→worker dispatch; assert Stage ID 0 accepted (regression test from Phase 1 fix) (1d)
+6. **D1.6**: **Upgrade sequence testing**: Validate mixed-version scenarios during cluster upgrade (server upgraded first, worker follows); confirm stage contract compatibility during transition (1d)
 
 **Deliverable**:
 - All existing query patterns execute correctly
 - Results byte-identical to monolithic execution
 - Partial failure recovery works
+- Breaking-change contract validated end-to-end
+- Upgrade path proven safe for staged server→worker transition
+
+**Note**: Tasks D1.5 and D1.6 map directly to Phase 1 outcome requirements (outcome file §Post-upgrade Validation, §Binary Upgrade Order, §Compatibility Expectations).
 
 ---
 
@@ -281,18 +323,39 @@ Result: Multi-worker parallelism + pipelined execution
 
 ---
 
-#### Workstream 2d.3: Documentation & Deployment (Week 2-3)
+#### Workstream 2d.3: Telemetry Key Validation (Week 2)
 
 **Tasks**:
-1. **D3.1**: Architecture documentation (stage extraction + routing) (1d)
-2. **D3.2**: Operational runbook (how to scale workers; partition assignment) (0.5d)
-3. **D3.3**: Deployment strategy (preview → canary → full rollout) (0.5d)
-4. **D3.4**: Team training + knowledge transfer (1d)
+1. **D3.1**: Verify all Phase 1 telemetry keys are emitted during dispatch (1d)
+   - `distributed_dag_metrics_json` (DAG metrics)
+   - `distributed_plan_validation_status` (planner validation flags)
+   - `stage_extraction_mismatch` (extraction diagnostic)
+   - `datafusion_stage_count` (count from DataFusion planner)
+   - `distributed_stage_count` (count from distributed scheduler)
+2. **D3.2**: Validate telemetry is observable in stage params on all dispatched tasks (1d)
+3. **D3.3**: Test telemetry completeness across query types (1-3 stages, various partitioning) (0.5d)
+
+**Deliverable**:
+- All Phase 1 telemetry keys present and correctly transmitted
+- Operator can validate cluster upgrade using telemetry (proof of Phase 1 outcome signoff requirements)
+
+**Note**: Directly fulfills Phase 1 outcome requirement: "Verify dispatch telemetry keys exist on stage params" (outcome file §Post-upgrade Validation).
+
+---
+
+#### Workstream 2d.4: Documentation & Deployment (Week 2-3)
+
+**Tasks**:
+1. **D4.1**: Architecture documentation (stage extraction + routing) (1d)
+2. **D4.2**: Operational runbook (how to scale workers; partition assignment; upgrade path reference) (0.5d)
+3. **D4.3**: Deployment strategy (preview → canary → full rollout; link to Phase 1 outcome upgrade path) (0.5d)
+4. **D4.4**: Team training + knowledge transfer (1d)
 
 **Deliverable**:
 - Ready for production deployment
 - Team trained
 - Monitoring in place
+- Upgrade path documented and linked to Phase 1 outcome file
 
 ---
 
@@ -302,11 +365,11 @@ Result: Multi-worker parallelism + pipelined execution
 Phase 0 (Prerequisite - Phase 1):
 └─ Control plane foundation complete (stage extraction + DAG scheduler + task model, 3-4 weeks)
 
-Phase 2a: DataFusion + Stage Extraction
+Phase 2a: DataFusion + Planner Integration (Reduced Scope - Integration Only)
 ├─ 2a.1: Server planner integration (2 weeks, 6-7d)
-├─ 2a.2: Stage extraction algorithm (2 weeks, 6-7d)
-└─ 2a.3: Task generation with mapping (1 week, 4-5d)
-Total: 3-4 weeks
+└─ 2a.2: Integrate Phase 1 extraction into DataFusion path (1.5 weeks, 4-5d)
+         [Stage extraction, task model, mapping complete from Phase 1]
+Total: 2-2.5 weeks (Reduced from 3-4 weeks; Phase 1 prerequisites met)
 
 Phase 2b: Arrow Flight Streaming (4 workers in parallel, 3-4 weeks)
 ├─ 2b.1: Flight server/client (2 weeks, 6-7d)
@@ -321,15 +384,19 @@ Phase 2c: Partition Routing (2-3 weeks)
 Total: 2-3 weeks
 
 Phase 2d: Integration + Validation (2-3 weeks)
-├─ 2d.1: End-to-end testing (1 week, 5-6d)
+├─ 2d.1: End-to-end testing + contract + upgrade validation (1-2 weeks, 6-8d)
 ├─ 2d.2: Performance benchmarking (1-2 weeks, 4-5d)
-└─ 2d.3: Documentation (1 week, 2-3d)
+├─ 2d.3: Telemetry key validation (1 week, 2-3d)
+└─ 2d.4: Documentation (1 week, 2-3d)
 Total: 2-3 weeks
 
-GRAND TOTAL: 10-14 weeks (~25-28 person-days across 4-5 engineers)
+GRAND TOTAL: 9-12.5 weeks (~23-28 person-days across 4-5 engineers)
+[Reduced from original 10-14 weeks due to Phase 1 prerequisite completion]
 ```
 
 **Critical Path**: 2a → 2b → 2c → 2d (sequential; constrained by dependencies)
+
+**Phase 1 Alignment Note**: Phase 2a is now **integration-focused** (not re-implementation) since stage extraction, task model, and mapping infrastructure are complete from Phase 1. Phase 2d is **expanded to validate Phase 1 outcome requirements**: contract semantics validation (stage_id=0 acceptance), upgrade safety (mixed-version server→worker transitions), and telemetry key presence. This ensures Phase 2 delivery satisfies operator signoff criteria from the breaking-changes outcome document.
 
 ---
 
@@ -342,7 +409,7 @@ GRAND TOTAL: 10-14 weeks (~25-28 person-days across 4-5 engineers)
 | **Data transport** | S3 (full materialization) | Arrow Flight (streaming) |
 | **Partitioning** | Not needed (single worker) | Critical (Hash, RoundRobin, etc.) |
 | **Latency** | Cumulative (T0 + T1 + T2) | Pipelined (overlap) |
-| **Effort** | ~10 weeks | ~12-14 weeks (+2-4 weeks for complexity) |
+| **Effort** | ~10 weeks | ~9-12.5 weeks (Phase 1 prerequisites reduce scope) |
 | **Complexity** | Medium | High (networking, coordination) |
 | **Scalability** | Limited (1 worker) | Unlimited (N workers) |
 
@@ -360,7 +427,10 @@ GRAND TOTAL: 10-14 weeks (~25-28 person-days across 4-5 engineers)
 4. ✅ **Partition Mapping**: Hash/RoundRobin partitioning distributes rows correctly across downstream partitions
 5. ✅ **Performance**: Latency ≥ baseline (target: 15-30% improvement); memory usage reduced
 6. ✅ **Fault Handling**: Worker death mid-stream handled gracefully (query fails fast, no hang)
-7. ✅ **Code Quality**: Complexity < 25; clippy clean; comprehensive test coverage
+7. ✅ **Breaking-Change Contract**: Typed stage partition metadata (stage_id, partition_id, output_destinations) flows correctly end-to-end; Stage ID 0 accepted (no regression)
+8. ✅ **Upgrade Path Validation**: Mixed-version (server upgraded first, then workers) scenarios tested; stage contract compatibility proven during transition
+9. ✅ **Telemetry Keys**: All Phase 1 telemetry keys present in dispatched stage params (distributed_dag_metrics_json, distributed_plan_validation_status, stage_extraction_mismatch, datafusion_stage_count, distributed_stage_count)
+10. ✅ **Code Quality**: Complexity < 25; clippy clean; comprehensive test coverage
 
 ### Optional (Hardening)
 

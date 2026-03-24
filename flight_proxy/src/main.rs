@@ -150,7 +150,12 @@ fn decode_internal_ticket(ticket_raw: &[u8]) -> Result<(String, String, String),
 ///
 /// Details:
 /// - Uses container DNS host = worker id and configured worker Flight port.
+/// - If worker scope already contains `host:port`, it is treated as an explicit endpoint host.
 fn resolve_worker_flight_endpoint(worker_id: &str) -> String {
+    if worker_id.contains(':') {
+        return format!("http://{}", worker_id);
+    }
+
     let port = resolve_worker_flight_port();
     format!("http://{}:{}", worker_id, port)
 }
@@ -364,20 +369,180 @@ impl FlightService for ProxyFlightService {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "flight proxy do_put is not implemented yet",
-        ))
+        let metadata = request.metadata().clone();
+        let mut inbound = request.into_inner();
+
+        let first = inbound
+            .message()
+            .await
+            .map_err(|e| {
+                Status::internal(format_outcome(
+                    "INFRA",
+                    "INFRA_FLIGHT_PROXY_STREAM_READ_FAILED",
+                    format!("failed to read do_put stream: {}", e).as_str(),
+                ))
+            })?
+            .ok_or_else(|| {
+                Status::invalid_argument(format_outcome(
+                    "VALIDATION",
+                    "VALIDATION_FLIGHT_PROXY_STREAM_EMPTY",
+                    "do_put stream is empty",
+                ))
+            })?;
+
+        let descriptor = first.flight_descriptor.as_ref().ok_or_else(|| {
+            Status::invalid_argument(format_outcome(
+                "VALIDATION",
+                "VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING",
+                "first do_put FlightData must include descriptor with worker scope",
+            ))
+        })?;
+        let worker_id = parse_descriptor_worker_scope(descriptor)?;
+
+        let worker_endpoint = resolve_worker_flight_endpoint(&worker_id);
+        let channel = tonic14::transport::Endpoint::from_shared(worker_endpoint.clone())
+            .map_err(|e| Status::invalid_argument(format!("invalid worker endpoint: {}", e)))?
+            .connect()
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "failed to connect to worker Flight endpoint {}: {}",
+                    worker_endpoint, e
+                ))
+            })?;
+
+        let mut payloads = vec![first];
+        while let Some(data) = inbound.message().await.map_err(|e| {
+            Status::internal(format_outcome(
+                "INFRA",
+                "INFRA_FLIGHT_PROXY_STREAM_READ_FAILED",
+                format!("failed to read do_put stream: {}", e).as_str(),
+            ))
+        })? {
+            payloads.push(data);
+        }
+
+        let mut client = FlightServiceClient::new(channel);
+        let mut upstream_request = Request::new(stream::iter(payloads));
+        for key in [
+            "authorization",
+            "session_id",
+            "rbac_user",
+            "rbac_role",
+            "auth_scope",
+            "query_id",
+        ] {
+            if let Some(value) = metadata.get(key) {
+                upstream_request.metadata_mut().insert(key, value.clone());
+            }
+        }
+
+        let upstream = client
+            .do_put(upstream_request)
+            .await
+            .map_err(|e| map_upstream_status(e, "worker DoPut failed"))?
+            .into_inner();
+
+        let output = futures::stream::try_unfold(upstream, |mut stream| async move {
+            match stream.message().await {
+                Ok(Some(result)) => Ok(Some((result, stream))),
+                Ok(None) => Ok(None),
+                Err(status) => Err(status),
+            }
+        });
+
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented(
-            "flight proxy do_exchange is not implemented yet",
-        ))
+        let metadata = request.metadata().clone();
+        let mut inbound = request.into_inner();
+
+        let first = inbound
+            .message()
+            .await
+            .map_err(|e| {
+                Status::internal(format_outcome(
+                    "INFRA",
+                    "INFRA_FLIGHT_PROXY_STREAM_READ_FAILED",
+                    format!("failed to read do_exchange stream: {}", e).as_str(),
+                ))
+            })?
+            .ok_or_else(|| {
+                Status::invalid_argument(format_outcome(
+                    "VALIDATION",
+                    "VALIDATION_FLIGHT_PROXY_STREAM_EMPTY",
+                    "do_exchange stream is empty",
+                ))
+            })?;
+
+        let descriptor = first.flight_descriptor.as_ref().ok_or_else(|| {
+            Status::invalid_argument(format_outcome(
+                "VALIDATION",
+                "VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING",
+                "first do_exchange FlightData must include descriptor with worker scope",
+            ))
+        })?;
+        let worker_id = parse_descriptor_worker_scope(descriptor)?;
+
+        let worker_endpoint = resolve_worker_flight_endpoint(&worker_id);
+        let channel = tonic14::transport::Endpoint::from_shared(worker_endpoint.clone())
+            .map_err(|e| Status::invalid_argument(format!("invalid worker endpoint: {}", e)))?
+            .connect()
+            .await
+            .map_err(|e| {
+                Status::unavailable(format!(
+                    "failed to connect to worker Flight endpoint {}: {}",
+                    worker_endpoint, e
+                ))
+            })?;
+
+        let mut payloads = vec![first];
+        while let Some(data) = inbound.message().await.map_err(|e| {
+            Status::internal(format_outcome(
+                "INFRA",
+                "INFRA_FLIGHT_PROXY_STREAM_READ_FAILED",
+                format!("failed to read do_exchange stream: {}", e).as_str(),
+            ))
+        })? {
+            payloads.push(data);
+        }
+
+        let mut client = FlightServiceClient::new(channel);
+        let mut upstream_request = Request::new(stream::iter(payloads));
+        for key in [
+            "authorization",
+            "session_id",
+            "rbac_user",
+            "rbac_role",
+            "auth_scope",
+            "query_id",
+        ] {
+            if let Some(value) = metadata.get(key) {
+                upstream_request.metadata_mut().insert(key, value.clone());
+            }
+        }
+
+        let upstream = client
+            .do_exchange(upstream_request)
+            .await
+            .map_err(|e| map_upstream_status(e, "worker DoExchange failed"))?
+            .into_inner();
+
+        let output = futures::stream::try_unfold(upstream, |mut stream| async move {
+            match stream.message().await {
+                Ok(Some(data)) => Ok(Some((data, stream))),
+                Ok(None) => Ok(None),
+                Err(status) => Err(status),
+            }
+        });
+
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_action(
@@ -419,8 +584,203 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 #[cfg(test)]
 mod tests {
     use super::{map_upstream_status, parse_descriptor_worker_scope};
-    use arrow_flight::FlightDescriptor;
+    use arrow_flight::flight_service_client::FlightServiceClient;
+    use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+    use arrow_flight::{
+        Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
+        HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
+    };
+    use futures::{Stream, stream};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic14::{Code, Status};
+    use tonic14::{Request, Response, Streaming, transport::Channel};
+
+    type TestFlightStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+    #[derive(Clone)]
+    struct StubWorkerFlightService {
+        do_put_calls: Arc<AtomicUsize>,
+        do_exchange_calls: Arc<AtomicUsize>,
+    }
+
+    #[tonic14::async_trait]
+    impl FlightService for StubWorkerFlightService {
+        type HandshakeStream = TestFlightStream<HandshakeResponse>;
+        type ListFlightsStream = TestFlightStream<FlightInfo>;
+        type DoGetStream = TestFlightStream<FlightData>;
+        type DoPutStream = TestFlightStream<PutResult>;
+        type DoExchangeStream = TestFlightStream<FlightData>;
+        type DoActionStream = TestFlightStream<arrow_flight::Result>;
+        type ListActionsStream = TestFlightStream<ActionType>;
+
+        async fn handshake(
+            &self,
+            _request: Request<Streaming<HandshakeRequest>>,
+        ) -> Result<Response<Self::HandshakeStream>, Status> {
+            Err(Status::unimplemented("stub handshake not implemented"))
+        }
+
+        async fn list_flights(
+            &self,
+            _request: Request<Criteria>,
+        ) -> Result<Response<Self::ListFlightsStream>, Status> {
+            Ok(Response::new(Box::pin(stream::empty())))
+        }
+
+        async fn get_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<FlightInfo>, Status> {
+            Err(Status::unimplemented(
+                "stub get_flight_info not implemented",
+            ))
+        }
+
+        async fn poll_flight_info(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<arrow_flight::PollInfo>, Status> {
+            Err(Status::unimplemented(
+                "stub poll_flight_info not implemented",
+            ))
+        }
+
+        async fn get_schema(
+            &self,
+            _request: Request<FlightDescriptor>,
+        ) -> Result<Response<SchemaResult>, Status> {
+            Err(Status::unimplemented("stub get_schema not implemented"))
+        }
+
+        async fn do_get(
+            &self,
+            _request: Request<Ticket>,
+        ) -> Result<Response<Self::DoGetStream>, Status> {
+            Err(Status::unimplemented("stub do_get not implemented"))
+        }
+
+        async fn do_put(
+            &self,
+            request: Request<Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoPutStream>, Status> {
+            self.do_put_calls.fetch_add(1, Ordering::SeqCst);
+            let mut inbound = request.into_inner();
+            let mut frame_count = 0usize;
+            while inbound
+                .message()
+                .await
+                .map_err(|e| Status::internal(format!("stub do_put read failed: {}", e)))?
+                .is_some()
+            {
+                frame_count += 1;
+            }
+
+            if frame_count == 0 {
+                return Err(Status::invalid_argument(
+                    "stub worker received empty do_put",
+                ));
+            }
+
+            let output = stream::iter(vec![Ok(PutResult {
+                app_metadata: Default::default(),
+            })]);
+            Ok(Response::new(Box::pin(output)))
+        }
+
+        async fn do_exchange(
+            &self,
+            request: Request<Streaming<FlightData>>,
+        ) -> Result<Response<Self::DoExchangeStream>, Status> {
+            self.do_exchange_calls.fetch_add(1, Ordering::SeqCst);
+            let mut inbound = request.into_inner();
+            let mut frame_count = 0usize;
+            while inbound
+                .message()
+                .await
+                .map_err(|e| Status::internal(format!("stub do_exchange read failed: {}", e)))?
+                .is_some()
+            {
+                frame_count += 1;
+            }
+
+            if frame_count == 0 {
+                return Err(Status::invalid_argument(
+                    "stub worker received empty do_exchange",
+                ));
+            }
+
+            let output = stream::iter(vec![Ok(FlightData {
+                app_metadata: Default::default(),
+                ..Default::default()
+            })]);
+            Ok(Response::new(Box::pin(output)))
+        }
+
+        async fn do_action(
+            &self,
+            _request: Request<Action>,
+        ) -> Result<Response<Self::DoActionStream>, Status> {
+            Ok(Response::new(Box::pin(stream::empty())))
+        }
+
+        async fn list_actions(
+            &self,
+            _request: Request<Empty>,
+        ) -> Result<Response<Self::ListActionsStream>, Status> {
+            Ok(Response::new(Box::pin(stream::empty())))
+        }
+    }
+
+    async fn start_stub_worker(
+        port: u16,
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<Result<(), tonic14::transport::Error>>,
+    ) {
+        let do_put_calls = Arc::new(AtomicUsize::new(0));
+        let do_exchange_calls = Arc::new(AtomicUsize::new(0));
+        let service = StubWorkerFlightService {
+            do_put_calls: do_put_calls.clone(),
+            do_exchange_calls: do_exchange_calls.clone(),
+        };
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
+            .parse()
+            .expect("stub worker addr must parse");
+
+        let handle = tokio::spawn(async move {
+            tonic14::transport::Server::builder()
+                .add_service(FlightServiceServer::new(service))
+                .serve(addr)
+                .await
+        });
+
+        (do_put_calls, do_exchange_calls, handle)
+    }
+
+    async fn connect_proxy_test_client() -> FlightServiceClient<Channel> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind test port");
+        let addr = listener.local_addr().expect("local addr must resolve");
+        drop(listener);
+
+        tokio::spawn(async move {
+            tonic14::transport::Server::builder()
+                .add_service(FlightServiceServer::new(super::ProxyFlightService))
+                .serve(addr)
+                .await
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let channel = tonic14::transport::Endpoint::from_shared(endpoint)
+            .expect("endpoint must parse")
+            .connect()
+            .await
+            .expect("client must connect to proxy");
+
+        FlightServiceClient::new(channel)
+    }
 
     #[test]
     fn wraps_upstream_status_with_canonical_envelope() {
@@ -444,5 +804,143 @@ mod tests {
             err.message()
                 .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING|")
         );
+    }
+
+    #[tokio::test]
+    async fn do_put_rejects_empty_stream_with_structured_validation_error() {
+        let mut client = connect_proxy_test_client().await;
+
+        let request = Request::new(stream::iter(Vec::<FlightData>::new()));
+        let error = client
+            .do_put(request)
+            .await
+            .expect_err("empty do_put stream must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_STREAM_EMPTY|")
+        );
+    }
+
+    #[tokio::test]
+    async fn do_put_rejects_first_frame_without_descriptor_scope() {
+        let mut client = connect_proxy_test_client().await;
+
+        let request = Request::new(stream::iter(vec![FlightData::default()]));
+        let error = client
+            .do_put(request)
+            .await
+            .expect_err("do_put without descriptor on first frame must fail");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING|")
+        );
+    }
+
+    #[tokio::test]
+    async fn do_exchange_rejects_empty_stream_with_structured_validation_error() {
+        let mut client = connect_proxy_test_client().await;
+
+        let request = Request::new(stream::iter(Vec::<FlightData>::new()));
+        let error = client
+            .do_exchange(request)
+            .await
+            .expect_err("empty do_exchange stream must be rejected");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_STREAM_EMPTY|")
+        );
+    }
+
+    #[tokio::test]
+    async fn do_exchange_rejects_first_frame_without_descriptor_scope() {
+        let mut client = connect_proxy_test_client().await;
+
+        let request = Request::new(stream::iter(vec![FlightData::default()]));
+        let error = client
+            .do_exchange(request)
+            .await
+            .expect_err("do_exchange without descriptor on first frame must fail");
+
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(
+            error
+                .message()
+                .starts_with("RESULT|VALIDATION|VALIDATION_FLIGHT_PROXY_DESCRIPTOR_SCOPE_MISSING|")
+        );
+    }
+
+    #[tokio::test]
+    async fn do_put_forwards_to_worker_and_returns_upstream_ack() {
+        let worker_port = 32111_u16;
+        let (do_put_calls, _do_exchange_calls, worker_handle) =
+            start_stub_worker(worker_port).await;
+
+        let mut client = connect_proxy_test_client().await;
+        let first = FlightData {
+            flight_descriptor: Some(FlightDescriptor::new_path(vec![
+                "s1".to_string(),
+                "t1".to_string(),
+                format!("127.0.0.1:{}", worker_port),
+            ])),
+            ..Default::default()
+        };
+        let request = Request::new(stream::iter(vec![first]));
+        let response = client
+            .do_put(request)
+            .await
+            .expect("proxy do_put should forward to worker stub");
+        let mut stream = response.into_inner();
+        let ack = stream
+            .message()
+            .await
+            .expect("ack stream should decode")
+            .expect("ack stream should include one result");
+
+        assert!(ack.app_metadata.is_empty());
+        assert_eq!(do_put_calls.load(Ordering::SeqCst), 1);
+
+        worker_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn do_exchange_forwards_to_worker_and_returns_upstream_stream() {
+        let worker_port = 32112_u16;
+        let (_do_put_calls, do_exchange_calls, worker_handle) =
+            start_stub_worker(worker_port).await;
+
+        let mut client = connect_proxy_test_client().await;
+        let first = FlightData {
+            flight_descriptor: Some(FlightDescriptor::new_path(vec![
+                "s1".to_string(),
+                "t2".to_string(),
+                format!("127.0.0.1:{}", worker_port),
+            ])),
+            ..Default::default()
+        };
+        let request = Request::new(stream::iter(vec![first]));
+        let response = client
+            .do_exchange(request)
+            .await
+            .expect("proxy do_exchange should forward to worker stub");
+        let mut stream = response.into_inner();
+        let frame = stream
+            .message()
+            .await
+            .expect("exchange stream should decode")
+            .expect("exchange stream should include one frame");
+
+        assert!(frame.app_metadata.is_empty());
+        assert_eq!(do_exchange_calls.load(Ordering::SeqCst), 1);
+
+        worker_handle.abort();
     }
 }

@@ -4,13 +4,20 @@ use super::{
     format_exchange_io_decision_event, format_exchange_retry_decision_event,
     format_materialization_decision_event, format_scan_fallback_reason_event,
     format_scan_mode_chosen_event, format_scan_pruning_decision_event, format_stage_runtime_event,
-    load_scan_batches, maybe_prune_scan_keys, parse_partition_index_from_exchange_key,
+    load_scan_batches, load_upstream_exchange_batches, maybe_prune_scan_keys,
+    parse_partition_index_from_exchange_key, select_exchange_keys_for_downstream_partition,
     validate_upstream_exchange_partition_set,
 };
+use crate::execution::artifacts::persist_stage_exchange_artifacts;
+use crate::execution::planner::StageExecutionContext;
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::state::SharedData;
+use crate::state::WorkerInformation;
 use crate::storage::StorageProvider;
 use crate::storage::mock::MockProvider;
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::error::Error;
@@ -56,6 +63,31 @@ fn decision_context() -> ScanDecisionContext<'static> {
         stage_id: 1,
         task_id: "t-edge",
     }
+}
+
+fn sample_shared_data_with_storage(provider: Arc<MockProvider>) -> SharedData {
+    let worker_info = WorkerInformation {
+        worker_id: "worker-1".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 32001,
+        server_url: "http://127.0.0.1:32001".to_string(),
+        tls_cert_path: String::new(),
+        tls_key_path: String::new(),
+        ca_cert_path: String::new(),
+    };
+
+    let mut shared = SharedData::new(worker_info, kionas::consul::ClusterInfo::default());
+    shared.set_storage_provider(provider);
+    shared
+}
+
+fn single_value_batch(value: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
+    )
+    .expect("single-row batch should build")
 }
 
 #[derive(Debug, Clone)]
@@ -392,6 +424,195 @@ fn rejects_upstream_exchange_partition_set_with_missing_partition() {
     let err = validate_upstream_exchange_partition_set(3, &keys, 2)
         .expect_err("missing partition must be rejected");
     assert!(err.contains("exchange artifact count mismatch"));
+}
+
+#[test]
+fn selects_exchange_keys_for_one_to_one_partition_mapping() {
+    let keys = vec![
+        "exchange/q1/s1/stage_7/part-00000.parquet".to_string(),
+        "exchange/q1/s1/stage_7/part-00001.parquet".to_string(),
+        "exchange/q1/s1/stage_7/part-00002.parquet".to_string(),
+    ];
+
+    let selected = select_exchange_keys_for_downstream_partition(7, &keys, 3, 3, 1)
+        .expect("one-to-one partition mapping should select exact partition index");
+
+    assert_eq!(
+        selected,
+        vec!["exchange/q1/s1/stage_7/part-00001.parquet".to_string()]
+    );
+}
+
+#[test]
+fn selects_exchange_keys_for_many_to_one_partition_mapping() {
+    let keys = vec![
+        "exchange/q2/s1/stage_9/part-00000.parquet".to_string(),
+        "exchange/q2/s1/stage_9/part-00001.parquet".to_string(),
+        "exchange/q2/s1/stage_9/part-00002.parquet".to_string(),
+        "exchange/q2/s1/stage_9/part-00003.parquet".to_string(),
+        "exchange/q2/s1/stage_9/part-00004.parquet".to_string(),
+    ];
+
+    let selected = select_exchange_keys_for_downstream_partition(9, &keys, 5, 2, 1)
+        .expect("many-to-one partition mapping should select modulo-matched upstream partitions");
+
+    assert_eq!(
+        selected,
+        vec![
+            "exchange/q2/s1/stage_9/part-00001.parquet".to_string(),
+            "exchange/q2/s1/stage_9/part-00003.parquet".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn many_to_one_partition_mapping_covers_all_upstream_partitions_without_overlap() {
+    let keys = vec![
+        "exchange/q3/s1/stage_11/part-00000.parquet".to_string(),
+        "exchange/q3/s1/stage_11/part-00001.parquet".to_string(),
+        "exchange/q3/s1/stage_11/part-00002.parquet".to_string(),
+        "exchange/q3/s1/stage_11/part-00003.parquet".to_string(),
+        "exchange/q3/s1/stage_11/part-00004.parquet".to_string(),
+    ];
+
+    let selected_part0 = select_exchange_keys_for_downstream_partition(11, &keys, 5, 2, 0)
+        .expect("partition 0 mapping should succeed");
+    let selected_part1 = select_exchange_keys_for_downstream_partition(11, &keys, 5, 2, 1)
+        .expect("partition 1 mapping should succeed");
+
+    let set0 = selected_part0
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let set1 = selected_part1
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let overlap = set0.intersection(&set1).cloned().collect::<Vec<_>>();
+    assert!(overlap.is_empty());
+
+    let union = set0.union(&set1).cloned().collect::<Vec<_>>();
+    assert_eq!(union.len(), keys.len());
+    for key in keys {
+        assert!(union.iter().any(|candidate| candidate == &key));
+    }
+}
+
+#[tokio::test]
+async fn load_upstream_exchange_batches_applies_many_to_one_distribution_mapping() {
+    let provider = MockProvider::new().into_arc();
+    let shared = sample_shared_data_with_storage(provider.clone());
+    let session_id = "sess-many-to-one";
+    let query_run_id = "run-many-to-one";
+    let upstream_stage_id = 9_u32;
+
+    for partition_index in 0..5_u32 {
+        let batch = single_value_batch(i64::from(partition_index));
+        persist_stage_exchange_artifacts(
+            &shared,
+            session_id,
+            query_run_id,
+            upstream_stage_id,
+            partition_index,
+            5,
+            &[],
+            &[batch],
+        )
+        .await
+        .expect("upstream exchange artifact should persist");
+    }
+
+    let mut upstream_partition_counts = HashMap::new();
+    upstream_partition_counts.insert(upstream_stage_id, 5_u32);
+    let stage_context = StageExecutionContext {
+        stage_id: 20,
+        upstream_stage_ids: vec![upstream_stage_id],
+        upstream_partition_counts,
+        partition_count: 2,
+        partition_index: 1,
+        query_run_id: query_run_id.to_string(),
+        scan_hints: RuntimeScanHints::full_scan(),
+    };
+
+    let batches = load_upstream_exchange_batches(&shared, session_id, &stage_context)
+        .await
+        .expect("many-to-one exchange routing should load mapped upstream partitions");
+
+    let mut values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("column should be Int64")
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+
+    assert_eq!(values, vec![1_i64, 3_i64]);
+}
+
+#[tokio::test]
+async fn load_upstream_exchange_batches_many_to_one_distribution_covers_all_rows() {
+    let provider = MockProvider::new().into_arc();
+    let shared = sample_shared_data_with_storage(provider.clone());
+    let session_id = "sess-many-to-one-cover";
+    let query_run_id = "run-many-to-one-cover";
+    let upstream_stage_id = 17_u32;
+
+    for partition_index in 0..5_u32 {
+        let batch = single_value_batch(i64::from(partition_index));
+        persist_stage_exchange_artifacts(
+            &shared,
+            session_id,
+            query_run_id,
+            upstream_stage_id,
+            partition_index,
+            5,
+            &[],
+            &[batch],
+        )
+        .await
+        .expect("upstream exchange artifact should persist");
+    }
+
+    let mut upstream_partition_counts = HashMap::new();
+    upstream_partition_counts.insert(upstream_stage_id, 5_u32);
+
+    let mut loaded_values = Vec::<i64>::new();
+    for partition_index in 0..2_u32 {
+        let stage_context = StageExecutionContext {
+            stage_id: 21,
+            upstream_stage_ids: vec![upstream_stage_id],
+            upstream_partition_counts: upstream_partition_counts.clone(),
+            partition_count: 2,
+            partition_index,
+            query_run_id: query_run_id.to_string(),
+            scan_hints: RuntimeScanHints::full_scan(),
+        };
+
+        let batches = load_upstream_exchange_batches(&shared, session_id, &stage_context)
+            .await
+            .expect("many-to-one exchange routing should load mapped upstream partitions");
+
+        loaded_values.extend(batches.iter().flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("column should be Int64")
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        }));
+    }
+
+    loaded_values.sort_unstable();
+    assert_eq!(loaded_values, vec![0_i64, 1_i64, 2_i64, 3_i64, 4_i64]);
 }
 
 #[tokio::test]
