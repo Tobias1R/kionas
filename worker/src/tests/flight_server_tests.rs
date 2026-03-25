@@ -1,7 +1,9 @@
 use super::{
-    WorkerFlightService, checksum_fnv64_hex, expected_artifacts_from_metadata,
-    ingest_backpressure_limits, parse_descriptor_scope, schema_from_metadata,
-    stream_stage_partition_to_output_destinations, to_staging_prefix, validate_metadata_alignment,
+    DownstreamRoutingLimits, WorkerFlightService, checksum_fnv64_hex,
+    expected_artifacts_from_metadata, ingest_backpressure_limits, parse_descriptor_scope,
+    schema_from_metadata, stream_stage_partition_to_output_destinations,
+    stream_stage_partition_to_output_destinations_with_limits, to_staging_prefix,
+    validate_metadata_alignment,
 };
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -462,6 +464,62 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
     assert!(keys.iter().any(|k| k.ends_with("result_metadata.json")));
 
     downstream_handle.abort();
+}
+
+#[tokio::test]
+async fn slow_consumer_throttles_fast_producer_with_bounded_queue() {
+    let upstream_shared = sample_shared_data();
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: vec![
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 2,
+                worker_addresses: vec!["http://127.0.0.1:7779".to_string()],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+        ],
+        partition_count: 1,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: "Single".to_string(),
+        query_run_id: "run-2b4".to_string(),
+        query_id: "q-2b4".to_string(),
+        stage_id: 1,
+        partition_id: 0,
+        task_id: "task-upstream-backpressure".to_string(),
+        operation: "query".to_string(),
+        input: "{}".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::from([
+            ("__auth_scope".to_string(), "select:*".to_string()),
+            ("__rbac_user".to_string(), "alice".to_string()),
+            ("__rbac_role".to_string(), "reader".to_string()),
+            ("__query_id".to_string(), "q-2b4".to_string()),
+        ]),
+        filter_predicate: None,
+    };
+
+    let limits = DownstreamRoutingLimits {
+        queue_capacity: 1,
+        enqueue_timeout: std::time::Duration::from_millis(5),
+        request_timeout: std::time::Duration::from_secs(1),
+        startup_delay: std::time::Duration::from_millis(100),
+    };
+
+    let batches = sample_many_single_row_batches(8);
+    let error = stream_stage_partition_to_output_destinations_with_limits(
+        &upstream_shared,
+        &task,
+        "s1",
+        &batches,
+        limits,
+    )
+    .await
+    .expect_err("slow consumer should trigger bounded queue backpressure");
+
+    assert!(error.contains("is too slow; bounded queue capacity=1"));
 }
 
 #[tokio::test]

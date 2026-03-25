@@ -10,6 +10,42 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic14::transport::{Channel, Endpoint};
 
+fn read_env_u32_with_min(var: &str, default: u32, min: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn read_env_u64_with_min(var: &str, default: u64, min: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn configure_endpoint_flow_control(endpoint: Endpoint) -> Endpoint {
+    let stream_window =
+        read_env_u32_with_min("WORKER_FLIGHT_STREAM_WINDOW_BYTES", 1024 * 1024, 65_535);
+    let connection_window = read_env_u32_with_min(
+        "WORKER_FLIGHT_CONNECTION_WINDOW_BYTES",
+        4 * 1024 * 1024,
+        65_535,
+    );
+    let keep_alive_ms = read_env_u64_with_min("WORKER_FLIGHT_KEEPALIVE_MS", 30_000, 1);
+    let keep_alive_timeout_ms =
+        read_env_u64_with_min("WORKER_FLIGHT_KEEPALIVE_TIMEOUT_MS", 10_000, 1);
+
+    endpoint
+        .initial_stream_window_size(Some(stream_window))
+        .initial_connection_window_size(Some(connection_window))
+        .http2_keep_alive_interval(Duration::from_millis(keep_alive_ms))
+        .keep_alive_timeout(Duration::from_millis(keep_alive_timeout_ms))
+        .tcp_nodelay(true)
+}
+
 /// What: Connection metadata tracked for each pooled client.
 ///
 /// Inputs: None (created per connection lifecycle)
@@ -125,6 +161,7 @@ impl FlightClientPool {
         // Don't have cached channel; create a new one
         let endpoint_obj = Endpoint::from_shared(endpoint_uri.to_string())
             .map_err(|e| FlightClientPoolError::ChannelError(e.to_string()))?;
+        let endpoint_obj = configure_endpoint_flow_control(endpoint_obj);
 
         let channel = timeout_create_channel(endpoint_obj, self.connect_timeout)
             .await

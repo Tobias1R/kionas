@@ -23,6 +23,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc;
 use tonic14::metadata::MetadataValue;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
@@ -228,6 +230,99 @@ fn stage_destination_task_id(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DownstreamRoutingLimits {
+    queue_capacity: usize,
+    enqueue_timeout: Duration,
+    request_timeout: Duration,
+    startup_delay: Duration,
+}
+
+fn read_env_usize_with_min(var: &str, default: usize, min: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn read_env_u64_with_min(var: &str, default: u64, min: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn downstream_routing_limits() -> DownstreamRoutingLimits {
+    DownstreamRoutingLimits {
+        queue_capacity: read_env_usize_with_min("WORKER_FLIGHT_ROUTER_QUEUE_CAPACITY", 16, 1),
+        enqueue_timeout: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_ENQUEUE_TIMEOUT_MS",
+            500,
+            1,
+        )),
+        request_timeout: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_REQUEST_TIMEOUT_MS",
+            10_000,
+            1,
+        )),
+        startup_delay: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_CONSUMER_START_DELAY_MS",
+            0,
+            0,
+        )),
+    }
+}
+
+fn flight_payload_wire_size_bytes(payload: &FlightData) -> usize {
+    payload
+        .data_header
+        .len()
+        .saturating_add(payload.data_body.len())
+        .saturating_add(payload.app_metadata.len())
+        .saturating_add(
+            payload
+                .flight_descriptor
+                .as_ref()
+                .map(|descriptor| {
+                    descriptor
+                        .path
+                        .iter()
+                        .map(std::string::String::len)
+                        .sum::<usize>()
+                        .saturating_add(descriptor.cmd.len())
+                })
+                .unwrap_or(0),
+        )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownstreamDispatchMetrics {
+    queued_frames: usize,
+    queued_bytes: usize,
+    enqueue_wait_ms: u128,
+    stream_time_ms: u128,
+}
+
+fn log_downstream_dispatch_metrics(
+    endpoint: &str,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    metrics: DownstreamDispatchMetrics,
+) {
+    log::info!(
+        "event=flight.downstream_dispatch_metrics query_run_id={} stage_id={} partition_id={} endpoint={} queued_frames={} queued_bytes={} enqueue_wait_ms={} stream_time_ms={}",
+        task.query_run_id,
+        task.stage_id,
+        task.partition_id,
+        endpoint,
+        metrics.queued_frames,
+        metrics.queued_bytes,
+        metrics.enqueue_wait_ms,
+        metrics.stream_time_ms
+    );
+}
+
 fn insert_dispatch_metadata_for_downstream(
     request: &mut Request<impl Sized>,
     task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
@@ -305,6 +400,23 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
     session_id: &str,
     batches: &[RecordBatch],
 ) -> Result<(), String> {
+    stream_stage_partition_to_output_destinations_with_limits(
+        shared_data,
+        task,
+        session_id,
+        batches,
+        downstream_routing_limits(),
+    )
+    .await
+}
+
+async fn stream_stage_partition_to_output_destinations_with_limits(
+    shared_data: &SharedData,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+    batches: &[RecordBatch],
+    limits: DownstreamRoutingLimits,
+) -> Result<(), String> {
     if task.output_destinations.is_empty() {
         return Ok(());
     }
@@ -314,6 +426,9 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
     }
 
     let service = WorkerFlightService::new(shared_data.clone());
+
+    let base_payloads = batches_to_flight_data(batches[0].schema().as_ref(), batches.to_vec())
+        .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
 
     for destination in &task.output_destinations {
         if destination.worker_addresses.is_empty() {
@@ -325,22 +440,10 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
 
         for (worker_index, worker_address) in destination.worker_addresses.iter().enumerate() {
             let endpoint = normalize_destination_endpoint(worker_address)?;
-            let channel = service
-                .get_downstream_channel(&endpoint)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "failed to connect downstream Flight endpoint {}: {}",
-                        endpoint, e
-                    )
-                })?;
-
-            let mut payloads =
-                batches_to_flight_data(batches[0].schema().as_ref(), batches.to_vec())
-                    .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
             let downstream_task_id =
                 stage_destination_task_id(task, destination, worker_address, worker_index);
 
+            let mut payloads = base_payloads.clone();
             if let Some(first) = payloads.first_mut() {
                 first.flight_descriptor = Some(FlightDescriptor::new_path(vec![
                     session_id.to_string(),
@@ -348,35 +451,130 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
                 ]));
             }
 
-            let request_stream = stream::iter(payloads);
-            let mut request = Request::new(request_stream);
-            insert_dispatch_metadata_for_downstream(&mut request, task, session_id)?;
+            let (tx, rx) = mpsc::channel::<FlightData>(limits.queue_capacity);
+            let task_clone = task.clone();
+            let endpoint_clone = endpoint.clone();
+            let session_id_owned = session_id.to_string();
+            let service_clone = service.clone();
 
-            let mut client = FlightServiceClient::new(channel);
-            let mut response = client
-                .do_put(request)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "failed to stream stage output to downstream endpoint {}: {}",
-                        endpoint, e
-                    )
-                })?
-                .into_inner();
+            let stream_started_at = Instant::now();
+            let consumer = tokio::spawn(async move {
+                if limits.startup_delay > Duration::from_millis(0) {
+                    tokio::time::sleep(limits.startup_delay).await;
+                }
 
-            while response
-                .message()
-                .await
-                .map_err(|e| {
-                    format!(
-                        "downstream endpoint {} failed while acknowledging stage stream: {}",
-                        endpoint, e
-                    )
-                })?
-                .is_some()
-            {
-                // Drain ack stream to ensure upstream death or write failures are surfaced.
+                let channel = service_clone
+                    .get_downstream_channel(&endpoint_clone)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to connect downstream Flight endpoint {}: {}",
+                            endpoint_clone, e
+                        )
+                    })?;
+
+                let request_stream = stream::unfold(rx, |mut receiver| async {
+                    receiver.recv().await.map(|payload| (payload, receiver))
+                });
+                let mut request = Request::new(request_stream);
+                insert_dispatch_metadata_for_downstream(
+                    &mut request,
+                    &task_clone,
+                    &session_id_owned,
+                )?;
+
+                let mut client = FlightServiceClient::new(channel);
+                let mut response =
+                    tokio::time::timeout(limits.request_timeout, client.do_put(request))
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "downstream endpoint {} request timed out after {:?}",
+                                endpoint_clone, limits.request_timeout
+                            )
+                        })?
+                        .map_err(|e| {
+                            format!(
+                                "failed to stream stage output to downstream endpoint {}: {}",
+                                endpoint_clone, e
+                            )
+                        })?
+                        .into_inner();
+
+                while response
+                    .message()
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "downstream endpoint {} failed while acknowledging stage stream: {}",
+                            endpoint_clone, e
+                        )
+                    })?
+                    .is_some()
+                {}
+
+                Ok::<u128, String>(stream_started_at.elapsed().as_millis())
+            });
+
+            let mut queued_frames = 0usize;
+            let mut queued_bytes = 0usize;
+            let mut enqueue_wait_ms = 0u128;
+
+            let mut dispatch_error = None::<String>;
+            for payload in payloads {
+                let payload_size = flight_payload_wire_size_bytes(&payload);
+                let send_started = Instant::now();
+                let send_result =
+                    tokio::time::timeout(limits.enqueue_timeout, tx.send(payload)).await;
+                enqueue_wait_ms =
+                    enqueue_wait_ms.saturating_add(send_started.elapsed().as_millis());
+
+                match send_result {
+                    Ok(Ok(())) => {
+                        queued_frames = queued_frames.saturating_add(1);
+                        queued_bytes = queued_bytes.saturating_add(payload_size);
+                    }
+                    Ok(Err(_)) => {
+                        dispatch_error = Some(format!(
+                            "downstream endpoint {} closed queue while receiving stage output",
+                            endpoint
+                        ));
+                        break;
+                    }
+                    Err(_) => {
+                        dispatch_error = Some(format!(
+                            "downstream endpoint {} is too slow; bounded queue capacity={} timed out after {:?}",
+                            endpoint, limits.queue_capacity, limits.enqueue_timeout
+                        ));
+                        break;
+                    }
+                }
             }
+
+            drop(tx);
+
+            if let Some(error) = dispatch_error {
+                consumer.abort();
+                return Err(error);
+            }
+
+            let stream_time_ms = consumer.await.map_err(|e| {
+                format!(
+                    "downstream endpoint {} dispatch task panicked: {}",
+                    endpoint, e
+                )
+            })??;
+
+            log_downstream_dispatch_metrics(
+                &endpoint,
+                task,
+                DownstreamDispatchMetrics {
+                    queued_frames,
+                    queued_bytes,
+                    enqueue_wait_ms,
+                    stream_time_ms,
+                },
+            );
         }
     }
 
