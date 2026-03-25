@@ -47,6 +47,31 @@ struct ParsedHandle {
     task_id: String,
     worker_id: String,
     signed_ticket: Option<String>,
+    stage_latency: Vec<StageLatencyDisplay>,
+    total_network_write_ms: Option<u128>,
+    total_network_batches: Option<u128>,
+    total_network_bytes: Option<u128>,
+}
+
+/// What: Client-facing stage latency display model parsed from query handles.
+///
+/// Inputs:
+/// - `stage_id`: Distributed stage identifier.
+/// - `queue_ms`: Queue latency in milliseconds.
+/// - `exec_ms`: Execution latency in milliseconds.
+/// - `network_ms`: Network latency in milliseconds.
+///
+/// Output:
+/// - Display record used to print stage latency breakdown lines.
+#[derive(Debug, Clone)]
+struct StageLatencyDisplay {
+    stage_id: u32,
+    queue_ms: u128,
+    exec_ms: u128,
+    network_ms: u128,
+    network_write_ms: u128,
+    network_batches: u128,
+    network_bytes: u128,
 }
 
 /// What: Decode a query handle from structured response bytes.
@@ -107,6 +132,22 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
     let mut session_id = String::new();
     let mut task_id = String::new();
     let mut signed_ticket = None;
+    let mut queue_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut exec_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_write_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_batches_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_bytes_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut total_network_write_ms = None;
+    let mut total_network_batches = None;
+    let mut total_network_bytes = None;
+
+    fn parse_stage_latency_key(key: &str, suffix: &str) -> Option<u32> {
+        let stage_part = key.strip_prefix("latency_stage_")?;
+        let stage_part = stage_part.strip_suffix(suffix)?;
+        stage_part.parse::<u32>().ok()
+    }
+
     for pair in query.split('&') {
         let (k, v) = pair
             .split_once('=')
@@ -117,6 +158,36 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
             task_id = v.to_string();
         } else if k == "ticket" {
             signed_ticket = Some(v.to_string());
+        } else if k == "latency_total_network_write_ms" {
+            total_network_write_ms = v.parse::<u128>().ok();
+        } else if k == "latency_total_network_batches" {
+            total_network_batches = v.parse::<u128>().ok();
+        } else if k == "latency_total_network_bytes" {
+            total_network_bytes = v.parse::<u128>().ok();
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_queue_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                queue_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_exec_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                exec_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_ms")
+            && let Ok(value) = v.parse::<u128>()
+        {
+            network_by_stage.insert(stage_id, value);
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_write_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                network_write_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_batches") {
+            if let Ok(value) = v.parse::<u128>() {
+                network_batches_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_bytes")
+            && let Ok(value) = v.parse::<u128>()
+        {
+            network_bytes_by_stage.insert(stage_id, value);
         }
     }
 
@@ -127,13 +198,83 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
         return Err("query handle missing task_id".to_string());
     }
 
+    let mut stage_ids = queue_by_stage
+        .keys()
+        .chain(exec_by_stage.keys())
+        .chain(network_by_stage.keys())
+        .chain(network_write_by_stage.keys())
+        .chain(network_batches_by_stage.keys())
+        .chain(network_bytes_by_stage.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    stage_ids.sort_unstable();
+    stage_ids.dedup();
+
+    let stage_latency = stage_ids
+        .into_iter()
+        .map(|stage_id| StageLatencyDisplay {
+            stage_id,
+            queue_ms: queue_by_stage.get(&stage_id).copied().unwrap_or(0),
+            exec_ms: exec_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_ms: network_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_write_ms: network_write_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_batches: network_batches_by_stage
+                .get(&stage_id)
+                .copied()
+                .unwrap_or(0),
+            network_bytes: network_bytes_by_stage.get(&stage_id).copied().unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+
     Ok(ParsedHandle {
         endpoint: format!("http://{}", authority),
         session_id,
         task_id,
         worker_id,
         signed_ticket,
+        stage_latency,
+        total_network_write_ms,
+        total_network_batches,
+        total_network_bytes,
     })
+}
+
+fn print_stage_latency_breakdown(handle: &str) -> Result<(), String> {
+    let parsed = parse_structured_query_handle(handle)?;
+    if parsed.stage_latency.is_empty() {
+        return Ok(());
+    }
+
+    for stage in &parsed.stage_latency {
+        let total = stage
+            .queue_ms
+            .saturating_add(stage.exec_ms)
+            .saturating_add(stage.network_ms);
+        println!(
+            "Stage {}: {}ms (queue) + {}ms (exec) + {}ms (network) = {}ms total | write={}ms transfer={} batches / {} bytes",
+            stage.stage_id,
+            stage.queue_ms,
+            stage.exec_ms,
+            stage.network_ms,
+            total,
+            stage.network_write_ms,
+            stage.network_batches,
+            stage.network_bytes
+        );
+    }
+
+    if let (Some(write_ms), Some(batches), Some(bytes)) = (
+        parsed.total_network_write_ms,
+        parsed.total_network_batches,
+        parsed.total_network_bytes,
+    ) {
+        println!(
+            "Network transfer totals: write_ms={} batches={} bytes={}",
+            write_ms, batches, bytes
+        );
+    }
+
+    Ok(())
 }
 
 /// What: Build worker-internal ticket payload from handle components.
@@ -561,6 +702,7 @@ async fn execute_and_render_query(
             // println!("Structured query handle: {}", handle);
             let batches = fetch_doget_batches(&handle).await?;
             print_batches_as_table(&batches)?;
+            print_stage_latency_breakdown(&handle)?;
         }
         if response.status == "OK" {
             println!("Query executed successfully");
@@ -923,3 +1065,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/main_tests.rs"]
+mod tests;

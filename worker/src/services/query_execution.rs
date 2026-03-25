@@ -80,6 +80,7 @@ pub(crate) async fn execute_query_task(
         result_location,
     )
     .await
+    .map(|_| ())
 }
 
 /// What: Pre-validate filter predicate column types against schema before filter execution.

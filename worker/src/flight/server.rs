@@ -305,6 +305,14 @@ struct DownstreamDispatchMetrics {
     stream_time_ms: u128,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DownstreamNetworkSummary {
+    pub endpoint_count: usize,
+    pub queued_frames: usize,
+    pub queued_bytes: usize,
+    pub stream_time_ms: u128,
+}
+
 fn log_downstream_dispatch_metrics(
     endpoint: &str,
     task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
@@ -401,7 +409,7 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
     session_id: &str,
     batches: &[RecordBatch],
     routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
-) -> Result<(), String> {
+) -> Result<DownstreamNetworkSummary, String> {
     stream_stage_partition_to_output_destinations_with_limits(
         shared_data,
         task,
@@ -420,9 +428,9 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
     batches: &[RecordBatch],
     routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
     limits: DownstreamRoutingLimits,
-) -> Result<(), String> {
+) -> Result<DownstreamNetworkSummary, String> {
     if task.output_destinations.is_empty() {
-        return Ok(());
+        return Ok(DownstreamNetworkSummary::default());
     }
 
     if batches.is_empty() {
@@ -430,6 +438,7 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
     }
 
     let service = WorkerFlightService::new(shared_data.clone());
+    let mut network_summary = DownstreamNetworkSummary::default();
 
     if let Some(routed_batches) = routed_batches_by_destination
         && routed_batches.len() != task.output_destinations.len()
@@ -600,10 +609,18 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
                     stream_time_ms,
                 },
             );
+            network_summary.endpoint_count = network_summary.endpoint_count.saturating_add(1);
+            network_summary.queued_frames =
+                network_summary.queued_frames.saturating_add(queued_frames);
+            network_summary.queued_bytes =
+                network_summary.queued_bytes.saturating_add(queued_bytes);
+            network_summary.stream_time_ms = network_summary
+                .stream_time_ms
+                .saturating_add(stream_time_ms);
         }
     }
 
-    Ok(())
+    Ok(network_summary)
 }
 
 /// What: Decode and verify the signed internal Flight ticket.
@@ -782,6 +799,8 @@ async fn ingest_flight_stream(
     request: Request<Streaming<FlightData>>,
     stream_name: &str,
 ) -> Result<(), Status> {
+    let ingest_started_at = Instant::now();
+    let decode_started_at = Instant::now();
     let stream_name_owned = stream_name.to_string();
     let authz = crate::authz::WorkerAuthorizer::new();
     let metadata = request.metadata().clone();
@@ -828,10 +847,16 @@ async fn ingest_flight_stream(
         )));
     }
 
+    let accumulated_wire_bytes =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(initial_wire_bytes));
+    let accumulated_wire_bytes_for_remaining = std::sync::Arc::clone(&accumulated_wire_bytes);
+
     let stream_name_for_remaining = stream_name_owned.clone();
     let remaining = stream::try_unfold((input, initial_wire_bytes), move |state| {
         let (mut stream_input, accumulated_wire_bytes) = state;
         let stream_name_for_remaining = stream_name_for_remaining.clone();
+        let accumulated_wire_bytes_for_remaining =
+            std::sync::Arc::clone(&accumulated_wire_bytes_for_remaining);
         async move {
             match stream_input.message().await {
                 Ok(Some(data)) => {
@@ -843,6 +868,8 @@ async fn ingest_flight_stream(
                             stream_name_for_remaining, limits.max_wire_bytes
                         )));
                     }
+                    accumulated_wire_bytes_for_remaining
+                        .store(next_wire_bytes, std::sync::atomic::Ordering::Relaxed);
                     Ok(Some((data, (stream_input, next_wire_bytes))))
                 }
                 Ok(None) => Ok(None),
@@ -888,6 +915,8 @@ async fn ingest_flight_stream(
         decoded_batches.push(batch);
     }
 
+    let decode_ms = decode_started_at.elapsed().as_millis();
+
     if decoded_batches.is_empty() {
         return Err(Status::invalid_argument(format!(
             "{} stream must include at least one IPC record batch",
@@ -897,6 +926,8 @@ async fn ingest_flight_stream(
 
     let result_location =
         resolve_or_create_ingest_result_location(shared_data, &session_id, &task_id).await;
+
+    let persist_started_at = Instant::now();
 
     persist_query_artifacts(
         shared_data,
@@ -913,6 +944,22 @@ async fn ingest_flight_stream(
             Status::internal(e)
         }
     })?;
+
+    let persist_ms = persist_started_at.elapsed().as_millis();
+    let total_ms = ingest_started_at.elapsed().as_millis();
+    let ingested_wire_bytes = accumulated_wire_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "event=flight.ingest_metrics stream={} session_id={} task_id={} wire_bytes={} decoded_batches={} decoded_rows={} decode_ms={} persist_ms={} total_ms={}",
+        stream_name_owned,
+        session_id,
+        task_id,
+        ingested_wire_bytes,
+        decoded_batches.len(),
+        decoded_rows,
+        decode_ms,
+        persist_ms,
+        total_ms
+    );
 
     Ok(())
 }
@@ -1635,6 +1682,7 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let do_get_started_at = Instant::now();
         let authz = crate::authz::WorkerAuthorizer::new();
         let metadata = request.metadata().clone();
         let ticket = request.into_inner();
@@ -1694,6 +1742,25 @@ impl FlightService for WorkerFlightService {
             .into_iter()
             .map(Ok)
             .collect::<Vec<Result<FlightData, Status>>>();
+
+        let payload_count = payloads.len();
+        let payload_bytes = payloads.iter().fold(0usize, |acc, payload| {
+            acc.saturating_add(
+                payload
+                    .as_ref()
+                    .map(flight_data_wire_size_bytes)
+                    .unwrap_or(0),
+            )
+        });
+        let total_ms = do_get_started_at.elapsed().as_millis();
+        log::info!(
+            "event=flight.do_get_metrics session_id={} task_id={} payload_count={} payload_bytes={} total_ms={}",
+            claims.sid,
+            claims.tid,
+            payload_count,
+            payload_bytes,
+            total_ms
+        );
 
         let output = stream::iter(payloads);
         Ok(Response::new(Box::pin(output)))

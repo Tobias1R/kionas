@@ -6,6 +6,7 @@ mod interops;
 mod services;
 mod state;
 mod storage;
+mod telemetry;
 mod transactions;
 mod txn;
 

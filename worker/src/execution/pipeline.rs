@@ -16,6 +16,9 @@ use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
 use crate::storage::StorageProvider;
 use crate::storage::exchange::{list_stage_exchange_data_keys, stage_exchange_metadata_key};
+use crate::telemetry::{
+    StageExecutionTelemetry, StageLatencyMetrics, StageMemoryMetrics, StageNetworkMetrics,
+};
 use arrow::array::BooleanArray;
 use arrow::array::StringArray;
 use arrow::compute::filter_record_batch;
@@ -28,7 +31,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 #[derive(Debug, Clone)]
@@ -1210,7 +1213,7 @@ pub(crate) async fn execute_query_task(
     session_id: &str,
     namespace: &QueryNamespace,
     result_location: &str,
-) -> Result<(), String> {
+) -> Result<StageExecutionTelemetry, String> {
     let auth_scope = task
         .params
         .get("__auth_scope")
@@ -1242,9 +1245,45 @@ pub(crate) async fn execute_query_task(
     }
 
     let stage_started_at = Instant::now();
+    let now_epoch_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system clock error while computing queue latency: {}", e))?
+        .as_millis();
+    let dispatch_enqueued_at_ms = task
+        .params
+        .get("__dispatch_enqueued_at_ms")
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or(now_epoch_ms);
+    let queue_ms = now_epoch_ms.saturating_sub(dispatch_enqueued_at_ms);
 
     let runtime_plan = extract_runtime_plan(task)?;
     let stage_context = stage_execution_context(task)?;
+    let memory_tracking_enabled = task
+        .params
+        .get("memory_tracking_enabled")
+        .and_then(|v| v.parse::<bool>().ok())
+        .or_else(|| {
+            std::env::var("WORKER_MEMORY_TRACKING_ENABLED")
+                .ok()
+                .and_then(|v| v.parse::<bool>().ok())
+        })
+        .unwrap_or(false);
+    let spill_threshold_mb = task
+        .params
+        .get("memory_tracking_spill_threshold_mb")
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| {
+            std::env::var("WORKER_MEMORY_SPILL_THRESHOLD_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(512);
+    let mut stage_memory_metrics = StageMemoryMetrics::new(
+        stage_context.stage_id,
+        memory_tracking_enabled,
+        spill_threshold_mb,
+    );
+    let execution_started_at = Instant::now();
     let query_id = task
         .params
         .get("__query_id")
@@ -1352,10 +1391,24 @@ pub(crate) async fn execute_query_task(
     }
 
     if let Some(aggregate_partial_spec) = runtime_plan.aggregate_partial_spec.as_ref() {
+        if stage_memory_metrics.enabled {
+            log::info!(
+                "event=worker.memory.spill_threshold_check stage_id={} threshold_bytes={} phase=aggregate_partial",
+                stage_context.stage_id,
+                stage_memory_metrics.spill_threshold_bytes
+            );
+        }
         batches = apply_aggregate_partial_pipeline(&batches, aggregate_partial_spec)?;
     }
 
     if let Some(aggregate_final_spec) = runtime_plan.aggregate_final_spec.as_ref() {
+        if stage_memory_metrics.enabled {
+            log::info!(
+                "event=worker.memory.spill_threshold_check stage_id={} threshold_bytes={} phase=aggregate_final",
+                stage_context.stage_id,
+                stage_memory_metrics.spill_threshold_bytes
+            );
+        }
         batches = apply_aggregate_final_pipeline(&batches, aggregate_final_spec)?;
     }
 
@@ -1379,6 +1432,11 @@ pub(crate) async fn execute_query_task(
     }
 
     let normalized_batches = normalize_batches_for_sort(&batches)?;
+    for batch in &normalized_batches {
+        stage_memory_metrics.track_batch_allocation(batch);
+    }
+
+    let exec_ms = execution_started_at.elapsed().as_millis();
 
     let routed_batches_by_partition = if task.output_destinations.is_empty() {
         None
@@ -1423,15 +1481,18 @@ pub(crate) async fn execute_query_task(
     .await
     .map_err(|e| format!("{} [{}]", e, context_tag))?;
 
-    crate::flight::server::stream_stage_partition_to_output_destinations(
-        shared,
-        task,
-        session_id,
-        &normalized_batches,
-        routed_batches_by_partition.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("{} [{}]", e, context_tag))?;
+    let network_started_at = Instant::now();
+    let downstream_network_summary =
+        crate::flight::server::stream_stage_partition_to_output_destinations(
+            shared,
+            task,
+            session_id,
+            &normalized_batches,
+            routed_batches_by_partition.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("{} [{}]", e, context_tag))?;
+    let network_ms = network_started_at.elapsed().as_millis();
 
     log::info!(
         "{}",
@@ -1499,7 +1560,54 @@ pub(crate) async fn execute_query_task(
         )
     );
 
-    Ok(())
+    if stage_memory_metrics.enabled {
+        log::info!(
+            "event=worker.stage_memory_metrics stage_id={} sampled_batches={} sampled_rows={} peak_batch_bytes={} spill_threshold_bytes={} spill_threshold_exceeded={}",
+            stage_memory_metrics.stage_id,
+            stage_memory_metrics.sampled_batches,
+            stage_memory_metrics.sampled_rows,
+            stage_memory_metrics.peak_batch_bytes,
+            stage_memory_metrics.spill_threshold_bytes,
+            stage_memory_metrics.spill_threshold_exceeded
+        );
+    }
+
+    log::info!(
+        "event=worker.stage_latency_metrics stage_id={} queue_ms={} exec_ms={} network_ms={} total_ms={}",
+        stage_context.stage_id,
+        queue_ms,
+        exec_ms,
+        network_ms,
+        queue_ms.saturating_add(exec_ms).saturating_add(network_ms)
+    );
+    log::info!(
+        "event=worker.stage_network_metrics stage_id={} downstream_endpoint_count={} downstream_write_ms={} downstream_queued_frames={} downstream_queued_bytes={}",
+        stage_context.stage_id,
+        downstream_network_summary.endpoint_count,
+        downstream_network_summary.stream_time_ms,
+        downstream_network_summary.queued_frames,
+        downstream_network_summary.queued_bytes
+    );
+
+    Ok(StageExecutionTelemetry {
+        latency: StageLatencyMetrics {
+            stage_id: stage_context.stage_id,
+            queue_ms,
+            exec_ms,
+            network_ms,
+        },
+        memory: if stage_memory_metrics.enabled {
+            Some(stage_memory_metrics)
+        } else {
+            None
+        },
+        network: Some(StageNetworkMetrics {
+            downstream_endpoint_count: downstream_network_summary.endpoint_count,
+            downstream_write_ms: downstream_network_summary.stream_time_ms,
+            downstream_queued_frames: downstream_network_summary.queued_frames,
+            downstream_queued_bytes: downstream_network_summary.queued_bytes,
+        }),
+    })
 }
 
 fn relation_key(namespace: &QueryNamespace) -> String {

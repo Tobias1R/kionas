@@ -1,5 +1,6 @@
 use super::{
-    DispatchAuthContext, format_stage_dispatch_boundary_event, validate_query_dispatch_context,
+    DispatchAuthContext, format_stage_dispatch_boundary_event,
+    format_stage_dispatch_observability_event, validate_query_dispatch_context,
 };
 use crate::statement_handler::shared::distributed_dag::{self, ExecutionModeHint, StageTaskGroup};
 use kionas::planner::PartitionSpec;
@@ -165,6 +166,24 @@ fn assert_distributed_observability_params(params: &HashMap<String, String>, sta
         params.get(distributed_dag::OBS_DISTRIBUTED_STAGE_COUNT_PARAM),
         Some(&expected_stage_count)
     );
+}
+
+fn assert_contains_all_five_telemetry_keys(params: &HashMap<String, String>) {
+    let required_keys = [
+        distributed_dag::OBS_DAG_METRICS_JSON_PARAM,
+        distributed_dag::OBS_PLAN_VALIDATION_STATUS_PARAM,
+        distributed_dag::OBS_STAGE_EXTRACTION_MISMATCH_PARAM,
+        distributed_dag::OBS_DATAFUSION_STAGE_COUNT_PARAM,
+        distributed_dag::OBS_DISTRIBUTED_STAGE_COUNT_PARAM,
+    ];
+
+    for key in required_keys {
+        assert!(
+            params.contains_key(key),
+            "expected telemetry key '{}' to be present in stage params",
+            key
+        );
+    }
 }
 
 fn insert_distributed_routing_observability_params(
@@ -400,6 +419,84 @@ fn formats_stage_dispatch_boundary_event_with_required_dimensions() {
     assert!(event.contains("category=execution"));
     assert!(event.contains("origin=server_dispatch"));
     assert!(event.contains("partition_count=8"));
+}
+
+#[test]
+fn formats_stage_dispatch_observability_event_with_required_dimensions() {
+    let event = format_stage_dispatch_observability_event(
+        "q-ob1", 5, "consul", "worker-1", "default", true, "passed", "false", "2", "2",
+    );
+
+    assert!(event.starts_with("event=execution.stage_dispatch_observability "));
+    assert!(event.contains("query_id=q-ob1"));
+    assert!(event.contains("stage_id=5"));
+    assert!(event.contains("route_source=consul"));
+    assert!(event.contains("worker_destination=worker-1"));
+    assert!(event.contains("warehouse=default"));
+    assert!(event.contains("dag_metrics_present=true"));
+    assert!(event.contains("plan_validation_status=passed"));
+    assert!(event.contains("stage_extraction_mismatch=false"));
+    assert!(event.contains("datafusion_stage_count=2"));
+    assert!(event.contains("distributed_stage_count=2"));
+}
+
+#[test]
+fn parses_stage_latency_from_result_location_query_params() {
+    let location = "flight://worker1:50052/query/sales/public/users/worker-1?session_id=s1&task_id=t1&stage_latency_queue_ms=21&stage_latency_exec_ms=55&stage_latency_network_ms=8";
+
+    let parsed = super::parse_stage_latency_from_result_location(location)
+        .expect("stage latency should parse from result location query params");
+
+    assert_eq!(parsed.queue_ms, 21);
+    assert_eq!(parsed.exec_ms, 55);
+    assert_eq!(parsed.network_ms, 8);
+    assert_eq!(parsed.network_write_ms, 0);
+    assert_eq!(parsed.network_bytes, 0);
+    assert_eq!(parsed.network_batches, 0);
+}
+
+#[test]
+fn appends_stage_latency_breakdown_to_final_result_location() {
+    let base = "flight://worker1:50052/query/sales/public/users/worker-1?session_id=s1&task_id=t1";
+    let mut per_stage = std::collections::BTreeMap::new();
+
+    per_stage.insert(
+        0,
+        super::StageLatencyBreakdown {
+            queue_ms: 10,
+            exec_ms: 30,
+            network_ms: 5,
+            network_write_ms: 4,
+            network_bytes: 1200,
+            network_batches: 12,
+        },
+    );
+    per_stage.insert(
+        1,
+        super::StageLatencyBreakdown {
+            queue_ms: 4,
+            exec_ms: 16,
+            network_ms: 2,
+            network_write_ms: 1,
+            network_bytes: 300,
+            network_batches: 3,
+        },
+    );
+
+    let enriched = super::append_stage_latency_breakdown_to_result_location(base, &per_stage);
+    assert!(enriched.contains("latency_stage_count=2"));
+    assert!(enriched.contains("latency_stage_0_queue_ms=10"));
+    assert!(enriched.contains("latency_stage_0_exec_ms=30"));
+    assert!(enriched.contains("latency_stage_0_network_ms=5"));
+    assert!(enriched.contains("latency_stage_1_queue_ms=4"));
+    assert!(enriched.contains("latency_stage_1_exec_ms=16"));
+    assert!(enriched.contains("latency_stage_1_network_ms=2"));
+    assert!(enriched.contains("latency_total_queue_ms=14"));
+    assert!(enriched.contains("latency_total_exec_ms=46"));
+    assert!(enriched.contains("latency_total_network_ms=7"));
+    assert!(enriched.contains("latency_total_network_write_ms=5"));
+    assert!(enriched.contains("latency_total_network_bytes=1500"));
+    assert!(enriched.contains("latency_total_network_batches=15"));
 }
 
 #[tokio::test]
@@ -796,6 +893,111 @@ async fn scheduler_preserves_observability_params_on_dispatched_partitions() {
             distributed_dag::ROUTING_POOL_SOURCE_DEFAULT,
             true,
         );
+    }
+}
+
+#[tokio::test]
+async fn query_dispatch_to_worker_includes_all_five_telemetry_keys() {
+    let mut scan_stage = stage_group(0, 0, 1, Vec::new());
+    scan_stage.payload = "{\"sql\":\"SELECT id FROM sales.public.users\"}".to_string();
+    insert_distributed_observability_params(&mut scan_stage.params, 1);
+
+    let mut join_stage = stage_group(1, 0, 1, vec![0]);
+    join_stage.payload = "{\"sql\":\"SELECT a.id, b.value FROM sales.public.a a JOIN sales.public.b b ON a.id = b.id\"}".to_string();
+    insert_distributed_observability_params(&mut join_stage.params, 2);
+
+    let stage_groups = vec![scan_stage, join_stage];
+    let captured_params = Arc::new(tokio::sync::Mutex::new(
+        Vec::<HashMap<String, String>>::new(),
+    ));
+    let captured_params_for_executor = captured_params.clone();
+
+    let execute_partition =
+        std::sync::Arc::new(move |group: StageTaskGroup, _auth_ctx, _timeout_secs| {
+            let captured_params_for_executor = captured_params_for_executor.clone();
+            Box::pin(async move {
+                captured_params_for_executor
+                    .lock()
+                    .await
+                    .push(group.params.clone());
+                Ok::<String, Box<dyn std::error::Error + Send + Sync>>(stage_result_location(
+                    &group,
+                ))
+            }) as super::StagePartitionFuture
+        });
+
+    let _ = super::run_stage_groups_with_partition_executor(
+        &stage_groups,
+        Some(&auth_ctx_with_query_id("q-five-keys")),
+        1,
+        execute_partition,
+    )
+    .await
+    .expect("query dispatch should preserve telemetry keys to worker stage metadata");
+
+    let captured = captured_params.lock().await;
+    assert_eq!(captured.len(), 2);
+    for params in captured.iter() {
+        assert_contains_all_five_telemetry_keys(params);
+    }
+}
+
+#[tokio::test]
+async fn query_dispatch_to_worker_includes_all_five_telemetry_keys_across_query_types() {
+    let query_matrix = [
+        "SELECT id FROM sales.public.users",
+        "SELECT id FROM sales.public.users WHERE id > 5",
+        "SELECT a.id, b.value FROM sales.public.a a JOIN sales.public.b b ON a.id = b.id",
+        "SELECT region, SUM(amount) FROM sales.public.orders GROUP BY region",
+    ];
+
+    let mut stage_groups = Vec::new();
+    for (index, query_sql) in query_matrix.iter().enumerate() {
+        let stage_id = u32::try_from(index).expect("query matrix index should fit u32");
+        let upstream = if stage_id == 0 {
+            Vec::new()
+        } else {
+            vec![stage_id - 1]
+        };
+
+        let mut group = stage_group(stage_id, 0, 1, upstream);
+        group.payload = format!("{{\"sql\":\"{}\"}}", query_sql);
+        insert_distributed_observability_params(&mut group.params, query_matrix.len());
+        stage_groups.push(group);
+    }
+
+    let captured_params = Arc::new(tokio::sync::Mutex::new(
+        Vec::<HashMap<String, String>>::new(),
+    ));
+    let captured_params_for_executor = captured_params.clone();
+
+    let execute_partition =
+        std::sync::Arc::new(move |group: StageTaskGroup, _auth_ctx, _timeout_secs| {
+            let captured_params_for_executor = captured_params_for_executor.clone();
+            Box::pin(async move {
+                captured_params_for_executor
+                    .lock()
+                    .await
+                    .push(group.params.clone());
+                Ok::<String, Box<dyn std::error::Error + Send + Sync>>(stage_result_location(
+                    &group,
+                ))
+            }) as super::StagePartitionFuture
+        });
+
+    let _ = super::run_stage_groups_with_partition_executor(
+        &stage_groups,
+        Some(&auth_ctx_with_query_id("q-query-type-matrix")),
+        1,
+        execute_partition,
+    )
+    .await
+    .expect("query-type matrix dispatch should preserve telemetry keys");
+
+    let captured = captured_params.lock().await;
+    assert_eq!(captured.len(), query_matrix.len());
+    for params in captured.iter() {
+        assert_contains_all_five_telemetry_keys(params);
     }
 }
 

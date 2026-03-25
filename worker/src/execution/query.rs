@@ -2,6 +2,8 @@
 
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
+use crate::telemetry::StageExecutionTelemetry;
+use url::Url;
 
 /// What: Canonical query namespace extracted from server-generated payload.
 ///
@@ -622,7 +624,7 @@ pub(crate) async fn execute_query_task_stub(
     };
     let result_location = build_result_location(shared, task, session_id, &namespace);
 
-    crate::execution::pipeline::execute_query_task(
+    let telemetry = crate::execution::pipeline::execute_query_task(
         shared,
         task,
         session_id,
@@ -631,7 +633,84 @@ pub(crate) async fn execute_query_task_stub(
     )
     .await?;
 
-    Ok(result_location)
+    Ok(append_stage_telemetry_to_result_location(
+        &result_location,
+        &telemetry,
+    ))
+}
+
+/// What: Append stage telemetry fields to a worker query result location URI.
+///
+/// Inputs:
+/// - `result_location`: Base query result location returned by worker.
+/// - `telemetry`: Stage execution telemetry captured during pipeline run.
+///
+/// Output:
+/// - URI with appended telemetry query params when parsable; otherwise the original URI.
+fn append_stage_telemetry_to_result_location(
+    result_location: &str,
+    telemetry: &StageExecutionTelemetry,
+) -> String {
+    let mut parsed = match Url::parse(result_location) {
+        Ok(value) => value,
+        Err(_) => return result_location.to_string(),
+    };
+
+    {
+        let mut pairs = parsed.query_pairs_mut();
+        pairs.append_pair(
+            "stage_latency_stage_id",
+            &telemetry.latency.stage_id.to_string(),
+        );
+        pairs.append_pair(
+            "stage_latency_queue_ms",
+            &telemetry.latency.queue_ms.to_string(),
+        );
+        pairs.append_pair(
+            "stage_latency_exec_ms",
+            &telemetry.latency.exec_ms.to_string(),
+        );
+        pairs.append_pair(
+            "stage_latency_network_ms",
+            &telemetry.latency.network_ms.to_string(),
+        );
+
+        if let Some(network) = telemetry.network.as_ref() {
+            pairs.append_pair(
+                "stage_network_endpoint_count",
+                &network.downstream_endpoint_count.to_string(),
+            );
+            pairs.append_pair(
+                "stage_network_write_ms",
+                &network.downstream_write_ms.to_string(),
+            );
+            pairs.append_pair(
+                "stage_network_batches",
+                &network.downstream_queued_frames.to_string(),
+            );
+            pairs.append_pair(
+                "stage_network_bytes",
+                &network.downstream_queued_bytes.to_string(),
+            );
+        }
+
+        if let Some(memory) = telemetry.memory.as_ref() {
+            pairs.append_pair(
+                "stage_memory_peak_batch_bytes",
+                &memory.peak_batch_bytes.to_string(),
+            );
+            pairs.append_pair(
+                "stage_memory_sampled_batches",
+                &memory.sampled_batches.to_string(),
+            );
+            pairs.append_pair(
+                "stage_memory_spill_threshold_exceeded",
+                &memory.spill_threshold_exceeded.to_string(),
+            );
+        }
+    }
+
+    parsed.to_string()
 }
 
 #[cfg(test)]

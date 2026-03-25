@@ -1,9 +1,11 @@
+use crate::statement_handler::shared::distributed_dag;
 use crate::warehouse::state::SharedData;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::workers::PooledConn;
 use uuid::Uuid;
@@ -16,6 +18,127 @@ fn format_outcome(category: &str, code: &str, message: &str) -> String {
 
 fn parse_u32_param(params: &HashMap<String, String>, key: &str) -> Option<u32> {
     params.get(key).and_then(|v| v.parse::<u32>().ok())
+}
+
+#[derive(Debug, Clone)]
+struct StageLatencyBreakdown {
+    queue_ms: u128,
+    exec_ms: u128,
+    network_ms: u128,
+    network_write_ms: u128,
+    network_bytes: u128,
+    network_batches: u128,
+}
+
+fn parse_stage_latency_from_result_location(location: &str) -> Option<StageLatencyBreakdown> {
+    let parsed = url::Url::parse(location).ok()?;
+
+    let mut queue_ms = None;
+    let mut exec_ms = None;
+    let mut network_ms = None;
+    let mut network_write_ms = None;
+    let mut network_bytes = None;
+    let mut network_batches = None;
+
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "stage_latency_queue_ms" => queue_ms = value.parse::<u128>().ok(),
+            "stage_latency_exec_ms" => exec_ms = value.parse::<u128>().ok(),
+            "stage_latency_network_ms" => network_ms = value.parse::<u128>().ok(),
+            "stage_network_write_ms" => network_write_ms = value.parse::<u128>().ok(),
+            "stage_network_bytes" => network_bytes = value.parse::<u128>().ok(),
+            "stage_network_batches" => network_batches = value.parse::<u128>().ok(),
+            _ => {}
+        }
+    }
+
+    Some(StageLatencyBreakdown {
+        queue_ms: queue_ms?,
+        exec_ms: exec_ms?,
+        network_ms: network_ms?,
+        network_write_ms: network_write_ms.unwrap_or_default(),
+        network_bytes: network_bytes.unwrap_or_default(),
+        network_batches: network_batches.unwrap_or_default(),
+    })
+}
+
+fn append_stage_latency_breakdown_to_result_location(
+    result_location: &str,
+    per_stage_latency: &BTreeMap<u32, StageLatencyBreakdown>,
+) -> String {
+    if per_stage_latency.is_empty() {
+        return result_location.to_string();
+    }
+
+    let mut parsed = match url::Url::parse(result_location) {
+        Ok(value) => value,
+        Err(_) => return result_location.to_string(),
+    };
+
+    let mut total_queue_ms = 0u128;
+    let mut total_exec_ms = 0u128;
+    let mut total_network_ms = 0u128;
+    let mut total_network_write_ms = 0u128;
+    let mut total_network_bytes = 0u128;
+    let mut total_network_batches = 0u128;
+
+    {
+        let mut query_pairs = parsed.query_pairs_mut();
+        query_pairs.append_pair("latency_stage_count", &per_stage_latency.len().to_string());
+
+        for (stage_id, metrics) in per_stage_latency {
+            total_queue_ms = total_queue_ms.saturating_add(metrics.queue_ms);
+            total_exec_ms = total_exec_ms.saturating_add(metrics.exec_ms);
+            total_network_ms = total_network_ms.saturating_add(metrics.network_ms);
+            total_network_write_ms =
+                total_network_write_ms.saturating_add(metrics.network_write_ms);
+            total_network_bytes = total_network_bytes.saturating_add(metrics.network_bytes);
+            total_network_batches = total_network_batches.saturating_add(metrics.network_batches);
+
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_queue_ms", stage_id),
+                &metrics.queue_ms.to_string(),
+            );
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_exec_ms", stage_id),
+                &metrics.exec_ms.to_string(),
+            );
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_network_ms", stage_id),
+                &metrics.network_ms.to_string(),
+            );
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_network_write_ms", stage_id),
+                &metrics.network_write_ms.to_string(),
+            );
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_network_bytes", stage_id),
+                &metrics.network_bytes.to_string(),
+            );
+            query_pairs.append_pair(
+                &format!("latency_stage_{}_network_batches", stage_id),
+                &metrics.network_batches.to_string(),
+            );
+        }
+
+        query_pairs.append_pair("latency_total_queue_ms", &total_queue_ms.to_string());
+        query_pairs.append_pair("latency_total_exec_ms", &total_exec_ms.to_string());
+        query_pairs.append_pair("latency_total_network_ms", &total_network_ms.to_string());
+        query_pairs.append_pair(
+            "latency_total_network_write_ms",
+            &total_network_write_ms.to_string(),
+        );
+        query_pairs.append_pair(
+            "latency_total_network_bytes",
+            &total_network_bytes.to_string(),
+        );
+        query_pairs.append_pair(
+            "latency_total_network_batches",
+            &total_network_batches.to_string(),
+        );
+    }
+
+    parsed.to_string()
 }
 
 /// What: Format the stage-dispatch diagnostics event for EP-1 runtime observability.
@@ -40,6 +163,53 @@ pub(crate) fn format_stage_dispatch_boundary_event(
     format!(
         "event=execution.stage_dispatch_boundary query_id={} stage_id={} task_id={} category=execution origin=server_dispatch partition_count={}",
         query_id, stage_id, task_id, partition_count
+    )
+}
+
+/// What: Format the stage-dispatch observability event with telemetry dimensions.
+///
+/// Inputs:
+/// - `query_id`: Query correlation id.
+/// - `stage_id`: Distributed stage id.
+/// - `route_source`: Routing source used to resolve worker pool.
+/// - `worker_destination`: Selected worker key.
+/// - `warehouse`: Warehouse name for dispatch destination context.
+/// - `dag_metrics_present`: Whether DAG metrics telemetry key is present.
+/// - `plan_validation_status`: Distributed plan validation status telemetry.
+/// - `stage_extraction_mismatch`: Whether extraction mismatch was detected.
+/// - `datafusion_stage_count`: Extracted DataFusion stage count telemetry.
+/// - `distributed_stage_count`: Distributed compiled stage count telemetry.
+///
+/// Output:
+/// - Stable event line suitable for operational telemetry validation.
+///
+/// Details:
+/// - Event name is fixed to `execution.stage_dispatch_observability`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn format_stage_dispatch_observability_event(
+    query_id: &str,
+    stage_id: u32,
+    route_source: &str,
+    worker_destination: &str,
+    warehouse: &str,
+    dag_metrics_present: bool,
+    plan_validation_status: &str,
+    stage_extraction_mismatch: &str,
+    datafusion_stage_count: &str,
+    distributed_stage_count: &str,
+) -> String {
+    format!(
+        "event=execution.stage_dispatch_observability query_id={} stage_id={} route_source={} worker_destination={} warehouse={} dag_metrics_present={} plan_validation_status={} stage_extraction_mismatch={} datafusion_stage_count={} distributed_stage_count={}",
+        query_id,
+        stage_id,
+        route_source,
+        worker_destination,
+        warehouse,
+        dag_metrics_present,
+        plan_validation_status,
+        stage_extraction_mismatch,
+        datafusion_stage_count,
+        distributed_stage_count
     )
 }
 
@@ -307,6 +477,45 @@ pub async fn run_task_for_input_with_params(
     {
         params.insert("__query_id".to_string(), ctx.query_id.clone());
     }
+    if operation.eq_ignore_ascii_case("query") {
+        let now_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| {
+                Box::new(std::io::Error::other(format!(
+                    "failed to read system clock while enqueueing dispatch: {}",
+                    e
+                ))) as Box<dyn Error + Send + Sync>
+            })?
+            .as_millis();
+        params.insert(
+            "__dispatch_enqueued_at_ms".to_string(),
+            now_epoch_ms.to_string(),
+        );
+    }
+
+    let observability_route_source = params
+        .get(distributed_dag::ROUTING_WORKER_SOURCE_PARAM)
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let observability_plan_validation_status = params
+        .get(distributed_dag::OBS_PLAN_VALIDATION_STATUS_PARAM)
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string());
+    let observability_stage_extraction_mismatch = params
+        .get(distributed_dag::OBS_STAGE_EXTRACTION_MISMATCH_PARAM)
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string());
+    let observability_datafusion_stage_count = params
+        .get(distributed_dag::OBS_DATAFUSION_STAGE_COUNT_PARAM)
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string());
+    let observability_distributed_stage_count = params
+        .get(distributed_dag::OBS_DISTRIBUTED_STAGE_COUNT_PARAM)
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string());
+    let observability_dag_metrics_present =
+        params.contains_key(distributed_dag::OBS_DAG_METRICS_JSON_PARAM);
+
     let query_id_for_event = query_id.clone();
     let task_id = build_task_and_schedule(
         shared_data,
@@ -329,6 +538,21 @@ pub async fn run_task_for_input_with_params(
                 stage_id,
                 &task_id,
                 diagnostics_partition_count,
+            )
+        );
+        log::info!(
+            "{}",
+            format_stage_dispatch_observability_event(
+                &query_id_for_event,
+                stage_id,
+                &observability_route_source,
+                &key,
+                &session.get_warehouse(),
+                observability_dag_metrics_present,
+                &observability_plan_validation_status,
+                &observability_stage_extraction_mismatch,
+                &observability_datafusion_stage_count,
+                &observability_distributed_stage_count,
             )
         );
     }
@@ -526,6 +750,7 @@ async fn run_stage_groups_with_partition_executor(
     }
 
     let mut result_by_stage = HashMap::<u32, String>::new();
+    let mut stage_latency_by_stage = BTreeMap::<u32, StageLatencyBreakdown>::new();
     let stage_waves =
         crate::statement_handler::shared::distributed_dag::build_stage_execution_waves(
             stage_groups,
@@ -629,6 +854,11 @@ async fn run_stage_groups_with_partition_executor(
             })?;
             let (stage_id, stage_result_location) =
                 stage_result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            if let Some(latency_metrics) =
+                parse_stage_latency_from_result_location(&stage_result_location)
+            {
+                stage_latency_by_stage.insert(stage_id, latency_metrics);
+            }
             result_by_stage.insert(stage_id, stage_result_location);
         }
     }
@@ -643,14 +873,19 @@ async fn run_stage_groups_with_partition_executor(
             )) as Box<dyn Error + Send + Sync>
         })?;
 
-    result_by_stage
+    let final_result_location = result_by_stage
         .remove(&final_stage.stage_id)
         .ok_or_else(|| {
             Box::new(std::io::Error::other(format!(
                 "final stage {} has no result location",
                 final_stage.stage_id
             ))) as Box<dyn Error + Send + Sync>
-        })
+        })?;
+
+    Ok(append_stage_latency_breakdown_to_result_location(
+        &final_result_location,
+        &stage_latency_by_stage,
+    ))
 }
 
 #[cfg(test)]
