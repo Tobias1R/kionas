@@ -6,6 +6,25 @@ x-remote-infra-hosts: &remote_infra_hosts
   - "kionas-postgres:192.168.0.15"
 
 services:
+
+  builder:
+    build:
+      context: ..
+      dockerfile: ./docker/Dockerfile.dev
+    container_name: kionas-builder
+    environment:
+      RUST_LOG: debug
+      RUST_BACKTRACE: full
+      KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
+      CONSUL_URL: http://kionas-consul:8500
+      REDIS_URL: redis://kionas-redis:6379      
+    networks:
+      - warehouse_network
+    extra_hosts: *remote_infra_hosts
+    volumes:
+      - ..:/workspace:cached
+    command: ["bash", "-c", "cargo build" ]
   
   devcontainer:
     build:
@@ -46,8 +65,10 @@ services:
       REDIS_URL: redis://kionas-redis:6379     
     volumes:
       - ..:/workspace:cached     
+    depends_on:
+      - builder
     # inifinite loop to keep the container running, replace with actual command when ready
-    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+    command: ["bash", "-c", "/workspace/target/debug/metastore" ]
 
   # warehouse container
   warehouse:
@@ -69,8 +90,9 @@ services:
     volumes:
       - ..:/workspace:cached
     depends_on:
+      - builder
       - metastore      
-    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+    command: ["bash", "-c", "/workspace/target/debug/server" ]
 
   # flight proxy container
   flight-proxy:
@@ -91,7 +113,7 @@ services:
       - ..:/workspace:cached
     depends_on:
       - warehouse
-    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+    command: ["bash", "-c", "/workspace/target/debug/flight_proxy" ]
 
   # worker container
   worker1:
@@ -119,7 +141,7 @@ services:
       - ..:/workspace:cached
     depends_on:
       - warehouse
-    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+    command: ["bash", "-c", "/workspace/target/debug/worker worker1" ]
 
   worker2:
     image: docker-devcontainer
@@ -146,7 +168,7 @@ services:
       - ..:/workspace:cached
     depends_on:
       - warehouse
-    command: ["bash", "-c", "while true; do sleep 1000; done" ]
+    command: ["bash", "-c", "/workspace/target/debug/worker worker2" ]
   # UI backend container
   ui-backend:
     image: docker-devcontainer
@@ -167,7 +189,9 @@ services:
       UI_BACKEND_PORT: 8081
     volumes:
       - ..:/workspace:cached
-    command: ["bash", "-c", "cd /workspace; cargo run -p ui_backend"]
+    depends_on:
+      - warehouse
+    command: ["bash", "-c", "/workspace/target/debug/ui_backend" ]
     
 
   

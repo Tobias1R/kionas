@@ -448,6 +448,12 @@ fn resolve_query_namespace_from_params(
 /// - `true` when stage metadata indicates distributed stage execution.
 fn is_stage_query_task(task: &worker_service::StagePartitionExecution) -> bool {
     task.stage_id > 0
+        || task.partition_count > 0
+        || !task.upstream_stage_ids.is_empty()
+        || !task.upstream_partition_counts.is_empty()
+        || task.params.contains_key("stage_id")
+        || task.params.contains_key("partition_index")
+        || task.params.contains_key("query_kind")
 }
 
 /// What: Parse and validate canonical SELECT query payload.

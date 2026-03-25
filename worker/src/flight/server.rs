@@ -193,14 +193,27 @@ fn normalize_destination_endpoint(raw: &str) -> Result<String, String> {
 
     let parsed = Url::parse(&candidate)
         .map_err(|e| format!("invalid output destination worker address '{}': {}", raw, e))?;
-    if parsed.host_str().is_none() || parsed.port().is_none() {
-        return Err(format!(
+    let host = parsed.host_str().ok_or_else(|| {
+        format!(
             "invalid output destination worker address '{}': host and port are required",
             raw
-        ));
-    }
+        )
+    })?;
+    let parsed_port = parsed.port().ok_or_else(|| {
+        format!(
+            "invalid output destination worker address '{}': host and port are required",
+            raw
+        )
+    })?;
 
-    Ok(candidate)
+    let interops_port = resolve_worker_interops_port();
+    let endpoint_port = if u32::from(parsed_port) == interops_port {
+        resolve_worker_flight_port(interops_port)
+    } else {
+        u32::from(parsed_port)
+    };
+
+    Ok(format!("{}://{}:{}", parsed.scheme(), host, endpoint_port))
 }
 
 fn stage_destination_task_id(
@@ -660,6 +673,21 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(default_worker_port.saturating_add(1))
+}
+
+/// What: Resolve worker interops port from environment with stable default.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Worker interops port used for endpoint normalization.
+fn resolve_worker_interops_port() -> u32 {
+    std::env::var("WORKER_INTEROPS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(50051)
 }
 
 /// What: Build worker Flight endpoint URI advertised in FlightInfo.

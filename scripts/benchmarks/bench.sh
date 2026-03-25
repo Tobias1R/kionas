@@ -27,6 +27,9 @@ if [[ ${#batch_sizes[@]} -eq 0 ]]; then
   exit 1
 fi
 
+declare -A measured_rps_sum
+declare -A measured_rps_count
+
 mkdir -p "$(dirname "$out")"
 
 printf '%s\n' 'run_id,timestamp_utc,profile_id,dataset_tier,row_count_per_table,table_count,warmup_runs,measured_runs,batch_size,wall_time_ms,rows_processed,rows_per_second,artifact_size_bytes,stage_runtime_ms,batch_count,result_row_count,notes' > "$out"
@@ -86,6 +89,12 @@ for batch_size in "${batch_sizes[@]}"; do
         artifact_size_value="$network_bytes_total"
       fi
 
+      if [ "$phase" = "MEAS" ]; then
+        current_sum="${measured_rps_sum[$batch_size]:-0}"
+        measured_rps_sum[$batch_size]=$(awk -v a="$current_sum" -v b="$rps" 'BEGIN { printf "%.6f", a + b }')
+        measured_rps_count[$batch_size]=$(( ${measured_rps_count[$batch_size]:-0} + 1 ))
+      fi
+
       printf '%s,%s,%s,%s,%s,%s,1,3,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
         "$run_id" "$ts" "$pid" "$tier" "$rowcount" "$tablecount" "$batch_size" "$wall_ms" "$rows" "$rps" "$artifact_size_value" "$stage_runtime_value" "$batches" "$rows" "$note" >> "$out"
 
@@ -95,3 +104,56 @@ for batch_size in "${batch_sizes[@]}"; do
 done
 
 echo "WROTE $out"
+
+best_batch_size=""
+best_avg_rps="0"
+
+for batch_size in "${batch_sizes[@]}"; do
+  count="${measured_rps_count[$batch_size]:-0}"
+  if [ "$count" -eq 0 ]; then
+    continue
+  fi
+
+  sum="${measured_rps_sum[$batch_size]:-0}"
+  avg=$(awk -v s="$sum" -v c="$count" 'BEGIN { if (c > 0) printf "%.6f", s / c; else print "0" }')
+
+  if [ -z "$best_batch_size" ] || awk -v a="$avg" -v b="$best_avg_rps" 'BEGIN { exit !(a > b) }'; then
+    best_batch_size="$batch_size"
+    best_avg_rps="$avg"
+  fi
+done
+
+if [ -n "$best_batch_size" ]; then
+  reference_batch_size="4096"
+  reference_count="${measured_rps_count[$reference_batch_size]:-0}"
+
+  if [ "$reference_count" -eq 0 ]; then
+    reference_batch_size=""
+    reference_avg_rps="0"
+    for batch_size in "${batch_sizes[@]}"; do
+      if [ "$batch_size" = "$best_batch_size" ]; then
+        continue
+      fi
+      count="${measured_rps_count[$batch_size]:-0}"
+      if [ "$count" -eq 0 ]; then
+        continue
+      fi
+      sum="${measured_rps_sum[$batch_size]:-0}"
+      avg=$(awk -v s="$sum" -v c="$count" 'BEGIN { if (c > 0) printf "%.6f", s / c; else print "0" }')
+      if [ -z "$reference_batch_size" ] || awk -v a="$avg" -v b="$reference_avg_rps" 'BEGIN { exit !(a > b) }'; then
+        reference_batch_size="$batch_size"
+        reference_avg_rps="$avg"
+      fi
+    done
+  else
+    reference_sum="${measured_rps_sum[$reference_batch_size]:-0}"
+    reference_avg_rps=$(awk -v s="$reference_sum" -v c="$reference_count" 'BEGIN { if (c > 0) printf "%.6f", s / c; else print "0" }')
+  fi
+
+  if [ -n "${reference_batch_size:-}" ] && awk -v r="${reference_avg_rps:-0}" 'BEGIN { exit !(r > 0) }'; then
+    improvement_pct=$(awk -v b="$best_avg_rps" -v r="$reference_avg_rps" 'BEGIN { printf "%.1f", ((b - r) / r) * 100 }')
+    echo "Optimal batch size: ${best_batch_size} rows (${improvement_pct}% better throughput than ${reference_batch_size})"
+  else
+    echo "Optimal batch size: ${best_batch_size} rows"
+  fi
+fi
