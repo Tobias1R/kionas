@@ -12,6 +12,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize logging
     env_logger::init();
 
+    // Force a deterministic rustls provider so TLS setup cannot panic on feature ambiguity.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Load a unified AppConfig (Consul -> local) and use its sections directly
     let consul_url = std::env::var("CONSUL_URL").ok();
     let hostname = kionas::get_local_hostname().unwrap_or_else(|| "metastore".to_string());
