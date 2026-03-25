@@ -7,6 +7,7 @@ use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -22,6 +23,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tonic14::metadata::MetadataValue;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
 
@@ -166,6 +168,219 @@ impl WorkerFlightService {
                 Status::new(code, e.to_string())
             })
     }
+}
+
+/// What: Normalize one destination address into a valid Flight endpoint URI.
+///
+/// Inputs:
+/// - `raw`: Worker address from stage output destination.
+///
+/// Output:
+/// - HTTP endpoint URI accepted by tonic Flight clients.
+fn normalize_destination_endpoint(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("output destination worker address is empty".to_string());
+    }
+
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    let parsed = Url::parse(&candidate)
+        .map_err(|e| format!("invalid output destination worker address '{}': {}", raw, e))?;
+    if parsed.host_str().is_none() || parsed.port().is_none() {
+        return Err(format!(
+            "invalid output destination worker address '{}': host and port are required",
+            raw
+        ));
+    }
+
+    Ok(candidate)
+}
+
+fn stage_destination_task_id(
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    destination: &crate::services::worker_service_server::worker_service::OutputDestination,
+    worker_address: &str,
+    worker_index: usize,
+) -> String {
+    let sanitized = worker_address
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let query_run = if task.query_run_id.trim().is_empty() {
+        format!("legacy-task-{}", task.task_id)
+    } else {
+        task.query_run_id.clone()
+    };
+
+    format!(
+        "stage-{}-part-{}-to-stage-{}-dest-{}-{}-{}",
+        task.stage_id,
+        task.partition_id,
+        destination.downstream_stage_id,
+        worker_index,
+        query_run,
+        sanitized
+    )
+}
+
+fn insert_dispatch_metadata_for_downstream(
+    request: &mut Request<impl Sized>,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+) -> Result<(), String> {
+    let auth_scope = task
+        .params
+        .get("__auth_scope")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query authorization scope metadata is missing".to_string())?;
+    let rbac_user = task
+        .params
+        .get("__rbac_user")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query rbac_user metadata is missing".to_string())?;
+    let rbac_role = task
+        .params
+        .get("__rbac_role")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query rbac_role metadata is missing".to_string())?;
+    let query_id = task
+        .params
+        .get("__query_id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+
+    let metadata = request.metadata_mut();
+    metadata.insert(
+        "session_id",
+        MetadataValue::try_from(session_id)
+            .map_err(|e| format!("invalid session_id metadata: {}", e))?,
+    );
+    metadata.insert(
+        "rbac_user",
+        MetadataValue::try_from(rbac_user)
+            .map_err(|e| format!("invalid rbac_user metadata: {}", e))?,
+    );
+    metadata.insert(
+        "rbac_role",
+        MetadataValue::try_from(rbac_role)
+            .map_err(|e| format!("invalid rbac_role metadata: {}", e))?,
+    );
+    metadata.insert(
+        "auth_scope",
+        MetadataValue::try_from(auth_scope)
+            .map_err(|e| format!("invalid auth_scope metadata: {}", e))?,
+    );
+    metadata.insert(
+        "query_id",
+        MetadataValue::try_from(query_id)
+            .map_err(|e| format!("invalid query_id metadata: {}", e))?,
+    );
+
+    Ok(())
+}
+
+/// What: Stream stage partition output batches to downstream worker destinations via Flight.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state used for Flight client configuration.
+/// - `task`: Stage task carrying output destination routing contract.
+/// - `session_id`: Session identifier for auth and descriptor scope.
+/// - `batches`: Normalized stage output batches to stream.
+///
+/// Output:
+/// - `Ok(())` when all destination do_put streams are acknowledged.
+/// - `Err(message)` when any destination connection or stream fails.
+pub(crate) async fn stream_stage_partition_to_output_destinations(
+    shared_data: &SharedData,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+    batches: &[RecordBatch],
+) -> Result<(), String> {
+    if task.output_destinations.is_empty() {
+        return Ok(());
+    }
+
+    if batches.is_empty() {
+        return Err("cannot stream empty stage output batches to downstream workers".to_string());
+    }
+
+    let service = WorkerFlightService::new(shared_data.clone());
+
+    for destination in &task.output_destinations {
+        if destination.worker_addresses.is_empty() {
+            return Err(format!(
+                "output destination for downstream_stage_id={} has no worker addresses",
+                destination.downstream_stage_id
+            ));
+        }
+
+        for (worker_index, worker_address) in destination.worker_addresses.iter().enumerate() {
+            let endpoint = normalize_destination_endpoint(worker_address)?;
+            let channel = service
+                .get_downstream_channel(&endpoint)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to connect downstream Flight endpoint {}: {}",
+                        endpoint, e
+                    )
+                })?;
+
+            let mut payloads =
+                batches_to_flight_data(batches[0].schema().as_ref(), batches.to_vec())
+                    .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
+            let downstream_task_id =
+                stage_destination_task_id(task, destination, worker_address, worker_index);
+
+            if let Some(first) = payloads.first_mut() {
+                first.flight_descriptor = Some(FlightDescriptor::new_path(vec![
+                    session_id.to_string(),
+                    downstream_task_id,
+                ]));
+            }
+
+            let request_stream = stream::iter(payloads);
+            let mut request = Request::new(request_stream);
+            insert_dispatch_metadata_for_downstream(&mut request, task, session_id)?;
+
+            let mut client = FlightServiceClient::new(channel);
+            let mut response = client
+                .do_put(request)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "failed to stream stage output to downstream endpoint {}: {}",
+                        endpoint, e
+                    )
+                })?
+                .into_inner();
+
+            while response
+                .message()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "downstream endpoint {} failed while acknowledging stage stream: {}",
+                        endpoint, e
+                    )
+                })?
+                .is_some()
+            {
+                // Drain ack stream to ensure upstream death or write failures are surfaced.
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// What: Decode and verify the signed internal Flight ticket.

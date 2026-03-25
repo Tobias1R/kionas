@@ -1,7 +1,7 @@
 use super::{
     WorkerFlightService, checksum_fnv64_hex, expected_artifacts_from_metadata,
-    ingest_backpressure_limits, parse_descriptor_scope, schema_from_metadata, to_staging_prefix,
-    validate_metadata_alignment,
+    ingest_backpressure_limits, parse_descriptor_scope, schema_from_metadata,
+    stream_stage_partition_to_output_destinations, to_staging_prefix, validate_metadata_alignment,
 };
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -390,6 +390,78 @@ async fn do_put_rejects_empty_stream_with_invalid_argument() {
     assert_eq!(error.message(), "do_put stream is empty");
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn streams_stage_partition_output_to_downstream_destinations() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
+    let addr = listener.local_addr().expect("must have local addr");
+    drop(listener);
+
+    let downstream_provider = crate::storage::mock::MockProvider::new().into_arc();
+    let mut downstream_shared = sample_shared_data();
+    downstream_shared.worker_info.worker_id = "downstream-worker".to_string();
+    downstream_shared.worker_info.host = "127.0.0.1".to_string();
+    downstream_shared.worker_info.port = addr.port() as u32;
+    downstream_shared.worker_info.server_url = format!("http://{}", addr);
+    downstream_shared.set_storage_provider(downstream_provider.clone());
+
+    let downstream_service = WorkerFlightService::new(downstream_shared);
+    let downstream_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(downstream_service))
+            .serve(addr)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+
+    let upstream_shared = sample_shared_data();
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: vec![
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 2,
+                worker_addresses: vec![format!("http://{}", addr)],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+        ],
+        partition_count: 1,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: "Single".to_string(),
+        query_run_id: "run-2b3".to_string(),
+        query_id: "q-2b3".to_string(),
+        stage_id: 1,
+        partition_id: 0,
+        task_id: "task-upstream-1".to_string(),
+        operation: "query".to_string(),
+        input: "{}".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::from([
+            ("__auth_scope".to_string(), "select:*".to_string()),
+            ("__rbac_user".to_string(), "alice".to_string()),
+            ("__rbac_role".to_string(), "reader".to_string()),
+            ("__query_id".to_string(), "q-2b3".to_string()),
+        ]),
+        filter_predicate: None,
+    };
+
+    stream_stage_partition_to_output_destinations(&upstream_shared, &task, "s1", &sample_batches())
+        .await
+        .expect("stage output should stream to downstream do_put destination");
+
+    let mut keys = downstream_provider
+        .list_objects("query/flight/s1/")
+        .await
+        .expect("downstream storage listing should succeed");
+    keys.sort();
+
+    assert!(keys.iter().any(|k| k.ends_with("part-00000.parquet")));
+    assert!(keys.iter().any(|k| k.ends_with("result_metadata.json")));
+
+    downstream_handle.abort();
 }
 
 #[tokio::test]

@@ -417,19 +417,17 @@ fn parse_pruning_eligibility(pruning_hints_json: Option<&str>) -> (bool, Option<
 pub(crate) fn extract_runtime_plan(
     task: &worker_service::StagePartitionExecution,
 ) -> Result<RuntimePlan, String> {
-    let payload: serde_json::Value =
-        serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
+    let payload_opt = serde_json::from_str::<serde_json::Value>(&task.input).ok();
 
-    // Extract schema_metadata if present in payload (Phase 9b support)
-    let schema_metadata = if let Some(metadata_value) = payload.get("schema_metadata") {
-        match serde_json::from_value::<HashMap<String, ColumnDatatypeSpec>>(metadata_value.clone())
-        {
-            Ok(map) if !map.is_empty() => Some(map),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    // Extract schema_metadata when available in payload (Phase 9b support).
+    let schema_metadata = payload_opt
+        .as_ref()
+        .and_then(|payload| payload.get("schema_metadata"))
+        .and_then(|metadata_value| {
+            serde_json::from_value::<HashMap<String, ColumnDatatypeSpec>>(metadata_value.clone())
+                .ok()
+        })
+        .filter(|map| !map.is_empty());
 
     let operators = extract_runtime_operators(task)?;
 
@@ -543,9 +541,30 @@ pub(crate) fn extract_runtime_plan(
 fn extract_runtime_operators(
     task: &worker_service::StagePartitionExecution,
 ) -> Result<Vec<PhysicalOperator>, String> {
+    if !task.execution_plan.is_empty() {
+        let execution_plan_payload =
+            serde_json::from_slice::<serde_json::Value>(&task.execution_plan)
+                .map_err(|e| format!("invalid execution_plan payload: {}", e))?;
+        return decode_runtime_operators_from_payload(&execution_plan_payload)
+            .map_err(|e| format!("invalid execution_plan payload: {}", e));
+    }
+
     let payload: serde_json::Value =
         serde_json::from_str(&task.input).map_err(|e| format!("invalid query payload: {}", e))?;
 
+    decode_runtime_operators_from_payload(&payload)
+}
+
+/// What: Decode executable operators from one canonical/stage payload shape.
+///
+/// Inputs:
+/// - `payload`: Serialized stage payload, operators array, or canonical query payload.
+///
+/// Output:
+/// - Ordered executable physical operators.
+fn decode_runtime_operators_from_payload(
+    payload: &serde_json::Value,
+) -> Result<Vec<PhysicalOperator>, String> {
     if let Some(operators) = payload.as_array() {
         return serde_json::from_value(serde_json::Value::Array(operators.clone()))
             .map_err(|e| format!("invalid stage operator payload: {}", e));

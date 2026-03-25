@@ -1,4 +1,4 @@
-use crate::execution::planner::stage_execution_context;
+use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
 use crate::services::worker_service_server::worker_service;
 
 fn build_query_task() -> worker_service::StagePartitionExecution {
@@ -67,4 +67,31 @@ fn stage_execution_context_rejects_zero_based_stage_with_invalid_partition_bound
     let err = stage_execution_context(&task)
         .expect_err("staged zero-based task should fail when partition_id is out of bounds");
     assert!(err.starts_with("EXECUTION_EXCHANGE_PARTITION_CONTEXT_MISSING:"));
+}
+
+#[test]
+fn extract_runtime_plan_prefers_execution_plan_bytes_for_stage_task() {
+    let mut task = build_query_task();
+    task.input = "not-json".to_string();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "db1", "schema": "s1", "table": "t1"}}},
+        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan = extract_runtime_plan(&task)
+        .expect("runtime planner should decode operators from execution_plan bytes");
+    assert!(plan.has_materialize);
+    assert_eq!(plan.projection_exprs.len(), 1);
+}
+
+#[test]
+fn extract_runtime_plan_rejects_invalid_execution_plan_bytes() {
+    let mut task = build_query_task();
+    task.execution_plan = b"not-json".to_vec();
+
+    let err = extract_runtime_plan(&task)
+        .expect_err("invalid execution_plan bytes must be rejected with actionable error");
+    assert!(err.contains("invalid execution_plan payload"));
 }

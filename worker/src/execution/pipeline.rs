@@ -1391,6 +1391,15 @@ pub(crate) async fn execute_query_task(
     .await
     .map_err(|e| format!("{} [{}]", e, context_tag))?;
 
+    crate::flight::server::stream_stage_partition_to_output_destinations(
+        shared,
+        task,
+        session_id,
+        &normalized_batches,
+    )
+    .await
+    .map_err(|e| format!("{} [{}]", e, context_tag))?;
+
     log::info!(
         "{}",
         format_exchange_io_decision_event(
