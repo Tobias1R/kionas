@@ -20,6 +20,7 @@ use tonic14::metadata::MetadataValue;
 use tonic14::transport::{Channel, Endpoint, Server};
 use tonic14::{Code, Request};
 
+use crate::execution::router::{route_batch_hash, route_batch_roundrobin};
 use crate::state::{SharedData, WorkerInformation};
 use crate::storage::StorageProvider;
 
@@ -132,6 +133,37 @@ fn sample_two_column_batches() -> Vec<RecordBatch> {
     )
     .expect("batch must build");
     vec![batch]
+}
+
+fn sample_id_value_batch(start: i64, end_inclusive: i64) -> RecordBatch {
+    let ids = (start..=end_inclusive).collect::<Vec<_>>();
+    let values = ids.clone();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)) as ArrayRef,
+            Arc::new(Int64Array::from(values)) as ArrayRef,
+        ],
+    )
+    .expect("id/value batch must build")
+}
+
+fn extract_int64_column(batch: &RecordBatch, column: &str) -> Vec<i64> {
+    let idx = batch
+        .schema()
+        .index_of(column)
+        .expect("test column should exist");
+    let arr = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("test column should be Int64");
+    (0..arr.len()).map(|row| arr.value(row)).collect::<Vec<_>>()
 }
 
 fn do_put_ipc_payloads_with_descriptor() -> Vec<FlightData> {
@@ -450,9 +482,15 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
         filter_predicate: None,
     };
 
-    stream_stage_partition_to_output_destinations(&upstream_shared, &task, "s1", &sample_batches())
-        .await
-        .expect("stage output should stream to downstream do_put destination");
+    stream_stage_partition_to_output_destinations(
+        &upstream_shared,
+        &task,
+        "s1",
+        &sample_batches(),
+        None,
+    )
+    .await
+    .expect("stage output should stream to downstream do_put destination");
 
     let mut keys = downstream_provider
         .list_objects("query/flight/s1/")
@@ -464,6 +502,407 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
     assert!(keys.iter().any(|k| k.ends_with("result_metadata.json")));
 
     downstream_handle.abort();
+}
+
+#[tokio::test]
+async fn streams_routed_batches_to_matching_output_destination_index() {
+    let listener_a = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
+    let addr_a = listener_a.local_addr().expect("must have local addr");
+    drop(listener_a);
+
+    let listener_b = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
+    let addr_b = listener_b.local_addr().expect("must have local addr");
+    drop(listener_b);
+
+    let provider_a = crate::storage::mock::MockProvider::new().into_arc();
+    let provider_b = crate::storage::mock::MockProvider::new().into_arc();
+
+    let mut shared_a = sample_shared_data();
+    shared_a.worker_info.worker_id = "downstream-worker-a".to_string();
+    shared_a.worker_info.host = "127.0.0.1".to_string();
+    shared_a.worker_info.port = addr_a.port() as u32;
+    shared_a.worker_info.server_url = format!("http://{}", addr_a);
+    shared_a.set_storage_provider(provider_a.clone());
+
+    let mut shared_b = sample_shared_data();
+    shared_b.worker_info.worker_id = "downstream-worker-b".to_string();
+    shared_b.worker_info.host = "127.0.0.1".to_string();
+    shared_b.worker_info.port = addr_b.port() as u32;
+    shared_b.worker_info.server_url = format!("http://{}", addr_b);
+    shared_b.set_storage_provider(provider_b.clone());
+
+    let service_a = WorkerFlightService::new(shared_a);
+    let service_b = WorkerFlightService::new(shared_b);
+
+    let handle_a = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(service_a))
+            .serve(addr_a)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+    let handle_b = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(service_b))
+            .serve(addr_b)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+
+    let upstream_shared = sample_shared_data();
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: vec![
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 2,
+                worker_addresses: vec![format!("http://{}", addr_a)],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 3,
+                worker_addresses: vec![format!("http://{}", addr_b)],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+        ],
+        partition_count: 1,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: "Single".to_string(),
+        query_run_id: "run-2c3-routed".to_string(),
+        query_id: "q-2c3-routed".to_string(),
+        stage_id: 1,
+        partition_id: 0,
+        task_id: "task-upstream-routed".to_string(),
+        operation: "query".to_string(),
+        input: "{}".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::from([
+            ("__auth_scope".to_string(), "select:*".to_string()),
+            ("__rbac_user".to_string(), "alice".to_string()),
+            ("__rbac_role".to_string(), "reader".to_string()),
+            ("__query_id".to_string(), "q-2c3-routed".to_string()),
+        ]),
+        filter_predicate: None,
+    };
+
+    let routed_a = vec![
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![10_i64, 11_i64])) as ArrayRef],
+        )
+        .expect("routed batch A must build"),
+    ];
+    let routed_b = vec![
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![20_i64, 21_i64, 22_i64])) as ArrayRef],
+        )
+        .expect("routed batch B must build"),
+    ];
+    let routed = vec![routed_a, routed_b];
+
+    stream_stage_partition_to_output_destinations(
+        &upstream_shared,
+        &task,
+        "s1",
+        &sample_batches(),
+        Some(&routed),
+    )
+    .await
+    .expect("routed stage output should stream to matching downstream destinations");
+
+    let mut keys_a = provider_a
+        .list_objects("query/flight/s1/")
+        .await
+        .expect("provider A list should succeed");
+    keys_a.sort();
+    let metadata_key_a = keys_a
+        .iter()
+        .find(|key| key.ends_with("result_metadata.json"))
+        .expect("provider A metadata key should exist")
+        .clone();
+    let metadata_a = provider_a
+        .get_object(&metadata_key_a)
+        .await
+        .expect("provider A metadata read should succeed")
+        .expect("provider A metadata should exist");
+    let metadata_a: serde_json::Value =
+        serde_json::from_slice(&metadata_a).expect("provider A metadata should parse");
+    assert_eq!(
+        metadata_a.get("row_count").and_then(|v| v.as_u64()),
+        Some(2)
+    );
+
+    let mut keys_b = provider_b
+        .list_objects("query/flight/s1/")
+        .await
+        .expect("provider B list should succeed");
+    keys_b.sort();
+    let metadata_key_b = keys_b
+        .iter()
+        .find(|key| key.ends_with("result_metadata.json"))
+        .expect("provider B metadata key should exist")
+        .clone();
+    let metadata_b = provider_b
+        .get_object(&metadata_key_b)
+        .await
+        .expect("provider B metadata read should succeed")
+        .expect("provider B metadata should exist");
+    let metadata_b: serde_json::Value =
+        serde_json::from_slice(&metadata_b).expect("provider B metadata should parse");
+    assert_eq!(
+        metadata_b.get("row_count").and_then(|v| v.as_u64()),
+        Some(3)
+    );
+
+    handle_a.abort();
+    handle_b.abort();
+}
+
+#[tokio::test]
+async fn rejects_routed_destination_count_mismatch() {
+    let upstream_shared = sample_shared_data();
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: vec![
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 2,
+                worker_addresses: vec!["http://127.0.0.1:32011".to_string()],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 3,
+                worker_addresses: vec!["http://127.0.0.1:32012".to_string()],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+        ],
+        partition_count: 1,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: "Single".to_string(),
+        query_run_id: "run-2c3-mismatch".to_string(),
+        query_id: "q-2c3-mismatch".to_string(),
+        stage_id: 1,
+        partition_id: 0,
+        task_id: "task-upstream-mismatch".to_string(),
+        operation: "query".to_string(),
+        input: "{}".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::from([
+            ("__auth_scope".to_string(), "select:*".to_string()),
+            ("__rbac_user".to_string(), "alice".to_string()),
+            ("__rbac_role".to_string(), "reader".to_string()),
+            ("__query_id".to_string(), "q-2c3-mismatch".to_string()),
+        ]),
+        filter_predicate: None,
+    };
+
+    let routed = vec![sample_batches()];
+    let error = stream_stage_partition_to_output_destinations(
+        &upstream_shared,
+        &task,
+        "s1",
+        &sample_batches(),
+        Some(&routed),
+    )
+    .await
+    .expect_err("mismatched routed destination count should fail");
+
+    assert!(error.contains("routed destination batch count mismatch"));
+}
+
+#[tokio::test]
+async fn routed_empty_destination_batches_fall_back_to_broadcast_batches() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
+    let addr = listener.local_addr().expect("must have local addr");
+    drop(listener);
+
+    let downstream_provider = crate::storage::mock::MockProvider::new().into_arc();
+    let mut downstream_shared = sample_shared_data();
+    downstream_shared.worker_info.worker_id = "downstream-worker-fallback".to_string();
+    downstream_shared.worker_info.host = "127.0.0.1".to_string();
+    downstream_shared.worker_info.port = addr.port() as u32;
+    downstream_shared.worker_info.server_url = format!("http://{}", addr);
+    downstream_shared.set_storage_provider(downstream_provider.clone());
+
+    let downstream_service = WorkerFlightService::new(downstream_shared);
+    let downstream_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(downstream_service))
+            .serve(addr)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+
+    let upstream_shared = sample_shared_data();
+    let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
+        execution_mode_hint: 0,
+        execution_plan: Vec::new(),
+        output_destinations: vec![
+            crate::services::worker_service_server::worker_service::OutputDestination {
+                downstream_stage_id: 2,
+                worker_addresses: vec![format!("http://{}", addr)],
+                partitioning: "Single".to_string(),
+                downstream_partition_count: 1,
+            },
+        ],
+        partition_count: 1,
+        upstream_stage_ids: Vec::new(),
+        upstream_partition_counts: std::collections::HashMap::new(),
+        partition_spec: "Single".to_string(),
+        query_run_id: "run-2c3-fallback".to_string(),
+        query_id: "q-2c3-fallback".to_string(),
+        stage_id: 1,
+        partition_id: 0,
+        task_id: "task-upstream-fallback".to_string(),
+        operation: "query".to_string(),
+        input: "{}".to_string(),
+        output: String::new(),
+        params: std::collections::HashMap::from([
+            ("__auth_scope".to_string(), "select:*".to_string()),
+            ("__rbac_user".to_string(), "alice".to_string()),
+            ("__rbac_role".to_string(), "reader".to_string()),
+            ("__query_id".to_string(), "q-2c3-fallback".to_string()),
+        ]),
+        filter_predicate: None,
+    };
+
+    let empty_routed = vec![Vec::<RecordBatch>::new()];
+    stream_stage_partition_to_output_destinations(
+        &upstream_shared,
+        &task,
+        "s1",
+        &sample_batches(),
+        Some(&empty_routed),
+    )
+    .await
+    .expect("empty routed destination batches should fall back to broadcast batches");
+
+    let mut keys = downstream_provider
+        .list_objects("query/flight/s1/")
+        .await
+        .expect("downstream storage listing should succeed");
+    keys.sort();
+    let metadata_key = keys
+        .iter()
+        .find(|key| key.ends_with("result_metadata.json"))
+        .expect("metadata key should exist")
+        .clone();
+    let metadata_bytes = downstream_provider
+        .get_object(&metadata_key)
+        .await
+        .expect("metadata read should succeed")
+        .expect("metadata should exist");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata_bytes).expect("metadata JSON should parse");
+    assert_eq!(metadata.get("row_count").and_then(|v| v.as_u64()), Some(2));
+
+    downstream_handle.abort();
+}
+
+#[test]
+fn multi_worker_fan_out_hash_partitioning_routes_all_rows() {
+    let upstream_a = sample_id_value_batch(0, 99);
+    let upstream_b = sample_id_value_batch(100, 199);
+
+    let routed_a = route_batch_hash(&upstream_a, &["id".to_string()], 4)
+        .expect("hash routing for upstream A should succeed");
+    let routed_b = route_batch_hash(&upstream_b, &["id".to_string()], 4)
+        .expect("hash routing for upstream B should succeed");
+
+    let mut total_rows = 0usize;
+    for partition_index in 0..4_usize {
+        let ids_a = extract_int64_column(&routed_a[partition_index], "id");
+        let ids_b = extract_int64_column(&routed_b[partition_index], "id");
+
+        total_rows = total_rows
+            .saturating_add(ids_a.len())
+            .saturating_add(ids_b.len());
+
+        for id in ids_a.iter().chain(ids_b.iter()) {
+            let probe = sample_id_value_batch(*id, *id);
+            let probe_routed = route_batch_hash(&probe, &["id".to_string()], 4)
+                .expect("probe hash routing should succeed");
+            let expected_partition = probe_routed
+                .iter()
+                .enumerate()
+                .find_map(|(idx, batch)| (batch.num_rows() > 0).then_some(idx))
+                .expect("probe route should pick exactly one partition");
+            assert_eq!(expected_partition, partition_index);
+        }
+    }
+
+    assert_eq!(total_rows, 200);
+}
+
+#[test]
+fn round_robin_ordering_distributes_rows_cyclically() {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let batch = sample_id_value_batch(0, 11);
+    let routed =
+        route_batch_roundrobin(&batch, 3, &counter).expect("round-robin routing should succeed");
+
+    assert_eq!(extract_int64_column(&routed[0], "id"), vec![0, 3, 6, 9]);
+    assert_eq!(extract_int64_column(&routed[1], "id"), vec![1, 4, 7, 10]);
+    assert_eq!(extract_int64_column(&routed[2], "id"), vec![2, 5, 8, 11]);
+}
+
+#[test]
+fn end_to_end_scan_repartition_aggregate_preserves_rows_and_sum() {
+    let stage1_partitions = vec![
+        sample_id_value_batch(0, 49),
+        sample_id_value_batch(50, 99),
+        sample_id_value_batch(100, 149),
+        sample_id_value_batch(150, 199),
+    ];
+
+    let mut stage2_partitions = vec![Vec::<RecordBatch>::new(); 4];
+    for batch in &stage1_partitions {
+        let routed = route_batch_hash(batch, &["id".to_string()], 4)
+            .expect("stage2 hash routing should succeed");
+        for (idx, routed_batch) in routed.into_iter().enumerate() {
+            if routed_batch.num_rows() > 0 {
+                stage2_partitions[idx].push(routed_batch);
+            }
+        }
+    }
+
+    let mut observed_ids = std::collections::HashSet::<i64>::new();
+    let mut aggregate_sum = 0_i64;
+    let mut total_rows = 0usize;
+
+    for (partition_index, partition_batches) in stage2_partitions.iter().enumerate() {
+        for batch in partition_batches {
+            let ids = extract_int64_column(batch, "id");
+            let values = extract_int64_column(batch, "value");
+            total_rows = total_rows.saturating_add(ids.len());
+
+            for (id, value) in ids.iter().zip(values.iter()) {
+                assert!(observed_ids.insert(*id), "id should appear exactly once");
+                aggregate_sum = aggregate_sum.saturating_add(*value);
+
+                let probe = sample_id_value_batch(*id, *id);
+                let probe_routed = route_batch_hash(&probe, &["id".to_string()], 4)
+                    .expect("probe hash routing should succeed");
+                let expected_partition = probe_routed
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, routed_batch)| (routed_batch.num_rows() > 0).then_some(idx))
+                    .expect("probe route should pick exactly one partition");
+                assert_eq!(expected_partition, partition_index);
+            }
+        }
+    }
+
+    assert_eq!(total_rows, 200);
+    assert_eq!(observed_ids.len(), 200);
+    assert_eq!(aggregate_sum, 19_900);
 }
 
 #[tokio::test]
@@ -514,6 +953,7 @@ async fn slow_consumer_throttles_fast_producer_with_bounded_queue() {
         &task,
         "s1",
         &batches,
+        None,
         limits,
     )
     .await

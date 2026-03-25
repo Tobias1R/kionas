@@ -7,6 +7,7 @@ use crate::execution::planner::StageExecutionContext;
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
+use crate::execution::router::route_batch_from_output_partitioning;
 use crate::services::query_execution::{
     apply_filter_predicate_pipeline, apply_limit_pipeline, apply_projection_pipeline,
     apply_sort_pipeline, normalize_batches_for_sort,
@@ -25,7 +26,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -1378,6 +1380,36 @@ pub(crate) async fn execute_query_task(
 
     let normalized_batches = normalize_batches_for_sort(&batches)?;
 
+    let routed_batches_by_partition = if task.output_destinations.is_empty() {
+        None
+    } else {
+        let rr_counter = Arc::new(AtomicUsize::new(0));
+        let mut routed = Vec::<Vec<RecordBatch>>::with_capacity(task.output_destinations.len());
+
+        for destination in &task.output_destinations {
+            let destination_partition_count = if destination.downstream_partition_count == 0 {
+                1
+            } else {
+                destination.downstream_partition_count
+            };
+
+            let mut destination_batches = Vec::<RecordBatch>::new();
+            for batch in &normalized_batches {
+                let mut split = route_batch_from_output_partitioning(
+                    batch,
+                    &destination.partitioning,
+                    destination_partition_count,
+                    Some(&rr_counter),
+                )?;
+                destination_batches.append(&mut split);
+            }
+
+            routed.push(destination_batches);
+        }
+
+        Some(routed)
+    };
+
     let exchange_artifact_bytes = persist_stage_exchange_artifacts(
         shared,
         session_id,
@@ -1396,6 +1428,7 @@ pub(crate) async fn execute_query_task(
         task,
         session_id,
         &normalized_batches,
+        routed_batches_by_partition.as_deref(),
     )
     .await
     .map_err(|e| format!("{} [{}]", e, context_tag))?;

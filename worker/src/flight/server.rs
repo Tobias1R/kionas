@@ -390,6 +390,7 @@ fn insert_dispatch_metadata_for_downstream(
 /// - `task`: Stage task carrying output destination routing contract.
 /// - `session_id`: Session identifier for auth and descriptor scope.
 /// - `batches`: Normalized stage output batches to stream.
+/// - `routed_batches_by_destination`: Optional per-destination batch payloads indexed by output destination order.
 ///
 /// Output:
 /// - `Ok(())` when all destination do_put streams are acknowledged.
@@ -399,12 +400,14 @@ pub(crate) async fn stream_stage_partition_to_output_destinations(
     task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
     session_id: &str,
     batches: &[RecordBatch],
+    routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
 ) -> Result<(), String> {
     stream_stage_partition_to_output_destinations_with_limits(
         shared_data,
         task,
         session_id,
         batches,
+        routed_batches_by_destination,
         downstream_routing_limits(),
     )
     .await
@@ -415,6 +418,7 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
     task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
     session_id: &str,
     batches: &[RecordBatch],
+    routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
     limits: DownstreamRoutingLimits,
 ) -> Result<(), String> {
     if task.output_destinations.is_empty() {
@@ -427,16 +431,37 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
 
     let service = WorkerFlightService::new(shared_data.clone());
 
-    let base_payloads = batches_to_flight_data(batches[0].schema().as_ref(), batches.to_vec())
-        .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
+    if let Some(routed_batches) = routed_batches_by_destination
+        && routed_batches.len() != task.output_destinations.len()
+    {
+        return Err(format!(
+            "routed destination batch count mismatch: expected {}, found {}",
+            task.output_destinations.len(),
+            routed_batches.len()
+        ));
+    }
 
-    for destination in &task.output_destinations {
+    for (destination_index, destination) in task.output_destinations.iter().enumerate() {
         if destination.worker_addresses.is_empty() {
             return Err(format!(
                 "output destination for downstream_stage_id={} has no worker addresses",
                 destination.downstream_stage_id
             ));
         }
+
+        let destination_batches = match routed_batches_by_destination
+            .and_then(|routed| routed.get(destination_index))
+            .filter(|routed| !routed.is_empty())
+        {
+            Some(routed) => routed.as_slice(),
+            None => batches,
+        };
+
+        let base_payloads = batches_to_flight_data(
+            destination_batches[0].schema().as_ref(),
+            destination_batches.to_vec(),
+        )
+        .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
 
         for (worker_index, worker_address) in destination.worker_addresses.iter().enumerate() {
             let endpoint = normalize_destination_endpoint(worker_address)?;
