@@ -335,6 +335,19 @@ async fn run_retrieval_determinism_check(handle: &str) -> Result<(), String> {
 
 type WarehouseClient = warehouse_service::warehouse_service_client::WarehouseServiceClient<Channel>;
 
+/// What: Install process-level rustls crypto provider for TLS operations.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - `Ok(())` when a provider is available for rustls client config builders.
+/// - `Err(message)` when no supported provider feature is compiled.
+fn install_rustls_crypto_provider() -> Result<(), String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    Ok(())
+}
+
 /// What: Create an authenticated warehouse channel using configured server URL.
 ///
 /// Inputs:
@@ -840,6 +853,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_rustls_crypto_provider()
+        .map_err(|e| format!("failed to initialize TLS crypto provider: {}", e))?;
+
     let args = Args::parse();
 
     if let Some(handle) = args.check_malformed_ticket.as_deref() {
