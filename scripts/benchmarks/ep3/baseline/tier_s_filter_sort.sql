@@ -1,2 +1,2 @@
-use warehouse kionas-worker1;
+use warehouse compute_xl;
 select id, name from bench.seed_ep3_tier_s.customers where id > 100 order by id;

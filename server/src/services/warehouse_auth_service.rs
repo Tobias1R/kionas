@@ -78,12 +78,31 @@ impl WarehouseAuthServiceBackend {
         &self,
         token: String,
         username: String,
-        warehouse: String,
+        warehouse_name: String,
         remote_addr: String,
     ) -> Session {
-        let hash_str = format!("{}{}{}", token.clone(), username.clone(), warehouse.clone());
+        let hash_str = format!(
+            "{}{}{}",
+            token.clone(),
+            username.clone(),
+            warehouse_name.clone()
+        );
         let session_id = kionas::gen_uuid_based_on_timestamp_and_string(hash_str.as_str());
-        Session::new(session_id, token, username, warehouse, remote_addr)
+        let pool_members = {
+            let state = self.shared_data.lock().await;
+            state
+                .get_pool_members(&warehouse_name)
+                .await
+                .unwrap_or_default()
+        };
+        Session::new(
+            session_id,
+            token,
+            username,
+            warehouse_name,
+            pool_members,
+            remote_addr,
+        )
     }
 }
 

@@ -1,5 +1,6 @@
 use kionas::utils::{print_memory_usage, print_server_info};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
@@ -65,6 +66,52 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     };
 
     let shared_data: SharedData = Arc::new(Mutex::new(SharedState::new(config.clone())));
+
+    let consul_addr = std::env::var("CONSUL_URL").ok();
+    let cluster_config = kionas::config::load_cluster_config(consul_addr.as_deref()).await?;
+    let pool_tiers = cluster_config.warehouse_pools_tiers;
+
+    for tier in &pool_tiers {
+        if tier.min_members == 0 {
+            return Err(
+                format!("Pool tier '{}' has min_members=0; expected >= 1", tier.tier).into(),
+            );
+        }
+        if tier.min_members > tier.max_members {
+            return Err(format!(
+                "Pool tier '{}' has min_members ({}) greater than max_members ({})",
+                tier.tier, tier.min_members, tier.max_members
+            )
+            .into());
+        }
+    }
+
+    let default_count = pool_tiers.iter().filter(|tier| tier.default).count();
+    if default_count != 1 {
+        return Err(format!(
+            "Expected exactly one default pool tier, found {}",
+            default_count
+        )
+        .into());
+    }
+
+    let mut tier_templates: HashMap<String, kionas::config::WarehousePoolTierConfig> =
+        HashMap::new();
+    for tier in pool_tiers {
+        tier_templates.insert(tier.tier.clone(), tier);
+    }
+
+    {
+        let state = shared_data.lock().await;
+        let mut templates = state.pool_tier_templates.lock().await;
+        *templates = tier_templates;
+        let loaded_tiers: Vec<String> = templates.keys().cloned().collect();
+        log::info!(
+            "Loaded {} warehouse pool tier templates: {:?}",
+            loaded_tiers.len(),
+            loaded_tiers
+        );
+    }
 
     let interops_service = InteropsService::new(Arc::clone(&shared_data));
     let warehouse_service = WarehouseService::initialize(Arc::clone(&shared_data)).await;

@@ -1,4 +1,5 @@
 use crate::warehouse::Warehouse;
+use crate::warehouse::pool::WarehousePool;
 use crate::warehouse::state::{SharedData, WorkerEntry};
 use kionas::{get_digest, parse_env_vars};
 use std::sync::Arc;
@@ -6,6 +7,24 @@ use tonic::{Request, Response, Status};
 // Second gRPC service
 pub mod interops_service {
     tonic::include_proto!("interops_service");
+}
+
+/// What: Extract tier key from a pool name.
+///
+/// Inputs:
+/// - `pool_name`: Pool name such as compute_xl or bare tier name
+///
+/// Output:
+/// - Tier key string such as xl
+///
+/// Details:
+/// - If the pool name starts with `compute_`, that prefix is removed
+/// - Otherwise the pool name itself is treated as tier name
+fn extract_tier_from_pool_name(pool_name: &str) -> String {
+    pool_name
+        .strip_prefix("compute_")
+        .unwrap_or(pool_name)
+        .to_string()
 }
 
 #[derive(Default)]
@@ -21,6 +40,40 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
     ) -> Result<Response<interops_service::RegisterWorkerResponse>, Status> {
         let worker = request.into_inner();
         let shared_data = self.shared_data.lock().await;
+
+        let requested_pool_name = if worker.pool_name.trim().is_empty() {
+            shared_data
+                .get_default_pool_name()
+                .await
+                .map_err(Status::failed_precondition)?
+        } else {
+            worker.pool_name.clone()
+        };
+        let tier_name = extract_tier_from_pool_name(&requested_pool_name);
+        let tier_config = {
+            let templates = shared_data.pool_tier_templates.lock().await;
+            templates.get(&tier_name).cloned().ok_or_else(|| {
+                Status::invalid_argument(format!("Pool tier '{}' not defined", tier_name))
+            })?
+        };
+
+        {
+            let mut pools = shared_data.warehouse_pools.lock().await;
+            let pool = pools.entry(requested_pool_name.clone()).or_insert_with(|| {
+                WarehousePool::new(requested_pool_name.clone(), tier_name.clone())
+            });
+            let is_new_member = !pool.members.contains(&worker.name);
+
+            if is_new_member && pool.members.len() >= tier_config.max_members {
+                return Err(Status::resource_exhausted(format!(
+                    "Pool '{}' exceeded max members ({})",
+                    requested_pool_name, tier_config.max_members
+                )));
+            }
+
+            pool.add_member(worker.name.clone());
+        }
+
         let warehouses = Arc::clone(&shared_data.warehouses);
         let mut warehouses = warehouses.lock().await;
         let digested = get_digest(worker.name.clone().as_str());
@@ -42,10 +95,12 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             format!("http://{}:{}", worker.host, worker.port)
         };
         log::info!(
-            "Registering worker {} at {} (pool_addr={})",
+            "Registering worker {} at {} (pool_addr={}, pool_name={}, tier={})",
             worker.name,
             worker.host,
-            pool_addr
+            pool_addr,
+            requested_pool_name,
+            tier_name
         );
 
         // attempt to read CA cert from config (if available) to trust worker TLS
@@ -95,7 +150,12 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
             status: "ok".into(),
             uuid: digested.clone(),
         };
-        log::info!("Worker registered: {:?}", digested);
+        log::info!(
+            "Worker registered: {} (pool_name={}, tier={})",
+            digested,
+            requested_pool_name,
+            tier_name
+        );
         Ok(Response::new(response))
     }
 

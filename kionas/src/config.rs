@@ -78,11 +78,39 @@ pub struct StorageConfig {
     pub secret_key: String,
 }
 
+/// What: Warehouse pool tier template configuration loaded from cluster config.
+///
+/// Inputs:
+/// - `tier`: Tier identifier such as xs, s, m, or xl
+/// - `min_members`: Minimum number of workers required in this tier
+/// - `max_members`: Maximum number of workers allowed in this tier
+/// - `default`: Whether this tier is the default pool tier
+/// - `description`: Human-readable description of the tier purpose
+///
+/// Output:
+/// - Deserialized tier template used by server startup and worker registration
+///
+/// Details:
+/// - Tier templates are cluster-scoped and shared by all workers
+/// - Validation for min/max/default constraints is done by server startup logic
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarehousePoolTierConfig {
+    pub tier: String,
+    pub min_members: usize,
+    pub max_members: usize,
+    pub default: bool,
+    pub description: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub nodes: Vec<String>,
     pub master: String,
     pub storage: StorageConfig,
+    #[serde(default, alias = "warehouse_pools_types")]
+    pub warehouse_pools_tiers: Vec<WarehousePoolTierConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

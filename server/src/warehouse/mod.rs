@@ -1,4 +1,5 @@
 //pub mod warehouse_service_server;
+pub(crate) mod pool;
 pub(crate) mod state;
 
 use core::hash;

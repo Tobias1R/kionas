@@ -18,6 +18,7 @@ message RegisterWorkerRequest {
     string host = 2;
     uint32 port = 3;
     string warehouse_type = 4;
+    string pool_name = 5;
 }
 
 message RegisterWorkerResponse {

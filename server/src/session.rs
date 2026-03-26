@@ -13,7 +13,10 @@ pub struct Session {
     auth_token: String,
     is_authenticated: bool,
     role: String,
-    warehouse: String,
+    #[serde(default, alias = "warehouse")]
+    warehouse_name: String,
+    #[serde(default)]
+    pool_members: Vec<String>,
     remote_addr: String,
     last_active: u64,
     use_database: String,
@@ -24,7 +27,8 @@ impl Session {
         id: String,
         auth_token: String,
         role: String,
-        warehouse: String,
+        warehouse_name: String,
+        pool_members: Vec<String>,
         remote_addr: String,
     ) -> Self {
         Self {
@@ -32,7 +36,8 @@ impl Session {
             auth_token,
             is_authenticated: false,
             role,
-            warehouse,
+            warehouse_name,
+            pool_members,
             remote_addr,
             last_active: 0,
             use_database: "default".to_string(),
@@ -52,7 +57,37 @@ impl Session {
     }
 
     pub fn get_warehouse(&self) -> String {
-        self.warehouse.clone()
+        self.warehouse_name.clone()
+    }
+
+    /// What: Return a snapshot of pool members captured for this session.
+    ///
+    /// Inputs:
+    /// - None
+    ///
+    /// Output:
+    /// - Vector of worker names bound to this session at creation/update time
+    ///
+    /// Details:
+    /// - Snapshot remains stable even if active pool membership changes later
+    #[allow(dead_code)]
+    pub fn get_pool_members(&self) -> Vec<String> {
+        self.pool_members.clone()
+    }
+
+    /// What: Check whether the session is assigned to a specific pool.
+    ///
+    /// Inputs:
+    /// - `pool_name`: Pool name to compare with this session assignment
+    ///
+    /// Output:
+    /// - `true` when the session warehouse matches `pool_name`
+    ///
+    /// Details:
+    /// - Comparison is exact and case-sensitive
+    #[allow(dead_code)]
+    pub fn is_in_pool(&self, pool_name: &str) -> bool {
+        self.warehouse_name == pool_name
     }
 
     pub fn get_remote_addr(&self) -> String {
@@ -86,11 +121,25 @@ impl Session {
     }
 
     pub fn get_warehouse_uuid(&self) -> String {
-        get_digest(&self.warehouse)
+        get_digest(&self.warehouse_name)
     }
 
     pub fn set_warehouse(&mut self, warehouse: String) {
-        self.warehouse = warehouse;
+        self.warehouse_name = warehouse;
+    }
+
+    /// What: Replace the session pool member snapshot.
+    ///
+    /// Inputs:
+    /// - `pool_members`: New pool member list to persist in session payload
+    ///
+    /// Output:
+    /// - None
+    ///
+    /// Details:
+    /// - Intended for session creation and explicit pool rebind operations
+    pub fn set_pool_members(&mut self, pool_members: Vec<String>) {
+        self.pool_members = pool_members;
     }
 
     pub fn get_use_database(&self) -> String {

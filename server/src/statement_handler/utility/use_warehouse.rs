@@ -30,6 +30,8 @@ pub async fn handle_use_warehouse(
         Some(mut s) => {
             s.set_warehouse(wh.clone());
             let state = shared_data.lock().await;
+            let pool_members = state.get_pool_members(&wh).await.unwrap_or_default();
+            s.set_pool_members(pool_members);
             state
                 .session_manager
                 .update_session(session_id.to_string(), &mut s)

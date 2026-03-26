@@ -102,11 +102,13 @@ pub async fn init_worker(
     let mut client = InteropsServiceClient::new(channel);
 
     // Register worker with server
+    let pool_name = std::env::var("WORKER_POOL_NAME").unwrap_or_default();
     let request = tonic::Request::new(RegisterWorkerRequest {
         name: local_hostname.clone(),
         host: local_hostname.clone(),
         port: worker_port as u32,
         warehouse_type: "kionas".to_string(),
+        pool_name,
     });
     println!("Registering worker with master server...");
     let response = client.register_worker(request).await?;

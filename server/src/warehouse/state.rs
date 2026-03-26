@@ -1,9 +1,11 @@
 use crate::session;
 use crate::tasks::TaskManager;
 use crate::warehouse::Warehouse;
+use crate::warehouse::pool::{PoolHealth, WarehousePool};
 use crate::workers_pool::WorkerPool;
 use chrono::{DateTime, Utc};
 use kionas::config::AppConfig;
+use kionas::config::WarehousePoolTierConfig;
 use kionas::parse_env_vars;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as HashEntry;
@@ -24,6 +26,8 @@ pub struct SharedState {
     pub worker_pools: Arc<AsyncMutex<HashMap<String, WorkerPool>>>,
     pub task_manager: Arc<TaskManager>,
     pub workers: Arc<AsyncMutex<HashMap<String, WorkerEntry>>>,
+    pub pool_tier_templates: Arc<AsyncMutex<HashMap<String, WarehousePoolTierConfig>>>,
+    pub warehouse_pools: Arc<AsyncMutex<HashMap<String, WarehousePool>>>,
     pub metastore_channel: Arc<AsyncMutex<Option<Channel>>>,
     pub config: Option<AppConfig>,
 }
@@ -38,6 +42,8 @@ impl SharedState {
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
             task_manager: Arc::new(TaskManager::new()),
             workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            pool_tier_templates: Arc::new(AsyncMutex::new(HashMap::new())),
+            warehouse_pools: Arc::new(AsyncMutex::new(HashMap::new())),
             metastore_channel: Arc::new(AsyncMutex::new(None)),
             config: Some(config),
         }
@@ -54,6 +60,8 @@ impl Default for SharedState {
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
             task_manager: Arc::new(TaskManager::new()),
             workers: Arc::new(AsyncMutex::new(HashMap::new())),
+            pool_tier_templates: Arc::new(AsyncMutex::new(HashMap::new())),
+            warehouse_pools: Arc::new(AsyncMutex::new(HashMap::new())),
             metastore_channel: Arc::new(AsyncMutex::new(None)),
             config: None,
         }
@@ -83,6 +91,96 @@ impl WorkerEntry {
 }
 
 impl SharedState {
+    /// What: Return current members for a named warehouse pool.
+    ///
+    /// Inputs:
+    /// - `pool_name`: Active pool name such as compute_xl
+    ///
+    /// Output:
+    /// - `Ok(Vec<String>)` with worker names, otherwise an error string
+    ///
+    /// Details:
+    /// - Returns a snapshot clone of members at read time
+    pub async fn get_pool_members(&self, pool_name: &str) -> Result<Vec<String>, String> {
+        let pools = self.warehouse_pools.lock().await;
+        pools
+            .get(pool_name)
+            .map(|pool| pool.members.clone())
+            .ok_or_else(|| format!("Pool '{}' not found", pool_name))
+    }
+
+    /// What: Resolve the default pool name derived from tier templates.
+    ///
+    /// Inputs:
+    /// - None
+    ///
+    /// Output:
+    /// - `Ok(String)` with default pool name
+    ///
+    /// Details:
+    /// - Default pool names are materialized as `compute_<tier>`
+    pub async fn get_default_pool_name(&self) -> Result<String, String> {
+        let templates = self.pool_tier_templates.lock().await;
+        templates
+            .values()
+            .find(|template| template.default)
+            .map(|template| format!("compute_{}", template.tier))
+            .ok_or_else(|| "No default pool defined".to_string())
+    }
+
+    /// What: List all active warehouse pool names.
+    ///
+    /// Inputs:
+    /// - None
+    ///
+    /// Output:
+    /// - Vector of active pool names
+    ///
+    /// Details:
+    /// - Active pools are created lazily as workers register
+    #[allow(dead_code)]
+    pub async fn list_pools(&self) -> Vec<String> {
+        let pools = self.warehouse_pools.lock().await;
+        pools.keys().cloned().collect()
+    }
+
+    /// What: Build health status for a named pool.
+    ///
+    /// Inputs:
+    /// - `pool_name`: Active pool name to inspect
+    ///
+    /// Output:
+    /// - `Ok(PoolHealth)` when pool and tier exist
+    ///
+    /// Details:
+    /// - Health compares current members against tier min/max bounds
+    #[allow(dead_code)]
+    pub async fn get_pool_health(&self, pool_name: &str) -> Result<PoolHealth, String> {
+        let pools = self.warehouse_pools.lock().await;
+        let pool = pools
+            .get(pool_name)
+            .ok_or_else(|| format!("Pool '{}' not found", pool_name))?
+            .clone();
+        drop(pools);
+
+        let templates = self.pool_tier_templates.lock().await;
+        let tier = templates
+            .get(&pool.tier)
+            .ok_or_else(|| format!("Tier '{}' not found", pool.tier))?
+            .clone();
+        let member_count = pool.members.len();
+        let is_healthy = pool.is_healthy(&tier);
+
+        Ok(PoolHealth {
+            pool_name: pool.name.clone(),
+            tier: pool.tier.clone(),
+            current_members: member_count,
+            min_members: tier.min_members,
+            max_members: tier.max_members,
+            is_healthy,
+        })
+    }
+
     /// Resolve the worker key (digest) for a given session id.
     /// Uses session affinity first, falls back to fuzzy warehouse name matching.
     pub async fn resolve_worker_key(&self, session_id: &str) -> Option<String> {
