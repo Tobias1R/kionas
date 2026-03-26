@@ -1,0 +1,10 @@
+#!/bin/bash
+
+./scripts/configure_worker.sh ./configs/kionas-worker2.json
+
+CMD="./docker-target/debug/worker worker2"
+if [ "$1" == "b" ]; then
+    CMD="cargo run -p worker -- worker2"
+fi
+echo "Running worker with command: $CMD"
+exec $CMD
