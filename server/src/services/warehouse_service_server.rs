@@ -1,9 +1,9 @@
 // Minimal, clean service implementation for `warehouse_service`.
 // This file intentionally keeps handler logic simple so the crate builds.
 
+use crate::parser::sql::parse_query;
 use crate::statement_handler::handle_statement;
 use crate::warehouse::state::SharedData;
-use kionas::parser::sql::parse_query;
 use tonic::{Request, Response, Status};
 
 pub mod warehouse_service {
@@ -36,13 +36,8 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
     let mut parts = result.splitn(4, '|');
     let prefix = parts.next().unwrap_or_default();
     if prefix != "RESULT" {
-        if result.starts_with("Failed")
-            || result.starts_with("Domain validation failed")
-            || result.starts_with("Unsupported")
-        {
-            resp.status = "ERROR".to_string();
-            resp.error_code = "INFRA_GENERIC".to_string();
-        }
+        resp.status = "ERROR".to_string();
+        resp.error_code = "INFRA_GENERIC".to_string();
         resp.message = result.to_string();
         return;
     }
@@ -53,10 +48,10 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
 
     resp.message = message.to_string();
 
-    if code == "QUERY_DISPATCHED" {
-        if let Some(handle) = extract_query_handle_from_message(message) {
-            resp.data = handle.into_bytes();
-        }
+    if code == "QUERY_DISPATCHED"
+        && let Some(handle) = extract_query_handle_from_message(message)
+    {
+        resp.data = handle.into_bytes();
     }
 
     match category {
@@ -64,13 +59,17 @@ fn apply_statement_outcome(result: &str, resp: &mut QueryResponse) {
             resp.status = "OK".to_string();
             resp.error_code = "0".to_string();
         }
-        "VALIDATION" => {
+        "VALIDATION" | "CONSTRAINT" | "EXECUTION" | "INFRA" => {
             resp.status = "ERROR".to_string();
-            resp.error_code = format!("BUSINESS_{}", code);
+            if code.starts_with(category) {
+                resp.error_code = code.to_string();
+            } else {
+                resp.error_code = format!("{}_{}", category, code);
+            }
         }
         _ => {
             resp.status = "ERROR".to_string();
-            resp.error_code = format!("INFRA_{}", code);
+            resp.error_code = "INFRA_UNKNOWN_CATEGORY".to_string();
         }
     }
 }
@@ -132,11 +131,14 @@ impl WarehouseServiceTrait for WarehouseService {
         let query_text = req.query;
         let session_id = ctx.session_id.clone();
 
-        // print
-        log::info!("Received query: {}", query_text);
-
         // Use the query id from the context so callers can correlate work.
-        let _query_id = ctx.query_id.clone();
+        let query_id = ctx.query_id.clone();
+        log::debug!(
+            "received query query_id={} session_id={} query_len={}",
+            query_id,
+            session_id,
+            query_text.len()
+        );
 
         // Prepare a single mutable response and populate it based on interpretation of the query.
         let mut resp = QueryResponse {
@@ -149,14 +151,22 @@ impl WarehouseServiceTrait for WarehouseService {
 
         let shared_data = self.shared_data.clone();
 
-        // Attempt to fetch and log the full session (if available) for better observability
+        // Attempt to fetch session context without high-volume object dumps.
         if !ctx.session_id.is_empty() {
             let session_manager = {
                 let sd = shared_data.lock().await;
                 sd.session_manager.clone()
             };
-            if let Some(sess) = session_manager.get_session(ctx.session_id.clone()).await {
-                log::info!("Session: {:?}", sess);
+            if session_manager
+                .get_session(ctx.session_id.clone())
+                .await
+                .is_some()
+            {
+                log::debug!(
+                    "session context available for query_id={} session_id={}",
+                    query_id,
+                    session_id
+                );
             }
         }
         // Centralized handler for simple commands (e.g. `USE WAREHOUSE`) that
@@ -205,171 +215,5 @@ impl WarehouseServiceTrait for WarehouseService {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{apply_statement_outcome, extract_query_handle_from_message};
-    use crate::services::warehouse_service_server::warehouse_service::QueryResponse;
-
-    #[test]
-    fn extracts_query_handle_from_message_suffix() {
-        let msg = "query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)";
-        let handle = extract_query_handle_from_message(msg).expect("handle must be parsed");
-        assert_eq!(
-            handle,
-            "flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1"
-        );
-    }
-
-    #[test]
-    fn maps_query_dispatched_handle_into_response_data() {
-        let mut resp = QueryResponse {
-            message: String::new(),
-            status: "OK".to_string(),
-            error_code: "0".to_string(),
-            execution_time: "0".to_string(),
-            data: Vec::new(),
-        };
-
-        apply_statement_outcome(
-            "RESULT|SUCCESS|QUERY_DISPATCHED|query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)",
-            &mut resp,
-        );
-
-        let decoded = String::from_utf8(resp.data.clone()).expect("response data must be utf8");
-        assert_eq!(resp.status, "OK");
-        assert_eq!(resp.error_code, "0");
-        assert_eq!(
-            decoded,
-            "flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1"
-        );
-    }
-
-    #[test]
-    fn clears_stale_query_handle_for_non_query_outcome() {
-        let mut resp = QueryResponse {
-            message: String::new(),
-            status: "OK".to_string(),
-            error_code: "0".to_string(),
-            execution_time: "0".to_string(),
-            data: Vec::new(),
-        };
-
-        apply_statement_outcome(
-            "RESULT|SUCCESS|QUERY_DISPATCHED|query dispatched successfully for db.schema.tbl (location: flight://worker:50052/query/db/schema/tbl/worker?session_id=s1&task_id=t1)",
-            &mut resp,
-        );
-        assert!(!resp.data.is_empty());
-
-        apply_statement_outcome(
-            "RESULT|SUCCESS|TABLE_CREATED|table created successfully",
-            &mut resp,
-        );
-        assert!(resp.data.is_empty());
-    }
-
-    #[test]
-    fn maps_unsupported_operator_as_business_error() {
-        let mut resp = QueryResponse {
-            message: String::new(),
-            status: "OK".to_string(),
-            error_code: "0".to_string(),
-            execution_time: "0".to_string(),
-            data: Vec::new(),
-        };
-
-        apply_statement_outcome(
-            "RESULT|VALIDATION|UNSUPPORTED_OPERATOR|physical operator 'HashJoin' is not supported in this phase",
-            &mut resp,
-        );
-
-        assert_eq!(resp.status, "ERROR");
-        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_OPERATOR");
-        assert_eq!(
-            resp.message,
-            "physical operator 'HashJoin' is not supported in this phase"
-        );
-    }
-
-    #[test]
-    fn maps_unsupported_predicate_as_business_error() {
-        let mut resp = QueryResponse {
-            message: String::new(),
-            status: "OK".to_string(),
-            error_code: "0".to_string(),
-            execution_time: "0".to_string(),
-            data: Vec::new(),
-        };
-
-        apply_statement_outcome(
-            "RESULT|VALIDATION|UNSUPPORTED_PREDICATE|predicate is not supported in this phase: LIKE",
-            &mut resp,
-        );
-
-        assert_eq!(resp.status, "ERROR");
-        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PREDICATE");
-        assert_eq!(
-            resp.message,
-            "predicate is not supported in this phase: LIKE"
-        );
-    }
-
-    #[test]
-    fn maps_unsupported_pipeline_as_business_error() {
-        let mut resp = QueryResponse {
-            message: String::new(),
-            status: "OK".to_string(),
-            error_code: "0".to_string(),
-            execution_time: "0".to_string(),
-            data: Vec::new(),
-        };
-
-        apply_statement_outcome(
-            "RESULT|VALIDATION|UNSUPPORTED_PIPELINE|invalid physical pipeline: pipeline must end with materialize",
-            &mut resp,
-        );
-
-        assert_eq!(resp.status, "ERROR");
-        assert_eq!(resp.error_code, "BUSINESS_UNSUPPORTED_PIPELINE");
-        assert_eq!(
-            resp.message,
-            "invalid physical pipeline: pipeline must end with materialize"
-        );
-    }
-
-    #[test]
-    fn maps_select_validation_codes_to_business_error_family() {
-        let cases = vec![
-            (
-                "UNSUPPORTED_QUERY_SHAPE",
-                "BUSINESS_UNSUPPORTED_QUERY_SHAPE",
-            ),
-            ("UNSUPPORTED_OPERATOR", "BUSINESS_UNSUPPORTED_OPERATOR"),
-            ("UNSUPPORTED_PREDICATE", "BUSINESS_UNSUPPORTED_PREDICATE"),
-            ("UNSUPPORTED_PIPELINE", "BUSINESS_UNSUPPORTED_PIPELINE"),
-        ];
-
-        for (validation_code, expected_error_code) in cases {
-            let mut resp = QueryResponse {
-                message: String::new(),
-                status: "OK".to_string(),
-                error_code: "0".to_string(),
-                execution_time: "0".to_string(),
-                data: Vec::new(),
-            };
-
-            apply_statement_outcome(
-                &format!(
-                    "RESULT|VALIDATION|{}|validation message for {}",
-                    validation_code, validation_code
-                ),
-                &mut resp,
-            );
-
-            assert_eq!(resp.status, "ERROR");
-            assert_eq!(resp.error_code, expected_error_code);
-            assert_eq!(
-                resp.message,
-                format!("validation message for {}", validation_code)
-            );
-        }
-    }
-}
+#[path = "../tests/services_warehouse_service_server_tests.rs"]
+mod tests;

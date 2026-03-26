@@ -18,7 +18,6 @@ use kionas::config::PostgresServiceConfig;
 use uuid::Uuid;
 
 use deadpool_postgres::Pool as PostgresPool;
-use log;
 use tokio_postgres::NoTls;
 
 #[async_trait]

@@ -1,7 +1,7 @@
 use crate::planner::error::PlannerError;
 use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
 
-/// What: Validate whether a predicate expression belongs to the supported Phase 2 subset.
+/// What: Validate whether a predicate expression belongs to the supported Phase 2+ subset.
 ///
 /// Inputs:
 /// - `predicate`: Physical predicate expression from a filter operator.
@@ -9,15 +9,26 @@ use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan
 /// Output:
 /// - `Ok(())` when the predicate shape is currently supported.
 /// - `Err(PlannerError::UnsupportedPredicate)` for deferred predicate families.
+///
+/// Supported Predicates (Phase 2-9a):
+/// - Equality: `col = value`, `col != value`, `col <> value`
+/// - Relational: `col > value`, `col >= value`, `col < value`, `col <= value`
+/// - NULL comparison (Phase 9a): `col IS NULL`, `col IS NOT NULL`
+/// - Logical combinations: `pred1 AND pred2`, `pred1 OR pred2`, `NOT pred1`
+///
+/// Deferred Predicates (Phase 9c+):
+/// - Range: BETWEEN, IN list
+/// - Pattern: LIKE, ILIKE
+/// - Existence: EXISTS, ANY, ALL
+/// - Window: OVER clause (window functions)
 fn ensure_supported_predicate(predicate: &PhysicalExpr) -> Result<(), PlannerError> {
     let sql = match predicate {
         PhysicalExpr::Raw { sql } => sql.to_ascii_lowercase(),
         PhysicalExpr::ColumnRef { .. } => return Ok(()),
+        PhysicalExpr::Predicate { .. } => return Ok(()),
     };
 
     let unsupported = [
-        (" between ", "BETWEEN"),
-        (" in (", "IN list"),
         (" like ", "LIKE"),
         (" ilike ", "ILIKE"),
         (" exists", "EXISTS"),
@@ -74,41 +85,246 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         ));
     }
 
+    let sort_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::Sort { .. }))
+        .count();
+    if sort_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one sort".to_string(),
+        ));
+    }
+
+    let projection_index = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Projection { .. }))
+        .ok_or_else(|| {
+            PlannerError::InvalidPhysicalPipeline(
+                "pipeline must contain a projection operator".to_string(),
+            )
+        })?;
+
+    let hash_join_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+        .count();
+    if hash_join_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one hash join".to_string(),
+        ));
+    }
+
+    let aggregate_partial_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+        .count();
+    if aggregate_partial_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one aggregate partial operator".to_string(),
+        ));
+    }
+
+    let aggregate_final_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+        .count();
+    if aggregate_final_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one aggregate final operator".to_string(),
+        ));
+    }
+
+    if aggregate_partial_count != aggregate_final_count {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "aggregate partial/final operators must appear together".to_string(),
+        ));
+    }
+
+    if let Some(partial_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+    {
+        let final_index = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+            .ok_or_else(|| {
+                PlannerError::InvalidPhysicalPipeline(
+                    "aggregate final operator is required when aggregate partial is present"
+                        .to_string(),
+                )
+            })?;
+
+        if partial_index >= final_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear before aggregate final".to_string(),
+            ));
+        }
+
+        if final_index >= projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate final must appear before projection".to_string(),
+            ));
+        }
+
+        if partial_index == 0 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear after table scan".to_string(),
+            ));
+        }
+
+        if let Some(hash_join_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+            && partial_index < hash_join_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "aggregate partial must appear after hash join".to_string(),
+            ));
+        }
+    }
+
+    if let Some(join_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+    {
+        if join_index > projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear before projection".to_string(),
+            ));
+        }
+
+        if join_index == 0 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear after table scan".to_string(),
+            ));
+        }
+
+        if let Some(sort_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+            && join_index > sort_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "hash join must appear before sort".to_string(),
+            ));
+        }
+    }
+
+    if let Some(sort_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+        && sort_index < projection_index
+    {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "sort must appear after projection".to_string(),
+        ));
+    }
+
+    let limit_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::Limit { .. }))
+        .count();
+    if limit_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one limit".to_string(),
+        ));
+    }
+
+    if let Some(limit_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Limit { .. }))
+    {
+        if limit_index < projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "limit must appear after projection".to_string(),
+            ));
+        }
+
+        if let Some(sort_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
+            && limit_index < sort_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "limit must appear after sort".to_string(),
+            ));
+        }
+    }
+
     for op in &plan.operators {
         match op {
-            PhysicalOperator::Filter { predicate } => ensure_supported_predicate(predicate)?,
+            PhysicalOperator::Filter { predicate } => {
+                ensure_supported_predicate(predicate)?;
+                // Phase 9b: Type coercion validation if schema metadata present
+                if let Some(schema_metadata) = &plan.schema_metadata {
+                    crate::planner::filter_type_checker::check_filter_predicate_types(
+                        predicate,
+                        schema_metadata,
+                    )?;
+                }
+            }
             PhysicalOperator::TableScan { .. }
             | PhysicalOperator::Projection { .. }
             | PhysicalOperator::Materialize => {}
-            PhysicalOperator::HashJoin { .. } => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "HashJoin".to_string(),
-                ));
+            PhysicalOperator::Sort { keys } => {
+                if keys.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "sort operator must include at least one key".to_string(),
+                    ));
+                }
+            }
+            PhysicalOperator::Limit { spec: _ } => {}
+            PhysicalOperator::HashJoin { spec } => {
+                if spec.keys.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "hash join must include at least one key".to_string(),
+                    ));
+                }
+
+                if spec.right_relation.database.trim().is_empty()
+                    || spec.right_relation.schema.trim().is_empty()
+                    || spec.right_relation.table.trim().is_empty()
+                {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "hash join right relation must be non-empty".to_string(),
+                    ));
+                }
             }
             PhysicalOperator::NestedLoopJoin => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
                     "NestedLoopJoin".to_string(),
                 ));
             }
-            PhysicalOperator::AggregatePartial => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "AggregatePartial".to_string(),
-                ));
-            }
-            PhysicalOperator::AggregateFinal => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "AggregateFinal".to_string(),
-                ));
-            }
-            PhysicalOperator::Sort => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "Sort".to_string(),
-                ));
-            }
-            PhysicalOperator::Limit => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "Limit".to_string(),
-                ));
+            PhysicalOperator::AggregatePartial { spec }
+            | PhysicalOperator::AggregateFinal { spec } => {
+                if spec.aggregates.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "aggregate operator must include at least one aggregate expression"
+                            .to_string(),
+                    ));
+                }
+
+                for aggregate in &spec.aggregates {
+                    if aggregate.output_name.trim().is_empty() {
+                        return Err(PlannerError::InvalidPhysicalPipeline(
+                            "aggregate output name cannot be empty".to_string(),
+                        ));
+                    }
+                }
             }
             PhysicalOperator::ExchangeShuffle { .. } => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
@@ -146,7 +362,9 @@ mod tests {
     use super::validate_physical_plan;
     use crate::planner::error::PlannerError;
     use crate::planner::logical_plan::LogicalRelation;
-    use crate::planner::physical_plan::{PhysicalExpr, PhysicalOperator, PhysicalPlan};
+    use crate::planner::physical_plan::{
+        PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
+    };
 
     fn base_relation() -> LogicalRelation {
         LogicalRelation {
@@ -170,6 +388,7 @@ mod tests {
                 PhysicalOperator::Materialize,
             ],
             sql: "SELECT id FROM users".to_string(),
+            schema_metadata: None,
         }
     }
 
@@ -177,23 +396,9 @@ mod tests {
     fn rejects_each_deferred_operator() {
         let cases = vec![
             (
-                PhysicalOperator::HashJoin { on: Vec::new() },
-                "HashJoin".to_string(),
-            ),
-            (
                 PhysicalOperator::NestedLoopJoin,
                 "NestedLoopJoin".to_string(),
             ),
-            (
-                PhysicalOperator::AggregatePartial,
-                "AggregatePartial".to_string(),
-            ),
-            (
-                PhysicalOperator::AggregateFinal,
-                "AggregateFinal".to_string(),
-            ),
-            (PhysicalOperator::Sort, "Sort".to_string()),
-            (PhysicalOperator::Limit, "Limit".to_string()),
             (
                 PhysicalOperator::ExchangeShuffle {
                     keys: vec!["id".to_string()],
@@ -270,5 +475,265 @@ mod tests {
         );
 
         validate_physical_plan(&plan).expect("must accept supported predicate");
+    }
+
+    #[test]
+    fn accepts_hash_join_with_keys_after_projection() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::HashJoin {
+                spec: crate::planner::PhysicalJoinSpec {
+                    join_type: crate::planner::JoinType::Inner,
+                    right_relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    keys: vec![crate::planner::JoinKeyPair {
+                        left: "users.id".to_string(),
+                        right: "orders.user_id".to_string(),
+                    }],
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("hash join with keys must be accepted");
+    }
+
+    #[test]
+    fn accepts_sort_when_keys_are_present() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+
+        validate_physical_plan(&plan).expect("sort should be accepted in this phase");
+    }
+
+    #[test]
+    fn accepts_limit_after_sort() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+        plan.operators.insert(
+            3,
+            PhysicalOperator::Limit {
+                spec: PhysicalLimitSpec {
+                    count: 5,
+                    offset: 2,
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("limit should be accepted in this phase");
+    }
+
+    #[test]
+    fn accepts_aggregate_partial_and_final_before_projection() {
+        let mut plan = base_valid_plan();
+        let spec = crate::planner::PhysicalAggregateSpec {
+            grouping_exprs: vec![PhysicalExpr::Raw {
+                sql: "country".to_string(),
+            }],
+            aggregates: vec![crate::planner::PhysicalAggregateExpr {
+                function: crate::planner::AggregateFunction::Count,
+                input: None,
+                output_name: "count".to_string(),
+            }],
+        };
+        plan.operators
+            .insert(1, PhysicalOperator::AggregatePartial { spec: spec.clone() });
+        plan.operators
+            .insert(2, PhysicalOperator::AggregateFinal { spec });
+
+        validate_physical_plan(&plan).expect("aggregate operators should be accepted");
+    }
+
+    #[test]
+    fn rejects_limit_before_sort() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Limit {
+                spec: PhysicalLimitSpec {
+                    count: 5,
+                    offset: 0,
+                },
+            },
+        );
+        plan.operators.insert(
+            3,
+            PhysicalOperator::Sort {
+                keys: vec![PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: "id".to_string(),
+                    },
+                    ascending: true,
+                }],
+            },
+        );
+
+        let err = validate_physical_plan(&plan).expect_err("limit before sort must be rejected");
+        assert_eq!(
+            err,
+            PlannerError::InvalidPhysicalPipeline("limit must appear after sort".to_string())
+        );
+    }
+
+    /// Phase 9a: IS NULL and IS NOT NULL operators are supported predicates.
+    /// These tests document the supported scope for NULL comparison operations.
+    #[test]
+    fn accepts_is_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_not_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NOT NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NOT NULL predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_null_with_and_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NULL AND age > 18".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL combined with AND must be accepted");
+    }
+
+    #[test]
+    fn accepts_is_not_null_with_or_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "name IS NOT NULL OR email IS NOT NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NOT NULL combined with OR must be accepted");
+    }
+
+    #[test]
+    fn accepts_not_is_null_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "NOT (name IS NULL)".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan)
+            .expect("NOT (IS NULL) predicate must be accepted in Phase 9a");
+    }
+
+    #[test]
+    fn accepts_is_null_with_join_predicate() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::HashJoin {
+                spec: crate::planner::PhysicalJoinSpec {
+                    join_type: crate::planner::JoinType::Inner,
+                    right_relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    keys: vec![crate::planner::JoinKeyPair {
+                        left: "users.id".to_string(),
+                        right: "orders.user_id".to_string(),
+                    }],
+                },
+            },
+        );
+        plan.operators.insert(
+            2,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "users.status IS NULL".to_string(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("IS NULL after JOIN must be accepted");
+    }
+
+    #[test]
+    fn accepts_is_null_with_group_by() {
+        let mut plan = base_valid_plan();
+        let spec = crate::planner::PhysicalAggregateSpec {
+            grouping_exprs: vec![PhysicalExpr::Raw {
+                sql: "country".to_string(),
+            }],
+            aggregates: vec![crate::planner::PhysicalAggregateExpr {
+                function: crate::planner::AggregateFunction::Count,
+                input: None,
+                output_name: "count".to_string(),
+            }],
+        };
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Raw {
+                    sql: "country IS NOT NULL".to_string(),
+                },
+            },
+        );
+        plan.operators
+            .insert(2, PhysicalOperator::AggregatePartial { spec: spec.clone() });
+        plan.operators
+            .insert(3, PhysicalOperator::AggregateFinal { spec });
+
+        validate_physical_plan(&plan).expect("IS NOT NULL with GROUP BY must be accepted");
     }
 }

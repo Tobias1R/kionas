@@ -1,4 +1,7 @@
 use tonic::{Request, Response, Status};
+#[allow(clippy::module_inception)]
+#[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
 pub mod metastore_service {
     tonic::include_proto!("metastore_service");
 }

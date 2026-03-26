@@ -167,7 +167,7 @@ impl MinioProvider {
             Err(e) => {
                 // Log full debug information from the SDK error to aid diagnosis
                 log::error!("S3 put_object failed for {}/{}: {:?}", self.bucket, key, e);
-                return Err(Box::new(e));
+                Err(Box::new(e))
             }
         }
     }
@@ -219,10 +219,18 @@ impl MinioProvider {
             if let Some(t) = token.as_ref() {
                 req = req.continuation_token(t);
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            let resp = req.send().await.map_err(|e| {
+                let code = e
+                    .as_service_error()
+                    .and_then(|se| se.code())
+                    .unwrap_or("unknown");
+                let msg = format!(
+                    "s3 list_objects_v2 failed (bucket='{}', prefix='{}', code='{}'): {:?}",
+                    self.bucket, prefix, code, e
+                );
+                log::error!("{}", msg);
+                Box::new(std::io::Error::other(msg)) as Box<dyn std::error::Error + Send + Sync>
+            })?;
             let contents = resp.contents();
             for c in contents.iter() {
                 if let Some(k) = c.key() {

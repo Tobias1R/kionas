@@ -6,6 +6,7 @@ pub mod interops_service {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct InteropsService {
     shared_data: SharedData,
 }

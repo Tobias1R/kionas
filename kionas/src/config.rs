@@ -141,50 +141,49 @@ pub async fn load_for_host(
     }
 
     // Try consul
-    if let Some(ca) = consul_addr {
-        if let Ok(Some(raw)) =
+    if let Some(ca) = consul_addr
+        && let Ok(Some(raw)) =
             fetch_consul_raw(ca, &format!("{}/{}", CONSUL_NODE_CONFIG_PREFIX, hostname)).await
-        {
-            let trimmed = raw.trim();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                let j: JsonValue = serde_json::from_str(&raw)?;
-                let j = substitute_env(j);
-                let cfg: AppConfig = serde_json::from_value(j)?;
-                return Ok(cfg);
-            } else {
-                // parse TOML then convert to JSON value for substitution
-                let t: toml::Value = toml::from_str(&raw)?;
-                let j = serde_json::to_value(t)?;
-                let j = substitute_env(j);
-                let cfg: AppConfig = serde_json::from_value(j)?;
-                return Ok(cfg);
-            }
+    {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let j: JsonValue = serde_json::from_str(&raw)?;
+            let j = substitute_env(j);
+            let cfg: AppConfig = serde_json::from_value(j)?;
+            Ok(cfg)
+        } else {
+            // parse TOML then convert to JSON value for substitution
+            let t: toml::Value = toml::from_str(&raw)?;
+            let j = serde_json::to_value(t)?;
+            let j = substitute_env(j);
+            let cfg: AppConfig = serde_json::from_value(j)?;
+            Ok(cfg)
         }
-    }
-
-    // Local fallback (use CLI arg --config or default)
-    #[derive(Parser, Debug)]
-    #[command(author, version, about, long_about = None)]
-    struct Args {
-        #[arg(short, long, default_value = "configs/server.toml")]
-        config: String,
-    }
-
-    let args = Args::parse();
-    let path = args.config;
-    let content = fs::read_to_string(&path)?;
-    let trimmed = content.trim();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        let j: JsonValue = serde_json::from_str(&content)?;
-        let j = substitute_env(j);
-        let cfg: AppConfig = serde_json::from_value(j)?;
-        return Ok(cfg);
     } else {
-        let t: toml::Value = toml::from_str(&content)?;
-        let j = serde_json::to_value(t)?;
-        let j = substitute_env(j);
-        let cfg: AppConfig = serde_json::from_value(j)?;
-        return Ok(cfg);
+        // Local fallback (use CLI arg --config or default)
+        #[derive(Parser, Debug)]
+        #[command(author, version, about, long_about = None)]
+        struct Args {
+            #[arg(short, long, default_value = "configs/server.toml")]
+            config: String,
+        }
+
+        let args = Args::parse();
+        let path = args.config;
+        let content = fs::read_to_string(&path)?;
+        let trimmed = content.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let j: JsonValue = serde_json::from_str(&content)?;
+            let j = substitute_env(j);
+            let cfg: AppConfig = serde_json::from_value(j)?;
+            Ok(cfg)
+        } else {
+            let t: toml::Value = toml::from_str(&content)?;
+            let j = serde_json::to_value(t)?;
+            let j = substitute_env(j);
+            let cfg: AppConfig = serde_json::from_value(j)?;
+            Ok(cfg)
+        }
     }
 }
 
@@ -192,16 +191,16 @@ pub async fn load_for_host(
 pub async fn load_cluster_config(
     consul_addr: Option<&str>,
 ) -> Result<ClusterConfig, Box<dyn Error + Send + Sync>> {
-    if let Some(ca) = consul_addr {
-        if let Ok(Some(raw)) = fetch_consul_raw(ca, CONSUL_CLUSTER_KEY).await {
-            let trimmed = raw.trim();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                let cfg: ClusterConfig = serde_json::from_str(&raw)?;
-                return Ok(cfg);
-            } else {
-                let cfg: ClusterConfig = toml::from_str(&raw)?;
-                return Ok(cfg);
-            }
+    if let Some(ca) = consul_addr
+        && let Ok(Some(raw)) = fetch_consul_raw(ca, CONSUL_CLUSTER_KEY).await
+    {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let cfg: ClusterConfig = serde_json::from_str(&raw)?;
+            return Ok(cfg);
+        } else {
+            let cfg: ClusterConfig = toml::from_str(&raw)?;
+            return Ok(cfg);
         }
     }
 

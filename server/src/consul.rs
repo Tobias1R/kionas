@@ -2,17 +2,20 @@ use kionas::config::AppConfig;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClusterConfig {
     pub listen_address: String,
     pub listen_port: u16,
 }
 
+#[allow(dead_code)]
 pub struct ConsulClient {
     base_url: String,
     client: Client,
 }
 
+#[allow(dead_code)]
 impl ConsulClient {
     pub fn new(consul_host: &str) -> Self {
         Self {
@@ -44,6 +47,7 @@ impl ConsulClient {
     }
 }
 
+#[allow(dead_code)]
 impl ClusterConfig {
     pub fn from_args(listen_address: String, listen_port: u16) -> Self {
         Self {

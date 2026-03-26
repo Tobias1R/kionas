@@ -8,6 +8,7 @@ members = [
     "tool",
     "metastore",
     "flight_proxy",
+    "ui_backend",
 ]
 
 [workspace.dependencies]
@@ -25,9 +26,17 @@ tonic = { version = "0.12.3", features = ["tls", "tls-native-roots", "tls-webpki
 tonic-reflection = "0.12.3"
 env_logger = "0.11"
 # global postgres dependency for sqlx
-sqlx = { version = "0.6", features = ["postgres", "runtime-tokio-rustls"] }
+sqlx = { version = "0.8.6", features = ["postgres", "runtime-tokio-rustls"] }
 chrono = "0.4.38"
 prost = "0.13.5"
 prost-types = "0.13.5"
 async-trait = "0.1.64"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
+
+[profile.dev]
+# Speed up local iteration by allowing more parallel codegen units.
+codegen-units = 256
+incremental = true
+
+[profile.test]
+inherits = "dev"

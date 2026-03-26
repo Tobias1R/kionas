@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
+#[allow(clippy::module_inception)]
 pub mod warehouse_auth_service {
     tonic::include_proto!("warehouse_auth_service");
 }
@@ -27,6 +28,7 @@ struct Claims {
     exp: usize,
 }
 
+#[allow(dead_code)]
 pub struct WarehouseAuthServiceBackend {
     shared_data: SharedData,
     session_manager: Arc<crate::session::SessionManager>,

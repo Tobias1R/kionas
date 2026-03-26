@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package worker_service;
 
+import "filter_predicate.proto";
+
 // Worker registration
 message RegisterWorkerRequest {
   string worker_id = 1;
@@ -26,7 +28,7 @@ message HeartbeatResponse {
 // Task-based execution
 message TaskRequest {
   string session_id = 1;
-  repeated Task tasks = 2;
+  repeated StagePartitionExecution tasks = 2;
 }
 
 message TaskResponse {
@@ -35,12 +37,37 @@ message TaskResponse {
   string result_location = 3; // Arrow Flight endpoint or file path
 }
 
-message Task {
+enum ExecutionModeHint {
+  EXECUTION_MODE_HINT_UNSPECIFIED = 0;
+  EXECUTION_MODE_HINT_LOCAL_ONLY = 1;
+  EXECUTION_MODE_HINT_DISTRIBUTED = 2;
+}
+
+message OutputDestination {
+  uint32 downstream_stage_id = 1;
+  repeated string worker_addresses = 2;
+  string partitioning = 3;
+  uint32 downstream_partition_count = 4;
+}
+
+message StagePartitionExecution {
   string task_id = 1;
   string operation = 2; // e.g., "scan", "filter", "aggregate", "write"
   string input = 3; // input path or ticket
   string output = 4; // output path or ticket
   map<string, string> params = 5; // operation-specific parameters
+  FilterPredicate filter_predicate = 6;
+  string query_id = 7;
+  uint32 stage_id = 8;
+  uint32 partition_id = 9;
+  bytes execution_plan = 10;
+  repeated OutputDestination output_destinations = 11;
+  ExecutionModeHint execution_mode_hint = 12;
+  uint32 partition_count = 13;
+  repeated uint32 upstream_stage_ids = 14;
+  map<uint32, uint32> upstream_partition_counts = 15;
+  string partition_spec = 16;
+  string query_run_id = 17;
 }
 
 // Arrow Flight integration
@@ -70,7 +97,7 @@ message PrepareRequest {
   string tx_id = 1;
   string session_id = 2;
   string staging_prefix = 3;
-  repeated Task tasks = 4; // tasks to stage
+  repeated StagePartitionExecution tasks = 4; // tasks to stage
 }
 
 message PrepareResponse {

@@ -62,7 +62,7 @@ if [[ "$DB_EXISTS" == "1" ]]; then
   if [[ "$TX_EXISTS" == "t" || "$TX_EXISTS" == "true" ]]; then
     echo "Metastore already initialized (transactions table present)."
   else
-    echo "Transactions table not found — running init SQL to migrate DB..."
+    echo "Transactions table not found â€” running init SQL to migrate DB..."
     if [[ -n "$DB_PASS" ]]; then
       docker exec -i -e PGPASSWORD="$DB_PASS" "$CONTAINER" psql -U "$DB_USER" -d postgres -f "$SCRIPT_CONTAINER_PATH"
     else
@@ -71,7 +71,7 @@ if [[ "$DB_EXISTS" == "1" ]]; then
     echo "Initialization script applied."
   fi
 else
-  echo "Database $DB_NAME does not exist — running init SQL to create and initialize the metastore..."
+  echo "Database $DB_NAME does not exist â€” running init SQL to create and initialize the metastore..."
   if [[ -n "$DB_PASS" ]]; then
     docker exec -i -e PGPASSWORD="$DB_PASS" "$CONTAINER" psql -U "$DB_USER" -d postgres -f "$SCRIPT_CONTAINER_PATH"
   else

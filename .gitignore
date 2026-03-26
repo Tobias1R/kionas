@@ -30,3 +30,18 @@ memories
 memories/*
 
 grpc.reflection.v1alpha
+
+_dev
+_dev/*
+
+target-worker-refactor-check
+target-worker-refactor-check/*
+
+docker-target
+docker-target/*
+
+runtime
+runtime/*
+
+roadmaps
+roadmaps/*

@@ -10,8 +10,6 @@ use kionas::consul::ClusterInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 type RedisPool = Arc<Pool<RedisConnectionManager>>;
@@ -24,23 +22,21 @@ impl deadpool::managed::Manager for RedisConnectionManager {
     type Type = redis::aio::MultiplexedConnection;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    fn create(&self) -> Pin<Box<dyn Future<Output = Result<Self::Type, Self::Error>> + Send>> {
+    fn create(&self) -> impl std::future::Future<Output = Result<Self::Type, Self::Error>> + Send {
         let redis_url = self.redis_url.clone();
-        Box::pin(async move {
+        async move {
             let client = redis::Client::open(redis_url)?;
             let conn = client.get_multiplexed_async_connection().await?;
             Ok(conn)
-        })
+        }
     }
 
-    fn recycle(
+    async fn recycle(
         &self,
         _obj: &mut Self::Type,
         _metrics: &deadpool::managed::Metrics,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(), deadpool::managed::RecycleError<Self::Error>>> + Send>,
-    > {
-        Box::pin(async move { Ok(()) })
+    ) -> Result<(), deadpool::managed::RecycleError<Self::Error>> {
+        Ok(())
     }
 }
 
@@ -68,7 +64,7 @@ pub struct SharedData {
     #[serde(skip)]
     pub task_result_locations: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     #[serde(skip)]
-    pub redis_pool: Arc<tokio::sync::Mutex<Option<RedisPool>>>,
+    pub(crate) redis_pool: Arc<tokio::sync::Mutex<Option<RedisPool>>>,
 }
 
 impl fmt::Debug for SharedData {
@@ -97,6 +93,7 @@ impl SharedData {
         self.storage_provider = Some(prov);
     }
 
+    #[allow(dead_code)]
     pub fn set_master_pool(&mut self, pool: Arc<Pool<InteropsManager>>) {
         // best-effort synchronous set for initialization paths
         let mutex = self.master_pool.clone();

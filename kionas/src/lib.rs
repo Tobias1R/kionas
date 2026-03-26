@@ -10,8 +10,6 @@ pub mod utils;
 
 use chrono::Utc;
 use get_if_addrs::get_if_addrs;
-use hostname;
-use md5;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::IpAddr;

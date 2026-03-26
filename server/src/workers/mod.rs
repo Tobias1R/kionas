@@ -25,20 +25,20 @@ pub async fn acquire_channel_with_heartbeat(
             .await
             {
                 Ok(Ok(_)) => Ok(conn),
-                Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("heartbeat error: {:?}", e),
-                ))),
+                Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+                    "heartbeat error: {:?}",
+                    e
+                )))),
                 Err(_) => Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timed out during heartbeat",
                 ))),
             }
         }
-        Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("pool.get() error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "pool.get() error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out getting pooled connection",
@@ -49,7 +49,7 @@ pub async fn acquire_channel_with_heartbeat(
 pub async fn send_task_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::TaskRequest,
-    auth_ctx: Option<&crate::statement_handler::helpers::DispatchAuthContext>,
+    auth_ctx: Option<&crate::statement_handler::shared::helpers::DispatchAuthContext>,
     timeout_secs: u64,
 ) -> Result<
     crate::services::worker_service_client::worker_service::TaskResponse,
@@ -83,10 +83,10 @@ pub async fn send_task_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("execute_task error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "execute_task error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out executing task",
@@ -94,6 +94,7 @@ pub async fn send_task_to_worker(
     }
 }
 
+#[allow(dead_code)]
 pub async fn send_prepare_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::PrepareRequest,
@@ -110,10 +111,10 @@ pub async fn send_prepare_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("prepare error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "prepare error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during prepare",
@@ -121,6 +122,7 @@ pub async fn send_prepare_to_worker(
     }
 }
 
+#[allow(dead_code)]
 pub async fn send_commit_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::CommitRequest,
@@ -137,10 +139,10 @@ pub async fn send_commit_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("commit error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "commit error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during commit",
@@ -148,6 +150,7 @@ pub async fn send_commit_to_worker(
     }
 }
 
+#[allow(dead_code)]
 pub async fn send_abort_to_worker(
     conn: PooledConn,
     req: crate::services::worker_service_client::worker_service::AbortRequest,
@@ -164,10 +167,10 @@ pub async fn send_abort_to_worker(
     .await
     {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(e)) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("abort error: {:?}", e),
-        ))),
+        Ok(Err(e)) => Err(Box::new(std::io::Error::other(format!(
+            "abort error: {:?}",
+            e
+        )))),
         Err(_) => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "timed out during abort",

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kionas UI Foundation</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="background-grid" aria-hidden="true"></div>
+    <header class="topbar">
+      <div>
+        <h1>Kionas Operations Pulse</h1>
+        <p>UI Foundation Dashboard</p>
+      </div>
+      <div class="topbar-actions">
+        <button id="refresh-btn" type="button">Refresh Now</button>
+        <div class="status-block">
+          <span id="global-status" class="status-pill status-loading">Loading</span>
+          <span id="last-refresh">Never refreshed</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="panel-grid">
+      <section class="panel" data-alias="server_stats">
+        <div class="panel-header">
+          <h2>Server Stats</h2>
+          <span class="status-pill status-loading" data-status>Loading</span>
+        </div>
+        <pre data-content>Waiting for data...</pre>
+      </section>
+
+      <section class="panel" data-alias="sessions">
+        <div class="panel-header">
+          <h2>Sessions</h2>
+          <span class="status-pill status-loading" data-status>Loading</span>
+        </div>
+        <pre data-content>Waiting for data...</pre>
+      </section>
+
+      <section class="panel" data-alias="tokens">
+        <div class="panel-header">
+          <h2>Tokens</h2>
+          <span class="status-pill status-loading" data-status>Loading</span>
+        </div>
+        <pre data-content>Waiting for data...</pre>
+      </section>
+
+      <section class="panel" data-alias="workers">
+        <div class="panel-header">
+          <h2>Workers</h2>
+          <span class="status-pill status-loading" data-status>Loading</span>
+        </div>
+        <pre data-content>Waiting for data...</pre>
+      </section>
+
+      <section class="panel" data-alias="consul_cluster_summary">
+        <div class="panel-header">
+          <h2>Consul Cluster Summary</h2>
+          <span class="status-pill status-loading" data-status>Loading</span>
+        </div>
+        <pre data-content>Waiting for data...</pre>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

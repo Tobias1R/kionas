@@ -97,6 +97,7 @@ async fn ensure_object_store_pool(
 }
 
 /// Open a Delta table by URI. Returns an error if the table cannot be opened.
+#[allow(dead_code)]
 pub async fn open_table(shared: SharedData, table_uri: &str) -> Result<DeltaTable, DynError> {
     let url = Url::parse(table_uri)?;
     let storage_options = storage_options_from_cluster(&shared.cluster_info.storage);
@@ -136,7 +137,7 @@ pub async fn create_table(
                 ArrowDataType::Timestamp(_, _) => DeltaDataType::TIMESTAMP,
                 ArrowDataType::Decimal128(precision, scale)
                 | ArrowDataType::Decimal256(precision, scale) => {
-                    PrimitiveType::decimal(*precision as u8, *scale as u8)
+                    PrimitiveType::decimal(*precision, *scale as u8)
                         .map(DeltaDataType::from)
                         .unwrap_or(DeltaDataType::STRING)
                 }

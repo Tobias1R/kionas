@@ -3,14 +3,13 @@ use kionas::utils::{print_memory_usage, print_server_info};
 use std::sync::Arc;
 
 use crate::{
-    tls as tlsmod,
+    janitor, tls as tlsmod,
     warehouse::state::{SharedData, SharedState},
 };
 use kionas::config::AppConfig;
 
 use crate::auth_setup;
 use crate::handlers;
-use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::services::interops_service_server::InteropsService;
@@ -18,7 +17,6 @@ use crate::services::warehouse_service_server::WarehouseService;
 
 use kionas::utils::resolve_hostname;
 use std::error::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize logging
@@ -134,93 +132,11 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         interops_service,
     );
 
-    // Simple HTTP metrics endpoint (minimal HTTP server) exposing SharedData
-    #[derive(Serialize)]
-    struct MetricsResponse {
-        counter: u32,
-        warehouses: Vec<String>,
-        sessions: usize,
-        worker_pools: Vec<String>,
-    }
-
-    let metrics_state = Arc::clone(&shared_data);
-    tokio::spawn(async move {
-        let bind = "0.0.0.0:9090";
-        log::info!("Starting minimal metrics HTTP server on {}", bind);
-        let listener = match tokio::net::TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("Failed to bind metrics listener: {}", e);
-                return;
-            }
-        };
-
-        loop {
-            let (mut socket, _peer) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!("Metrics accept error: {}", e);
-                    continue;
-                }
-            };
-
-            let state = Arc::clone(&metrics_state);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let n = match socket.read(&mut buf).await {
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]);
-                if !req.starts_with("GET /metrics") {
-                    let _ = socket
-                        .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
-                        .await;
-                    return;
-                }
-
-                // build metrics JSON from shared state
-                let shared = state.lock().await;
-                let counter = *shared.counter.lock().await;
-                let warehouses_map = shared.warehouses.lock().await;
-                let warehouses: Vec<String> = warehouses_map.keys().cloned().collect();
-                let sessions = shared.session_manager.list_sessions().await.len();
-                let worker_pools_map = shared.worker_pools.lock().await;
-                let worker_pools: Vec<String> = worker_pools_map.keys().cloned().collect();
-
-                let resp = MetricsResponse {
-                    counter,
-                    warehouses,
-                    sessions,
-                    worker_pools,
-                };
-
-                let body = match serde_json::to_string(&resp) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        let _ = socket
-                            .write_all(
-                                b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
-                            )
-                            .await;
-                        return;
-                    }
-                };
-
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-                    body.len()
-                );
-
-                let _ = socket.write_all(header.as_bytes()).await;
-                let _ = socket.write_all(body.as_bytes()).await;
-            });
-        }
-    });
+    // Start periodic janitor tasks for Redis-backed dashboard snapshots.
+    janitor::start(Arc::clone(&shared_data));
 
     let address = warehouse_cfg.host.clone();
-    let port = warehouse_cfg.port.clone();
+    let port = warehouse_cfg.port;
     log::info!("Starting server on {}:{}", address, port);
     print_server_info();
     print_memory_usage();

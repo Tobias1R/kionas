@@ -1,6 +1,8 @@
 # Build artifacts
 **/target/
 target/
+docker-target/
+**/docker-target/
 
 # VCS and editor
 .git/

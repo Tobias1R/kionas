@@ -3,6 +3,7 @@ use tonic::Request;
 use tonic::Status;
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct RequestContext {
     pub query_id: String,
     pub session_id_opt: Option<String>,
@@ -30,7 +31,7 @@ impl RequestContext {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "anonymous".to_string());
 
-        let session_id = session_id_opt.clone().unwrap_or_else(|| "".to_string());
+        let session_id = session_id_opt.clone().unwrap_or_default();
         let mut role: String = "worker".to_string();
         let mut warehouse_name = "".to_string();
 

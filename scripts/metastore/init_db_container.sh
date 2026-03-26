@@ -69,7 +69,7 @@ if [[ "$DB_EXISTS" == "1" ]]; then
   if [[ "$TX_EXISTS" == "t" || "$TX_EXISTS" == "true" ]]; then
     echo "Metastore already initialized (transactions table present)."
   else
-    echo "Transactions table not found — applying init SQL..."
+    echo "Transactions table not found â€” applying init SQL..."
     if [[ -n "$DB_PASS" ]]; then
       PGPASSWORD="$DB_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$DB_USER" -d postgres -f "$SCRIPT_PATH"
     else
@@ -78,7 +78,7 @@ if [[ "$DB_EXISTS" == "1" ]]; then
     echo "Initialization script applied."
   fi
 else
-  echo "Database $DB_NAME does not exist — applying init SQL to create and initialize the metastore..."
+  echo "Database $DB_NAME does not exist â€” applying init SQL to create and initialize the metastore..."
   if [[ -n "$DB_PASS" ]]; then
     PGPASSWORD="$DB_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$DB_USER" -d postgres -f "$SCRIPT_PATH"
   else
@@ -100,7 +100,7 @@ fi
 RBAC_EXISTS=$(run_psql "$DB_NAME" "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='users_rbac');" || echo "f")
 RBAC_EXISTS=$(echo "$RBAC_EXISTS" | tr -d '[:space:]')
 if [[ "$RBAC_EXISTS" != "t" && "$RBAC_EXISTS" != "true" ]]; then
-  echo "RBAC tables not found — applying RBAC SQL..."
+  echo "RBAC tables not found â€” applying RBAC SQL..."
   RBAC_SCRIPT_PATH=${RBAC_SQL_PATH:-./scripts/metastore/rbac.sql}
   if [[ -n "$DB_PASS" ]]; then
     PGPASSWORD="$DB_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$DB_USER" -d "$DB_NAME" -f "$RBAC_SCRIPT_PATH"

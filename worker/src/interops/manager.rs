@@ -1,6 +1,4 @@
 use deadpool::managed::{Manager, Metrics};
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 pub struct InteropsManager {
@@ -16,25 +14,24 @@ impl Manager for InteropsManager {
     >;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    fn create(&self) -> Pin<Box<dyn Future<Output = Result<Self::Type, Self::Error>> + Send>> {
+    fn create(&self) -> impl std::future::Future<Output = Result<Self::Type, Self::Error>> + Send {
         let master = self.addr.clone();
         let ca = self.ca_cert_path.clone();
         let cert = self.tls_cert_path.clone();
         let key = self.tls_key_path.clone();
-        Box::pin(async move {
+        async move {
             let base_ep = tonic::transport::Channel::from_shared(master.clone())?;
             let configured_endpoint = if master.starts_with("https") {
                 if let Some(ca_path) = ca.as_ref() {
                     let ca_bytes = std::fs::read(ca_path)?;
                     let ca = tonic::transport::Certificate::from_pem(ca_bytes);
                     let mut tls = tonic::transport::ClientTlsConfig::new().ca_certificate(ca);
-                    if let (Some(cert_path), Some(key_path)) = (cert.as_ref(), key.as_ref()) {
-                        if let (Ok(cert), Ok(key)) =
+                    if let (Some(cert_path), Some(key_path)) = (cert.as_ref(), key.as_ref())
+                        && let (Ok(cert), Ok(key)) =
                             (std::fs::read(cert_path), std::fs::read(key_path))
-                        {
-                            let id = tonic::transport::Identity::from_pem(cert, key);
-                            tls = tls.identity(id);
-                        }
+                    {
+                        let id = tonic::transport::Identity::from_pem(cert, key);
+                        tls = tls.identity(id);
                     }
                     match base_ep.clone().tls_config(tls) {
                         Ok(e) => e,
@@ -50,16 +47,14 @@ impl Manager for InteropsManager {
             let chan = tokio::time::timeout(Duration::from_secs(10), configured_endpoint.connect())
                 .await??;
             Ok(crate::interops_service::interops_service_client::InteropsServiceClient::new(chan))
-        })
+        }
     }
 
-    fn recycle(
+    async fn recycle(
         &self,
         _obj: &mut Self::Type,
         _metrics: &Metrics,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<(), deadpool::managed::RecycleError<Self::Error>>> + Send>,
-    > {
-        Box::pin(async move { Ok(()) })
+    ) -> Result<(), deadpool::managed::RecycleError<Self::Error>> {
+        Ok(())
     }
 }

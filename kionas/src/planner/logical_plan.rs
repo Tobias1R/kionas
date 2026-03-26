@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+use crate::planner::aggregate_spec::LogicalAggregateExpr;
+use crate::planner::join_spec::LogicalJoinSpec;
+
 /// What: Logical expression for Phase 1 minimal SELECT support.
 ///
 /// Inputs:
@@ -53,12 +56,32 @@ pub struct LogicalSelection {
     pub predicate: LogicalExpr,
 }
 
+/// What: One logical ORDER BY expression.
+///
+/// Inputs:
+/// - `expression`: Sort key expression.
+/// - `ascending`: `true` for ASC, `false` for DESC.
+///
+/// Output:
+/// - Deterministic ordering directive consumed by physical translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogicalSortExpr {
+    pub expression: LogicalExpr,
+    pub ascending: bool,
+}
+
 /// What: Phase 1 logical plan root model.
 ///
 /// Inputs:
 /// - `relation`: Single source relation.
 /// - `projection`: Projection expression node.
 /// - `selection`: Optional filter node.
+/// - `joins`: Optional join directives.
+/// - `grouping_keys`: Optional GROUP BY key expressions.
+/// - `aggregates`: Optional aggregate expressions parsed from projection.
+/// - `order_by`: Optional ordering directives.
+/// - `limit`: Optional row-count limit.
+/// - `offset`: Optional row offset applied before limit.
 /// - `sql`: Canonical SQL string for explain/debug parity.
 ///
 /// Output:
@@ -68,5 +91,11 @@ pub struct LogicalPlan {
     pub relation: LogicalRelation,
     pub projection: LogicalProjection,
     pub selection: Option<LogicalSelection>,
+    pub joins: Vec<LogicalJoinSpec>,
+    pub grouping_keys: Vec<LogicalExpr>,
+    pub aggregates: Vec<LogicalAggregateExpr>,
+    pub order_by: Vec<LogicalSortExpr>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub sql: String,
 }

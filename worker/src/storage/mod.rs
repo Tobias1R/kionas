@@ -5,9 +5,12 @@ use std::sync::Arc;
 
 #[cfg(feature = "storage-minio")]
 pub mod minio;
+#[cfg(feature = "storage-minio")]
+pub mod minio_pool;
 
 pub mod deltalake;
 pub mod exchange;
+#[allow(dead_code)]
 pub mod mock;
 pub mod object_store_adapter;
 pub mod object_store_pool;
@@ -35,6 +38,7 @@ pub trait StorageProvider: Send + Sync {
 }
 
 /// Put a serializable object as JSON into the provider.
+#[allow(dead_code)]
 pub async fn put_json<T: serde::Serialize>(
     provider: &Arc<dyn StorageProvider>,
     key: &str,
@@ -45,6 +49,7 @@ pub async fn put_json<T: serde::Serialize>(
 }
 
 /// Get and deserialize JSON from provider. Returns Ok(None) if the key does not exist.
+#[allow(dead_code)]
 pub async fn get_json<T: DeserializeOwned>(
     provider: &Arc<dyn StorageProvider>,
     key: &str,
@@ -70,8 +75,21 @@ pub async fn build_provider_from_cluster(
             #[cfg(feature = "storage-minio")]
             {
                 let cfg = minio::MinioConfig::from_value(storage)?;
-                let prov = minio::MinioProvider::new(cfg).await?;
-                return Ok(Arc::new(prov));
+                let pool_size = std::env::var("MINIO_PROVIDER_POOL_SIZE")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8)
+                    .max(1);
+
+                if pool_size == 1 {
+                    log::info!("Using single MinIO provider (pool disabled via size=1)");
+                    let prov = minio::MinioProvider::new(cfg).await?;
+                    Ok(Arc::new(prov))
+                } else {
+                    log::info!("Using pooled MinIO provider with size={}", pool_size);
+                    let pooled = minio_pool::PooledMinioProvider::new(cfg, pool_size)?;
+                    Ok(Arc::new(pooled))
+                }
             }
             #[cfg(not(feature = "storage-minio"))]
             {

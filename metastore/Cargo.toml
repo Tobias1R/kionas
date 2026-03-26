@@ -23,6 +23,7 @@ parquet.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
+rustls.workspace = true
 deadpool-postgres = "0.14.1"
 tokio-postgres = "0.7.0" # for connection pooling with sqlx
 uuid = { version = "1", features = ["v4", "serde"] }

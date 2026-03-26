@@ -123,6 +123,7 @@ mod tests {
                 },
             }],
             partition_spec: PartitionSpec::Single,
+            output_partition_count: None,
         }
     }
 

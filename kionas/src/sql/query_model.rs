@@ -1,5 +1,6 @@
 use crate::parser::datafusion_sql::sqlparser::ast::{
-    Query as SqlQuery, Select, SetExpr, TableFactor,
+    BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query as SqlQuery, Select, SetExpr,
+    TableFactor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,13 +18,13 @@ use serde_json::json;
 pub const QUERY_PAYLOAD_VERSION: u8 = 2;
 
 /// What: Validation outcome code for unsupported query shape errors.
-pub const VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE: &str = "UNSUPPORTED_QUERY_SHAPE";
+pub const VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE: &str = "VALIDATION_UNSUPPORTED_QUERY_SHAPE";
 /// What: Validation outcome code for invalid physical pipeline errors.
-pub const VALIDATION_CODE_UNSUPPORTED_PIPELINE: &str = "UNSUPPORTED_PIPELINE";
+pub const VALIDATION_CODE_UNSUPPORTED_PIPELINE: &str = "VALIDATION_UNSUPPORTED_PIPELINE";
 /// What: Validation outcome code for unsupported physical operators.
-pub const VALIDATION_CODE_UNSUPPORTED_OPERATOR: &str = "UNSUPPORTED_OPERATOR";
+pub const VALIDATION_CODE_UNSUPPORTED_OPERATOR: &str = "VALIDATION_UNSUPPORTED_OPERATOR";
 /// What: Validation outcome code for unsupported predicates.
-pub const VALIDATION_CODE_UNSUPPORTED_PREDICATE: &str = "UNSUPPORTED_PREDICATE";
+pub const VALIDATION_CODE_UNSUPPORTED_PREDICATE: &str = "VALIDATION_UNSUPPORTED_PREDICATE";
 
 /// What: Canonical namespace fields used to identify query source table.
 ///
@@ -43,6 +44,62 @@ pub struct QueryNamespace {
     pub raw: String,
 }
 
+/// What: Canonical ORDER BY expression shape preserved in query model payload.
+///
+/// Inputs:
+/// - `expression`: Sort key SQL text.
+/// - `ascending`: `true` for ASC, `false` for DESC.
+///
+/// Output:
+/// - Deterministic ordering directive consumed by planner translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SortSpec {
+    pub expression: String,
+    pub ascending: bool,
+}
+
+/// What: Supported join type in query-model payload.
+///
+/// Inputs:
+/// - Variant selected during AST extraction.
+///
+/// Output:
+/// - Stable join type consumed by logical translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QueryJoinType {
+    Inner,
+}
+
+/// What: One equi-join key pair from a JOIN ON clause.
+///
+/// Inputs:
+/// - `left`: Left expression text.
+/// - `right`: Right expression text.
+///
+/// Output:
+/// - Serializable join key pair entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryJoinKey {
+    pub left: String,
+    pub right: String,
+}
+
+/// What: Canonical query-model representation for one JOIN clause.
+///
+/// Inputs:
+/// - `join_type`: Supported join variant.
+/// - `right`: Canonical right relation namespace.
+/// - `keys`: Equi-join key pairs.
+///
+/// Output:
+/// - Serializable join directive consumed by logical planner translation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryJoinSpec {
+    pub join_type: QueryJoinType,
+    pub right: QueryNamespace,
+    pub keys: Vec<QueryJoinKey>,
+}
+
 /// What: Shared semantic model for a minimal SELECT query.
 ///
 /// Inputs:
@@ -52,6 +109,8 @@ pub struct QueryNamespace {
 /// - `namespace`: Resolved query namespace metadata.
 /// - `projection`: Projection expressions.
 /// - `selection`: Optional filter expression.
+/// - `order_by`: Optional ORDER BY directives.
+/// - `group_by`: Optional GROUP BY directives.
 /// - `sql`: Canonical SQL text representation.
 ///
 /// Output:
@@ -64,6 +123,11 @@ pub struct SelectQueryModel {
     pub namespace: QueryNamespace,
     pub projection: Vec<String>,
     pub selection: Option<String>,
+    pub joins: Vec<QueryJoinSpec>,
+    pub group_by: Vec<String>,
+    pub order_by: Vec<SortSpec>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
     pub sql: String,
 }
 
@@ -85,6 +149,24 @@ pub struct QueryDispatchEnvelope {
     pub table: String,
 }
 
+/// What: Canonical SELECT dispatch model bundle without planning artifacts.
+///
+/// Inputs:
+/// - `model`: Canonical semantic model extracted from SQL AST.
+/// - `database`: Canonical database identifier.
+/// - `schema`: Canonical schema identifier.
+/// - `table`: Canonical table identifier.
+///
+/// Output:
+/// - Reusable bundle consumed by server-owned planning and payload emission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectQueryDispatchModel {
+    pub model: SelectQueryModel,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+}
+
 /// What: Error type produced while translating SQL AST into shared query model.
 ///
 /// Inputs:
@@ -97,12 +179,19 @@ pub enum QueryModelError {
     UnsupportedSetOperation,
     UnsupportedMultiTableFrom,
     UnsupportedJoin,
+    UnsupportedJoinType(String),
+    UnsupportedJoinConstraint,
+    UnsupportedJoinExpression(String),
+    MissingJoinKeys,
     UnsupportedTableFactor,
     PlannerTranslationFailed(String),
     PlannerPhysicalFailed(String),
     InvalidPhysicalPipeline(String),
     UnsupportedPhysicalOperator(String),
     UnsupportedPredicate(String),
+    UnsupportedLimitExpression(String),
+    UnsupportedFetchClause,
+    OffsetWithoutLimit,
 }
 
 impl std::fmt::Display for QueryModelError {
@@ -117,6 +206,18 @@ impl std::fmt::Display for QueryModelError {
             }
             QueryModelError::UnsupportedJoin => {
                 write!(f, "JOIN is not supported in this phase")
+            }
+            QueryModelError::UnsupportedJoinType(kind) => {
+                write!(f, "JOIN type '{}' is not supported in this phase", kind)
+            }
+            QueryModelError::UnsupportedJoinConstraint => {
+                write!(f, "JOIN must use an ON clause in this phase")
+            }
+            QueryModelError::UnsupportedJoinExpression(message) => {
+                write!(f, "unsupported JOIN expression: {}", message)
+            }
+            QueryModelError::MissingJoinKeys => {
+                write!(f, "JOIN must include at least one equality key")
             }
             QueryModelError::UnsupportedTableFactor => write!(
                 f,
@@ -140,6 +241,15 @@ impl std::fmt::Display for QueryModelError {
             }
             QueryModelError::UnsupportedPredicate(name) => {
                 write!(f, "predicate is not supported in this phase: {}", name)
+            }
+            QueryModelError::UnsupportedLimitExpression(message) => {
+                write!(f, "unsupported LIMIT/OFFSET expression: {}", message)
+            }
+            QueryModelError::UnsupportedFetchClause => {
+                write!(f, "FETCH clause is not supported in this phase")
+            }
+            QueryModelError::OffsetWithoutLimit => {
+                write!(f, "OFFSET without LIMIT is not supported in this phase")
             }
         }
     }
@@ -205,6 +315,151 @@ fn canonicalize_table_namespace(
     }
 }
 
+fn split_once_case_insensitive<'a>(haystack: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    lower_haystack.find(&lower_needle).map(|index| {
+        let head = &haystack[..index];
+        let tail = &haystack[index + needle.len()..];
+        (head, tail)
+    })
+}
+
+fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
+    let (_, after_order_by) = match split_once_case_insensitive(sql, "order by") {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+
+    let mut order_clause = after_order_by.trim();
+    for stopper in [" limit ", " offset ", " fetch "] {
+        if let Some((head, _)) = split_once_case_insensitive(order_clause, stopper) {
+            order_clause = head.trim();
+        }
+    }
+
+    if order_clause.is_empty() {
+        return Vec::new();
+    }
+
+    order_clause
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            let lower = segment.to_ascii_lowercase();
+            if lower.ends_with(" desc") {
+                SortSpec {
+                    expression: segment[..segment.len() - 5].trim().to_string(),
+                    ascending: false,
+                }
+            } else if lower.ends_with(" asc") {
+                SortSpec {
+                    expression: segment[..segment.len() - 4].trim().to_string(),
+                    ascending: true,
+                }
+            } else {
+                SortSpec {
+                    expression: segment.to_string(),
+                    ascending: true,
+                }
+            }
+        })
+        .filter(|spec| !spec.expression.is_empty())
+        .collect::<Vec<_>>()
+}
+
+fn parse_group_by_from_sql(sql: &str) -> Vec<String> {
+    let (_, after_group_by) = match split_once_case_insensitive(sql, "group by") {
+        Some(parts) => parts,
+        None => return Vec::new(),
+    };
+
+    let mut group_clause = after_group_by.trim();
+    for stopper in [" order by ", " limit ", " offset ", " fetch ", " having "] {
+        if let Some((head, _)) = split_once_case_insensitive(group_clause, stopper) {
+            group_clause = head.trim();
+        }
+    }
+
+    if group_clause.is_empty() {
+        return Vec::new();
+    }
+
+    group_clause
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+}
+
+/// What: Parse a SQL numeric clause token as non-negative integer.
+///
+/// Inputs:
+/// - `raw`: Clause token text.
+/// - `label`: Clause label used in validation errors.
+///
+/// Output:
+/// - Parsed unsigned integer value.
+fn parse_non_negative_u64_token(raw: &str, label: &str) -> Result<u64, QueryModelError> {
+    let token = raw.split_whitespace().next().unwrap_or_default();
+    token.parse::<u64>().map_err(|_| {
+        QueryModelError::UnsupportedLimitExpression(format!("{}='{}'", label, raw.trim()))
+    })
+}
+
+/// What: Extract LIMIT and OFFSET values from canonical SQL text.
+///
+/// Inputs:
+/// - `sql`: Canonical SQL text from parsed query AST.
+///
+/// Output:
+/// - Tuple with optional `(limit, offset)` values.
+fn parse_limit_offset_from_sql(sql: &str) -> Result<(Option<u64>, Option<u64>), QueryModelError> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains(" fetch ") {
+        return Err(QueryModelError::UnsupportedFetchClause);
+    }
+
+    let limit = if let Some((_, after_limit)) = split_once_case_insensitive(sql, " limit ") {
+        let limit_raw =
+            if let Some((head, _)) = split_once_case_insensitive(after_limit, " offset ") {
+                head.trim()
+            } else {
+                after_limit.trim()
+            };
+
+        if limit_raw.is_empty() {
+            return Err(QueryModelError::UnsupportedLimitExpression(
+                "LIMIT clause is empty".to_string(),
+            ));
+        }
+
+        Some(parse_non_negative_u64_token(limit_raw, "LIMIT")?)
+    } else {
+        None
+    };
+
+    let offset = if let Some((_, after_offset)) = split_once_case_insensitive(sql, " offset ") {
+        let offset_raw = after_offset.trim();
+        if offset_raw.is_empty() {
+            return Err(QueryModelError::UnsupportedLimitExpression(
+                "OFFSET clause is empty".to_string(),
+            ));
+        }
+        Some(parse_non_negative_u64_token(offset_raw, "OFFSET")?)
+    } else {
+        None
+    };
+
+    if offset.is_some() && limit.is_none() {
+        return Err(QueryModelError::OffsetWithoutLimit);
+    }
+
+    Ok((limit, offset))
+}
+
 fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> {
     let select = match query.body.as_ref() {
         SetExpr::Select(select) => select.as_ref(),
@@ -215,12 +470,95 @@ fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> 
         return Err(QueryModelError::UnsupportedMultiTableFrom);
     }
 
-    let from = &select.from[0];
-    if !from.joins.is_empty() {
-        return Err(QueryModelError::UnsupportedJoin);
+    // Removed unused variable
+    Ok(select)
+}
+
+fn parse_join_column_ref(expr: &Expr) -> Result<String, QueryModelError> {
+    match expr {
+        Expr::Identifier(identifier) => Ok(identifier.to_string()),
+        Expr::CompoundIdentifier(parts) => Ok(parts
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(".")),
+        _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+    }
+}
+
+fn parse_join_keys(expr: &Expr, out: &mut Vec<QueryJoinKey>) -> Result<(), QueryModelError> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                parse_join_keys(left, out)?;
+                parse_join_keys(right, out)?;
+                Ok(())
+            }
+            BinaryOperator::Eq => {
+                let left_key = parse_join_column_ref(left)?;
+                let right_key = parse_join_column_ref(right)?;
+                out.push(QueryJoinKey {
+                    left: left_key,
+                    right: right_key,
+                });
+                Ok(())
+            }
+            _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+        },
+        _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
+    }
+}
+
+fn parse_join_specs(
+    joins: &[Join],
+    default_database: &str,
+    default_schema: &str,
+) -> Result<Vec<QueryJoinSpec>, QueryModelError> {
+    let mut specs = Vec::with_capacity(joins.len());
+
+    for join in joins {
+        let right_table = match &join.relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            _ => return Err(QueryModelError::UnsupportedTableFactor),
+        };
+
+        let (join_type, constraint) = match &join.join_operator {
+            JoinOperator::Inner(constraint) => (QueryJoinType::Inner, constraint),
+            JoinOperator::Join(constraint) => (QueryJoinType::Inner, constraint),
+            _ => {
+                return Err(QueryModelError::UnsupportedJoinType(
+                    "non-inner".to_string(),
+                ));
+            }
+        };
+
+        let on = match constraint {
+            JoinConstraint::On(expr) => expr,
+            _ => return Err(QueryModelError::UnsupportedJoinConstraint),
+        };
+
+        let mut keys = Vec::new();
+        parse_join_keys(on, &mut keys)?;
+        if keys.is_empty() {
+            return Err(QueryModelError::MissingJoinKeys);
+        }
+
+        let (database, schema, table) =
+            canonicalize_table_namespace(&right_table, default_database, default_schema);
+
+        specs.push(QueryJoinSpec {
+            join_type,
+            right: QueryNamespace {
+                database,
+                schema,
+                table,
+                raw: right_table,
+            },
+            keys,
+        });
     }
 
-    Ok(select)
+    Ok(specs)
 }
 
 /// What: Build a shared dispatch envelope for a minimal SELECT query.
@@ -237,12 +575,59 @@ fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> 
 /// Details:
 /// - This function centralizes query payload construction outside the server crate so
 ///   planner and other crates can share the same model boundary.
-pub fn build_select_query_dispatch_envelope(
+pub async fn build_select_query_dispatch_envelope(
     query: &SqlQuery,
     session_id: &str,
     default_database: &str,
     default_schema: &str,
 ) -> Result<QueryDispatchEnvelope, QueryModelError> {
+    let select_query =
+        build_select_query_model(query, session_id, default_database, default_schema)?;
+    let database = select_query.database;
+    let schema = select_query.schema;
+    let table = select_query.table;
+    let model = select_query.model;
+
+    let payload = json!({
+        "version": model.version,
+        "statement": model.statement,
+        "session_id": model.session_id,
+        "namespace": model.namespace,
+        "projection": model.projection,
+        "selection": model.selection,
+        "joins": model.joins,
+        "group_by": model.group_by,
+        "order_by": model.order_by,
+        "limit": model.limit,
+        "offset": model.offset,
+        "sql": model.sql,
+    })
+    .to_string();
+
+    Ok(QueryDispatchEnvelope {
+        payload,
+        database,
+        schema,
+        table,
+    })
+}
+
+/// What: Build canonical SELECT query model and namespace metadata from SQL AST.
+///
+/// Inputs:
+/// - `query`: Parsed SQL query AST.
+/// - `session_id`: Current session identifier.
+/// - `default_database`: Session default database fallback.
+/// - `default_schema`: Session default schema fallback.
+///
+/// Output:
+/// - `SelectQueryDispatchModel` containing canonical semantic model and relation namespace.
+pub fn build_select_query_model(
+    query: &SqlQuery,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<SelectQueryDispatchModel, QueryModelError> {
     let select = extract_minimal_select(query)?;
 
     let from = &select.from[0];
@@ -254,6 +639,8 @@ pub fn build_select_query_dispatch_envelope(
     let (database, schema, table) =
         canonicalize_table_namespace(&table_name, default_database, default_schema);
 
+    let canonical_sql = query.to_string();
+    let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
     let model = SelectQueryModel {
         version: QUERY_PAYLOAD_VERSION,
         statement: "Select".to_string(),
@@ -273,40 +660,16 @@ pub fn build_select_query_dispatch_envelope(
             .selection
             .as_ref()
             .map(std::string::ToString::to_string),
-        sql: query.to_string(),
+        joins: parse_join_specs(&from.joins, default_database, default_schema)?,
+        group_by: parse_group_by_from_sql(canonical_sql.as_str()),
+        order_by: parse_order_by_from_sql(canonical_sql.as_str()),
+        limit,
+        offset,
+        sql: canonical_sql,
     };
 
-    let logical_plan = crate::planner::build_logical_plan_from_select_model(&model)
-        .map_err(|e| QueryModelError::PlannerTranslationFailed(e.to_string()))?;
-    let physical_plan = crate::planner::build_physical_plan_from_logical_plan(&logical_plan)
-        .map_err(|e| match e {
-            crate::planner::PlannerError::InvalidPhysicalPipeline(message) => {
-                QueryModelError::InvalidPhysicalPipeline(message)
-            }
-            crate::planner::PlannerError::UnsupportedPhysicalOperator(name) => {
-                QueryModelError::UnsupportedPhysicalOperator(name)
-            }
-            crate::planner::PlannerError::UnsupportedPredicate(name) => {
-                QueryModelError::UnsupportedPredicate(name)
-            }
-            _ => QueryModelError::PlannerPhysicalFailed(e.to_string()),
-        })?;
-
-    let payload = json!({
-        "version": model.version,
-        "statement": model.statement,
-        "session_id": model.session_id,
-        "namespace": model.namespace,
-        "projection": model.projection,
-        "selection": model.selection,
-        "sql": model.sql,
-        "logical_plan": logical_plan,
-        "physical_plan": physical_plan,
-    })
-    .to_string();
-
-    Ok(QueryDispatchEnvelope {
-        payload,
+    Ok(SelectQueryDispatchModel {
+        model,
         database,
         schema,
         table,
@@ -319,13 +682,13 @@ mod tests {
         QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
         VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
         VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE, build_select_query_dispatch_envelope,
-        validation_code_for_query_error,
+        build_select_query_model, validation_code_for_query_error,
     };
     use crate::parser::sql::parse_query;
     use serde_json::Value;
 
-    #[test]
-    fn builds_payload_for_minimal_select() {
+    #[tokio::test]
+    async fn builds_payload_for_minimal_select() {
         let statements = parse_query("SELECT id FROM sales.public.users WHERE active = true")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -335,17 +698,107 @@ mod tests {
         };
 
         let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect("payload should build");
 
         assert!(envelope.payload.contains("\"statement\":\"Select\""));
         assert!(envelope.payload.contains("\"database\":\"sales\""));
-        assert!(envelope.payload.contains("\"logical_plan\""));
-        assert!(envelope.payload.contains("\"physical_plan\""));
         assert_eq!(envelope.table, "users");
     }
 
-    #[test]
-    fn rejects_multi_table_select() {
+    #[tokio::test]
+    async fn captures_order_by_in_payload() {
+        let statements =
+            parse_query("SELECT id FROM sales.public.users ORDER BY id DESC LIMIT 5 OFFSET 2")
+                .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect("payload should build");
+        let parsed: Value =
+            serde_json::from_str(&envelope.payload).expect("payload should be valid json");
+        let order_by = parsed
+            .get("order_by")
+            .and_then(Value::as_array)
+            .expect("payload should include order_by");
+
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(
+            order_by[0].get("expression").and_then(Value::as_str),
+            Some("id")
+        );
+        assert_eq!(
+            order_by[0].get("ascending").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(parsed.get("limit").and_then(Value::as_u64), Some(5));
+        assert_eq!(parsed.get("offset").and_then(Value::as_u64), Some(2));
+
+        assert!(parsed.get("diagnostics").is_none());
+        assert!(parsed.get("physical_plan").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_offset_without_limit() {
+        let statements = parse_query("SELECT id FROM sales.public.users OFFSET 2")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect_err("must reject offset without limit");
+        assert!(matches!(err, QueryModelError::OffsetWithoutLimit));
+    }
+
+    #[tokio::test]
+    async fn rejects_fetch_clause() {
+        let statements = parse_query("SELECT id FROM sales.public.users FETCH FIRST 1 ROWS ONLY")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect_err("must reject fetch");
+        assert!(matches!(err, QueryModelError::UnsupportedFetchClause));
+    }
+
+    #[tokio::test]
+    async fn builds_payload_when_relation_does_not_exist_in_runtime_catalog() {
+        let statements = parse_query("SELECT id FROM abc.schema1.table4 ORDER BY id")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "abc", "schema1")
+            .await
+            .expect("payload should build without runtime catalog lookups");
+
+        let parsed: Value =
+            serde_json::from_str(&envelope.payload).expect("payload should be valid json");
+        assert_eq!(
+            parsed.get("sql").and_then(Value::as_str),
+            Some("SELECT id FROM abc.schema1.table4 ORDER BY id")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_multi_table_select() {
         let statements = parse_query("SELECT * FROM a, b").expect("statement should parse");
         let statement = statements.first().expect("statement expected");
         let query = match statement {
@@ -354,13 +807,14 @@ mod tests {
         };
 
         let err = build_select_query_dispatch_envelope(query, "s1", "default", "public")
+            .await
             .expect_err("must reject unsupported shape");
 
         assert!(err.to_string().contains("exactly one table"));
     }
 
-    #[test]
-    fn payload_contains_logical_plan_structure() {
+    #[tokio::test]
+    async fn payload_contains_query_model_structure() {
         let statements = parse_query("SELECT id, name FROM sales.public.users WHERE active = true")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -370,6 +824,7 @@ mod tests {
         };
 
         let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
             .expect("payload should build");
 
         let parsed: Value =
@@ -397,41 +852,12 @@ mod tests {
             Some("users")
         );
 
-        let logical_plan = parsed
-            .get("logical_plan")
-            .expect("payload should include logical_plan");
-        let relation = logical_plan
-            .get("relation")
-            .expect("logical_plan should include relation");
-        assert_eq!(
-            relation.get("database").and_then(Value::as_str),
-            Some("sales")
-        );
-        assert_eq!(
-            relation.get("schema").and_then(Value::as_str),
-            Some("public")
-        );
-        assert_eq!(relation.get("table").and_then(Value::as_str), Some("users"));
-
-        let projection_exprs = logical_plan
-            .get("projection")
-            .and_then(|p| p.get("expressions"))
-            .and_then(Value::as_array)
-            .expect("logical_plan.projection.expressions should be an array");
-        assert_eq!(projection_exprs.len(), 2);
-
-        let physical_plan = parsed
-            .get("physical_plan")
-            .expect("payload should include physical_plan");
-        let operators = physical_plan
-            .get("operators")
-            .and_then(Value::as_array)
-            .expect("physical_plan.operators should be an array");
-        assert!(operators.len() >= 3);
+        assert!(parsed.get("logical_plan").is_none());
+        assert!(parsed.get("physical_plan").is_none());
     }
 
-    #[test]
-    fn rejects_deferred_predicate_shapes() {
+    #[tokio::test]
+    async fn accepts_deferred_predicate_shapes_in_model_only_envelope() {
         let statements = parse_query("SELECT id FROM sales.public.users WHERE name LIKE 'a%'")
             .expect("statement should parse");
         let statement = statements.first().expect("statement expected");
@@ -440,13 +866,30 @@ mod tests {
             _ => panic!("expected query statement"),
         };
 
-        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
-            .expect_err("must reject deferred predicate");
+        let envelope = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect("model-only envelope should not reject deferred predicates");
+        assert!(envelope.payload.contains("name LIKE 'a%'"));
+    }
 
-        match err {
-            QueryModelError::UnsupportedPredicate(name) => assert_eq!(name, "LIKE"),
-            other => panic!("unexpected error: {}", other),
-        }
+    #[tokio::test]
+    async fn builds_select_query_model_without_planning_artifacts() {
+        let statements = parse_query("SELECT id FROM sales.public.users ORDER BY id DESC LIMIT 5")
+            .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build");
+
+        assert_eq!(model.database, "sales");
+        assert_eq!(model.schema, "public");
+        assert_eq!(model.table, "users");
+        assert_eq!(model.model.limit, Some(5));
+        assert_eq!(model.model.order_by.len(), 1);
     }
 
     #[test]
@@ -509,6 +952,18 @@ mod tests {
             (
                 QueryModelError::UnsupportedPredicate("x".to_string()),
                 VALIDATION_CODE_UNSUPPORTED_PREDICATE,
+            ),
+            (
+                QueryModelError::UnsupportedLimitExpression("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::UnsupportedFetchClause,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
+                QueryModelError::OffsetWithoutLimit,
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
             ),
         ];
 

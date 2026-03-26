@@ -1,14 +1,15 @@
+type Task = crate::services::worker_service_server::worker_service::StagePartitionExecution;
 use crate::state::SharedData;
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use kionas::parser::datafusion_sql::sqlparser::ast::{Expr, SetExpr, Statement, Value as SqlValue};
-use kionas::parser::sql::parse_query;
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-enum InsertScalar {
+pub(crate) enum InsertScalar {
     Int(i64),
     Bool(bool),
     Str(String),
@@ -16,10 +17,35 @@ enum InsertScalar {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedInsertPayload {
+pub(crate) struct ParsedInsertPayload {
+    pub(crate) table_name: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<InsertScalar>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum InsertScalarPayload {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Null,
+}
+
+#[derive(Deserialize)]
+struct ParsedInsertPayloadWire {
     table_name: String,
     columns: Vec<String>,
-    rows: Vec<Vec<InsertScalar>>,
+    rows: Vec<Vec<InsertScalarPayload>>,
+}
+
+fn normalize_identifier(raw: &str) -> String {
+    raw.trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
 }
 
 /// What: Build a Delta table URI from storage config and a SQL table name.
@@ -75,111 +101,56 @@ fn derive_table_uri_from_storage(storage: &JsonValue, table_name: &str) -> Optio
 }
 
 #[cfg(test)]
-mod tests {
-    use super::derive_table_uri_from_storage;
-    use serde_json::json;
+#[path = "../tests/transactions_maestro_uri_tests.rs"]
+mod uri_tests;
 
-    #[test]
-    fn derive_insert_uri_uses_canonical_three_part_layout() {
-        let storage = json!({ "bucket": "warehouse" });
-        let uri = derive_table_uri_from_storage(&storage, "testdb_4.testschema_2.testtable_2")
-            .expect("uri must be derived");
-        assert_eq!(
-            uri,
-            "s3://warehouse/databases/testdb_4/schemas/testschema_2/tables/testtable_2"
-        );
-    }
-
-    #[test]
-    fn derive_insert_uri_normalizes_quoted_three_part_layout() {
-        let storage = json!({ "bucket": "warehouse" });
-        let uri = derive_table_uri_from_storage(&storage, "\"TestDB\".\"Schema\".\"Table\"")
-            .expect("uri must be derived");
-        assert_eq!(
-            uri,
-            "s3://warehouse/databases/testdb/schemas/schema/tables/table"
-        );
-    }
-}
-
-/// What: Parse an INSERT SQL payload into table metadata and row values.
+/// What: Parse structured INSERT payload from task params into typed row values.
 ///
 /// Inputs:
-/// - `sql`: Raw SQL payload from task input
+/// - `task`: Insert task containing `insert_payload_json` params.
 ///
 /// Output:
-/// - Parsed table name, optional column list and VALUES rows
+/// - Parsed table name, columns, and rows for Arrow conversion.
 ///
 /// Details:
-/// - Supports INSERT statements where source is a VALUES clause.
-fn parse_insert_payload(sql: &str) -> Result<ParsedInsertPayload, String> {
-    let statements = parse_query(sql).map_err(|e| format!("insert parse error: {}", e))?;
-    let stmt = statements
-        .first()
-        .ok_or_else(|| "insert parse error: empty statement list".to_string())?;
+/// - Rejects missing or malformed payloads with actionable messages.
+fn parse_insert_payload(task: &Task) -> Result<ParsedInsertPayload, String> {
+    let raw = task.params.get("insert_payload_json").ok_or_else(|| {
+        "insert payload contract missing: insert_payload_json parameter is required".to_string()
+    })?;
 
-    let insert = match stmt {
-        Statement::Insert(insert_stmt) => insert_stmt,
-        _ => return Err("task payload is not an INSERT statement".to_string()),
-    };
+    let payload = serde_json::from_str::<ParsedInsertPayloadWire>(raw)
+        .map_err(|e| format!("insert payload contract malformed: {}", e))?;
 
-    let source = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| "INSERT source is missing".to_string())?;
-
-    let values = match source.body.as_ref() {
-        SetExpr::Values(values) => values,
-        _ => {
-            return Err(
-                "INSERT source is not VALUES; only VALUES inserts are supported in worker"
-                    .to_string(),
-            );
-        }
-    };
-
-    if values.rows.is_empty() {
-        return Err("INSERT VALUES has no rows".to_string());
-    }
-
-    let mut rows = Vec::with_capacity(values.rows.len());
-    for row in &values.rows {
-        let mut parsed_row = Vec::with_capacity(row.len());
-        for expr in row {
-            let scalar = match expr {
-                Expr::Value(vws) => match &vws.value {
-                    SqlValue::Number(n, _) => n
-                        .parse::<i64>()
-                        .map(InsertScalar::Int)
-                        .unwrap_or_else(|_| InsertScalar::Str(n.clone())),
-                    SqlValue::Boolean(b) => InsertScalar::Bool(*b),
-                    SqlValue::Null => InsertScalar::Null,
-                    other => InsertScalar::Str(other.to_string()),
-                },
-                other => InsertScalar::Str(other.to_string()),
-            };
-            parsed_row.push(scalar);
-        }
-        rows.push(parsed_row);
-    }
-
-    let column_count = rows.first().map(|r| r.len()).unwrap_or(0);
+    let column_count = payload.rows.first().map(|r| r.len()).unwrap_or(0);
     if column_count == 0 {
         return Err("INSERT VALUES produced zero columns".to_string());
     }
-    if rows.iter().any(|r| r.len() != column_count) {
+    if payload.rows.iter().any(|r| r.len() != column_count) {
         return Err("INSERT VALUES row width mismatch".to_string());
     }
+    if payload.columns.len() != column_count {
+        return Err("INSERT payload columns width mismatch".to_string());
+    }
 
-    let columns = if insert.columns.is_empty() {
-        (1..=column_count).map(|i| format!("c{}", i)).collect()
-    } else {
-        insert.columns.iter().map(ToString::to_string).collect()
-    };
+    let rows = payload
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|scalar| match scalar {
+                    InsertScalarPayload::Int(v) => InsertScalar::Int(v),
+                    InsertScalarPayload::Bool(v) => InsertScalar::Bool(v),
+                    InsertScalarPayload::Str(v) => InsertScalar::Str(v),
+                    InsertScalarPayload::Null => InsertScalar::Null,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
 
     Ok(ParsedInsertPayload {
-        table_name: insert.table.to_string(),
-        columns,
+        table_name: payload.table_name,
+        columns: payload.columns,
         rows,
     })
 }
@@ -194,7 +165,223 @@ fn parse_insert_payload(sql: &str) -> Result<ParsedInsertPayload, String> {
 ///
 /// Details:
 /// - Type inference is per-column: int, bool, otherwise utf8.
-fn build_record_batch_from_insert(parsed: &ParsedInsertPayload) -> Result<RecordBatch, String> {
+fn parse_insert_column_type_hints(
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+) -> Result<HashMap<String, String>, String> {
+    let strict_contract = task
+        .params
+        .get("datatype_contract_version")
+        .map(|value| !value.trim().is_empty() && value.trim() != "0")
+        .unwrap_or(false);
+
+    let Some(raw) = task.params.get("column_type_hints_json") else {
+        if strict_contract {
+            return Err(
+                "INSERT_TYPE_HINTS_MALFORMED: missing column_type_hints_json for datatype contract"
+                    .to_string(),
+            );
+        }
+        return Ok(HashMap::new());
+    };
+
+    let hints = serde_json::from_str::<HashMap<String, String>>(raw)
+        .map(|value| {
+            value
+                .into_iter()
+                .map(|(k, v)| (normalize_identifier(&k), v))
+                .filter(|(k, _)| !k.is_empty())
+                .collect::<HashMap<_, _>>()
+        })
+        .map_err(|e| {
+            format!(
+                "INSERT_TYPE_HINTS_MALFORMED: invalid column_type_hints_json: {}",
+                e
+            )
+        })?;
+
+    if strict_contract && hints.is_empty() {
+        return Err(
+            "INSERT_TYPE_HINTS_MALFORMED: column_type_hints_json cannot be empty when datatype contract is enabled"
+                .to_string(),
+        );
+    }
+
+    Ok(hints)
+}
+
+fn strip_sql_literal_quotes(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0] as char;
+        let last = bytes[trimmed.len() - 1] as char;
+        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn parse_timestamp_millis_literal(raw: &str) -> Option<i64> {
+    let unquoted = strip_sql_literal_quotes(raw);
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&unquoted) {
+        return Some(parsed.timestamp_millis());
+    }
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&unquoted, "%Y-%m-%d %H:%M:%S") {
+        return Some(parsed.and_utc().timestamp_millis());
+    }
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&unquoted, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(parsed.and_utc().timestamp_millis());
+    }
+    None
+}
+
+fn parse_datetime_literal(raw: &str) -> Result<chrono::NaiveDateTime, String> {
+    let unquoted = strip_sql_literal_quotes(raw);
+    let lower = unquoted.to_ascii_lowercase();
+    if lower.ends_with('z')
+        || lower.contains('+')
+        || (lower.matches('-').count() > 2 && lower.contains('t'))
+    {
+        return Err(
+            "DATETIME_TIMEZONE_NOT_ALLOWED: DATETIME literals must not include timezone offsets"
+                .to_string(),
+        );
+    }
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&unquoted, "%Y-%m-%d %H:%M:%S") {
+        return Ok(parsed);
+    }
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(&unquoted, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(parsed);
+    }
+    Err(format!(
+        "TEMPORAL_LITERAL_INVALID: invalid DATETIME literal '{}'",
+        unquoted
+    ))
+}
+
+fn format_datetime_literal(value: chrono::NaiveDateTime) -> String {
+    value.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+fn parse_decimal_precision_scale(declared: &str) -> Option<(u16, u16)> {
+    let lower = declared.to_ascii_lowercase();
+    let start = lower.find('(')?;
+    let end = lower.rfind(')')?;
+    if end <= start + 1 {
+        return None;
+    }
+
+    let inner = &lower[start + 1..end];
+    let parts = inner
+        .split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let precision = parts[0].parse::<u16>().ok()?;
+    let scale = parts[1].parse::<u16>().ok()?;
+    Some((precision, scale))
+}
+
+fn normalize_decimal_literal(
+    raw: &str,
+    precision_scale: Option<(u16, u16)>,
+) -> Result<String, String> {
+    let mut value = strip_sql_literal_quotes(raw);
+    if value.is_empty() {
+        return Err("DECIMAL_COERCION_FAILED: empty decimal literal".to_string());
+    }
+
+    if value.contains('e') || value.contains('E') {
+        return Err(format!(
+            "DECIMAL_COERCION_FAILED: scientific notation is not supported for decimal literal '{}'",
+            value
+        ));
+    }
+
+    let sign = if value.starts_with('-') {
+        value = value.trim_start_matches('-').to_string();
+        "-"
+    } else if value.starts_with('+') {
+        value = value.trim_start_matches('+').to_string();
+        ""
+    } else {
+        ""
+    };
+
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() > 2 || parts.is_empty() {
+        return Err(format!(
+            "DECIMAL_COERCION_FAILED: invalid decimal literal '{}'",
+            value
+        ));
+    }
+
+    let integer_part = parts[0];
+    let fraction_part = if parts.len() == 2 { parts[1] } else { "" };
+    if integer_part.is_empty() && fraction_part.is_empty() {
+        return Err("DECIMAL_COERCION_FAILED: invalid decimal literal".to_string());
+    }
+    if !integer_part.chars().all(|ch| ch.is_ascii_digit())
+        || !fraction_part.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(format!(
+            "DECIMAL_COERCION_FAILED: invalid decimal literal '{}'",
+            value
+        ));
+    }
+
+    let mut normalized_integer = integer_part.trim_start_matches('0').to_string();
+    if normalized_integer.is_empty() {
+        normalized_integer = "0".to_string();
+    }
+
+    let mut normalized_fraction = fraction_part.to_string();
+    if let Some((precision, scale)) = precision_scale {
+        if normalized_fraction.len() > usize::from(scale) {
+            return Err(format!(
+                "DECIMAL_COERCION_FAILED: literal '{}' exceeds scale {}",
+                value, scale
+            ));
+        }
+        while normalized_fraction.len() < usize::from(scale) {
+            normalized_fraction.push('0');
+        }
+
+        let digits_total = normalized_integer
+            .chars()
+            .filter(|ch| ch.is_ascii_digit())
+            .count()
+            + normalized_fraction
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .count();
+        if digits_total > usize::from(precision) {
+            return Err(format!(
+                "DECIMAL_COERCION_FAILED: literal '{}' exceeds precision {}",
+                value, precision
+            ));
+        }
+    }
+
+    if normalized_fraction.is_empty() {
+        Ok(format!("{}{}", sign, normalized_integer))
+    } else {
+        Ok(format!(
+            "{}{}.{}",
+            sign, normalized_integer, normalized_fraction
+        ))
+    }
+}
+
+fn build_record_batch_from_insert(
+    parsed: &ParsedInsertPayload,
+    column_type_hints: &HashMap<String, String>,
+) -> Result<RecordBatch, String> {
     let row_count = parsed.rows.len();
     let col_count = parsed.columns.len();
     if row_count == 0 || col_count == 0 {
@@ -203,10 +390,138 @@ fn build_record_batch_from_insert(parsed: &ParsedInsertPayload) -> Result<Record
 
     let mut fields = Vec::with_capacity(col_count);
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count);
+    let strict_hints = !column_type_hints.is_empty();
 
     for col_idx in 0..col_count {
         let mut only_int = true;
         let mut only_bool = true;
+        let normalized_column = normalize_identifier(&parsed.columns[col_idx]);
+        let hinted_type = column_type_hints
+            .get(&normalized_column)
+            .map(|v| v.to_ascii_lowercase());
+
+        if strict_hints && hinted_type.is_none() {
+            return Err(format!(
+                "INSERT_TYPE_HINTS_MALFORMED: missing type hint for column '{}' while datatype contract is enabled",
+                parsed.columns[col_idx]
+            ));
+        }
+
+        if let Some(hint) = hinted_type.as_deref() {
+            if hint.contains("timestamp") {
+                let mut values: Vec<Option<i64>> = Vec::with_capacity(row_count);
+                for (row_idx, row) in parsed.rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        InsertScalar::Null => values.push(None),
+                        InsertScalar::Int(v) => values.push(Some(*v)),
+                        InsertScalar::Str(v) => {
+                            if let Some(ts_ms) = parse_timestamp_millis_literal(v) {
+                                values.push(Some(ts_ms));
+                            } else {
+                                return Err(format!(
+                                    "TEMPORAL_LITERAL_INVALID: invalid TIMESTAMP literal '{}' for column '{}' at row {}",
+                                    strip_sql_literal_quotes(v),
+                                    parsed.columns[col_idx],
+                                    row_idx + 1
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "TEMPORAL_LITERAL_INVALID: unsupported TIMESTAMP value '{:?}' for column '{}' at row {}",
+                                other,
+                                parsed.columns[col_idx],
+                                row_idx + 1
+                            ));
+                        }
+                    }
+                }
+                fields.push(Field::new(
+                    &parsed.columns[col_idx],
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                ));
+                arrays.push(Arc::new(TimestampMillisecondArray::from(values)) as ArrayRef);
+                continue;
+            }
+
+            if hint.contains("datetime") {
+                let mut values: Vec<Option<String>> = Vec::with_capacity(row_count);
+                for (row_idx, row) in parsed.rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        InsertScalar::Null => values.push(None),
+                        InsertScalar::Str(v) => {
+                            let parsed_dt = parse_datetime_literal(v)?;
+                            values.push(Some(format_datetime_literal(parsed_dt)));
+                        }
+                        InsertScalar::Int(v) => {
+                            let parsed_dt = chrono::DateTime::from_timestamp_millis(*v)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "TEMPORAL_LITERAL_INVALID: invalid DATETIME epoch '{}' for column '{}' at row {}",
+                                        v,
+                                        parsed.columns[col_idx],
+                                        row_idx + 1
+                                    )
+                                })?
+                                .naive_utc();
+                            values.push(Some(format_datetime_literal(parsed_dt)));
+                        }
+                        other => {
+                            return Err(format!(
+                                "TEMPORAL_LITERAL_INVALID: unsupported DATETIME value '{:?}' for column '{}' at row {}",
+                                other,
+                                parsed.columns[col_idx],
+                                row_idx + 1
+                            ));
+                        }
+                    }
+                }
+                let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+                fields.push(Field::new(&parsed.columns[col_idx], DataType::Utf8, true));
+                arrays.push(Arc::new(StringArray::from(refs)) as ArrayRef);
+                continue;
+            }
+
+            if hint.contains("decimal") || hint.contains("numeric") {
+                let precision_scale = parse_decimal_precision_scale(hint);
+                let mut values: Vec<Option<String>> = Vec::with_capacity(row_count);
+                for (row_idx, row) in parsed.rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        InsertScalar::Null => values.push(None),
+                        InsertScalar::Int(v) => {
+                            let normalized =
+                                normalize_decimal_literal(&v.to_string(), precision_scale)?;
+                            values.push(Some(normalized));
+                        }
+                        InsertScalar::Str(v) => {
+                            let normalized = normalize_decimal_literal(v, precision_scale)
+                                .map_err(|e| {
+                                    format!(
+                                        "{} for column '{}' at row {}",
+                                        e,
+                                        parsed.columns[col_idx],
+                                        row_idx + 1
+                                    )
+                                })?;
+                            values.push(Some(normalized));
+                        }
+                        other => {
+                            return Err(format!(
+                                "DECIMAL_COERCION_FAILED: unsupported decimal value '{:?}' for column '{}' at row {}",
+                                other,
+                                parsed.columns[col_idx],
+                                row_idx + 1
+                            ));
+                        }
+                    }
+                }
+                let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
+                fields.push(Field::new(&parsed.columns[col_idx], DataType::Utf8, true));
+                arrays.push(Arc::new(StringArray::from(refs)) as ArrayRef);
+                continue;
+            }
+        }
 
         for row in &parsed.rows {
             match &row[col_idx] {
@@ -438,10 +753,6 @@ pub async fn handle_execute_task(
         .as_ref()
         .map(|t| t.operation.to_lowercase())
         .unwrap_or_default();
-    let task_input = first_task
-        .as_ref()
-        .map(|t| t.input.clone())
-        .unwrap_or_default();
     let task_id = first_task
         .as_ref()
         .map(|t| t.task_id.clone())
@@ -460,7 +771,9 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_database::execute_create_database_task(&shared, task).await {
+        match crate::transactions::ddl::create_database::execute_create_database_task(&shared, task)
+            .await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -493,7 +806,9 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_schema::execute_create_schema_task(&shared, task).await {
+        match crate::transactions::ddl::create_schema::execute_create_schema_task(&shared, task)
+            .await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -526,7 +841,8 @@ pub async fn handle_execute_task(
             }
         };
 
-        match crate::services::create_table::execute_create_table_task(&shared, task).await {
+        match crate::transactions::ddl::create_table::execute_create_table_task(&shared, task).await
+        {
             Ok(location) => {
                 shared
                     .set_task_result_location(&session_id, &task.task_id, &location)
@@ -593,11 +909,61 @@ pub async fn handle_execute_task(
                 }
             })
     });
-    let parsed_insert = if operation == "insert" && !task_input.trim().is_empty() {
-        parse_insert_payload(&task_input).ok()
+    let parsed_insert = if operation == "insert" {
+        match first_task.as_ref() {
+            Some(task) => match parse_insert_payload(task) {
+                Ok(parsed) => Some(parsed),
+                Err(message) => {
+                    return crate::services::worker_service_server::worker_service::TaskResponse {
+                        status: "error".to_string(),
+                        error: message,
+                        result_location: String::new(),
+                    };
+                }
+            },
+            None => None,
+        }
     } else {
         None
     };
+    let insert_column_type_hints = if operation == "insert" {
+        match first_task.as_ref() {
+            Some(task) => match parse_insert_column_type_hints(task) {
+                Ok(hints) => hints,
+                Err(message) => {
+                    return crate::services::worker_service_server::worker_service::TaskResponse {
+                        status: "error".to_string(),
+                        error: message,
+                        result_location: String::new(),
+                    };
+                }
+            },
+            None => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+    if operation == "insert"
+        && let (Some(task), Some(parsed)) = (first_task.as_ref(), parsed_insert.as_ref())
+    {
+        let required_columns =
+            crate::transactions::constraints::insert_not_null::parse_required_not_null_columns(
+                task,
+            );
+        if let Err(message) =
+            crate::transactions::constraints::insert_not_null::enforce_not_null_columns(
+                task,
+                parsed,
+                &required_columns,
+            )
+        {
+            return crate::services::worker_service_server::worker_service::TaskResponse {
+                status: "error".to_string(),
+                error: message,
+                result_location: String::new(),
+            };
+        }
+    }
     let table_name_override = first_task
         .as_ref()
         .and_then(|task| task.params.get("table_name").cloned())
@@ -618,19 +984,25 @@ pub async fn handle_execute_task(
 
     let stage_id = first_task
         .as_ref()
-        .and_then(|task| task.params.get("stage_id").cloned())
-        .filter(|s| !s.trim().is_empty());
+        .and_then(|task| (task.stage_id > 0).then(|| task.stage_id.to_string()));
     let partition_count = first_task
         .as_ref()
-        .and_then(|task| task.params.get("partition_count"))
-        .and_then(|value| value.parse::<u32>().ok());
+        .and_then(|task| (task.partition_count > 0).then_some(task.partition_count));
     let upstream_stage_ids = first_task
         .as_ref()
-        .and_then(|task| task.params.get("upstream_stage_ids").cloned())
+        .map(|task| {
+            serde_json::to_string(&task.upstream_stage_ids).unwrap_or_else(|_| "[]".to_string())
+        })
         .unwrap_or_else(|| "[]".to_string());
     let partition_spec = first_task
         .as_ref()
-        .and_then(|task| task.params.get("partition_spec").cloned())
+        .map(|task| {
+            if task.partition_spec.trim().is_empty() {
+                "\"Single\"".to_string()
+            } else {
+                task.partition_spec.clone()
+            }
+        })
         .unwrap_or_else(|| "\"Single\"".to_string());
 
     shared
@@ -650,7 +1022,7 @@ pub async fn handle_execute_task(
         if let Some(table_uri) = delta_table_uri {
             let batch_res = if operation == "insert" {
                 if let Some(parsed) = parsed_insert.as_ref() {
-                    build_record_batch_from_insert(parsed)
+                    build_record_batch_from_insert(parsed, &insert_column_type_hints)
                 } else {
                     Err("failed to parse INSERT payload".to_string())
                 }
@@ -764,3 +1136,7 @@ pub async fn handle_execute_task(
         result_location,
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/transactions_maestro_insert_tests.rs"]
+mod insert_tests;

@@ -9,11 +9,13 @@
 pub enum PlannerError {
     EmptyProjection,
     EmptyRelation,
+    InvalidLogicalPlan(String),
     EmptyPhysicalPlan,
     InvalidPhysicalPipeline(String),
     InvalidDistributedPlan(String),
     UnsupportedPhysicalOperator(String),
     UnsupportedPredicate(String),
+    TypeCoercionViolation(String),
 }
 
 impl std::fmt::Display for PlannerError {
@@ -21,6 +23,9 @@ impl std::fmt::Display for PlannerError {
         match self {
             PlannerError::EmptyProjection => write!(f, "logical plan projection cannot be empty"),
             PlannerError::EmptyRelation => write!(f, "logical plan relation cannot be empty"),
+            PlannerError::InvalidLogicalPlan(message) => {
+                write!(f, "invalid logical plan: {}", message)
+            }
             PlannerError::EmptyPhysicalPlan => {
                 write!(f, "physical plan operator list cannot be empty")
             }
@@ -39,6 +44,9 @@ impl std::fmt::Display for PlannerError {
             }
             PlannerError::UnsupportedPredicate(message) => {
                 write!(f, "predicate is not supported in this phase: {}", message)
+            }
+            PlannerError::TypeCoercionViolation(message) => {
+                write!(f, "type coercion violation: {}", message)
             }
         }
     }

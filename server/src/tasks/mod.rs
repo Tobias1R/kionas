@@ -1,4 +1,8 @@
 use chrono::{DateTime, Utc};
+use kionas::planner::{
+    PhysicalExpr, PhysicalOperator, PhysicalPlan, PredicateComparisonOp, PredicateExpr,
+    PredicateValue,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, RwLock};
@@ -15,6 +19,21 @@ pub enum TaskState {
 }
 
 #[derive(Debug, Clone)]
+pub struct StageTaskMetadata {
+    pub stage_id: u32,
+    pub partition_id: u32,
+    pub partition_count: u32,
+    pub upstream_stage_ids: Vec<u32>,
+    pub upstream_partition_counts: HashMap<u32, u32>,
+    pub partition_spec: String,
+    pub query_run_id: Option<String>,
+    pub execution_mode_hint: i32,
+    pub output_destinations:
+        Vec<crate::services::worker_service_client::worker_service::OutputDestination>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Task {
     pub id: String,
     pub query_id: String,
@@ -22,6 +41,7 @@ pub struct Task {
     pub operation: String,
     pub payload: String,
     pub params: HashMap<String, String>,
+    pub stage_metadata: Option<StageTaskMetadata>,
     pub state: TaskState,
     pub attempts: u32,
     pub max_retries: u32,
@@ -47,6 +67,7 @@ impl Task {
             operation,
             payload,
             params,
+            stage_metadata: None,
             state: TaskState::Pending,
             attempts: 0,
             max_retries: 3,
@@ -113,6 +134,7 @@ impl TaskManager {
     }
 
     /// Wait for task to reach a terminal state or timeout.
+    #[allow(dead_code)]
     pub async fn wait_for_completion(&self, id: &str, timeout_secs: u64) -> Option<Task> {
         use tokio::time::{Duration, timeout};
         let start = Utc::now();
@@ -206,6 +228,7 @@ impl TaskManager {
     }
 
     /// Update task fields based on worker update and notify waiters.
+    #[allow(dead_code)]
     pub async fn update_from_worker(
         &self,
         id: &str,
@@ -285,16 +308,16 @@ impl TaskManager {
                 }
 
                 let effective_count = partition_count.or(existing_partition_count);
-                if let Some(total) = effective_count {
-                    if new_completed > total {
-                        log::warn!(
-                            "Ignoring invalid partition progress for task {}: completed={} exceeds total={}",
-                            id,
-                            new_completed,
-                            total
-                        );
-                        return false;
-                    }
+                if let Some(total) = effective_count
+                    && new_completed > total
+                {
+                    log::warn!(
+                        "Ignoring invalid partition progress for task {}: completed={} exceeds total={}",
+                        id,
+                        new_completed,
+                        total
+                    );
+                    return false;
                 }
             }
 
@@ -331,13 +354,13 @@ impl TaskManager {
             applied = true;
         }
 
-        if applied {
-            if let Some(n) = {
+        if applied
+            && let Some(n) = {
                 let nmap = self.notifiers.read().await;
                 nmap.get(id).cloned()
-            } {
-                n.notify_waiters();
             }
+        {
+            n.notify_waiters();
         }
 
         applied
@@ -345,117 +368,10 @@ impl TaskManager {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{TaskManager, TaskState};
-    use std::collections::HashMap;
+#[path = "../tests/tasks_mod_tests.rs"]
+mod tests;
 
-    #[tokio::test]
-    async fn ignores_non_monotonic_partition_progress() {
-        let tm = TaskManager::new();
-        let task_id = tm
-            .create_task(
-                "q1".to_string(),
-                "s1".to_string(),
-                "query".to_string(),
-                "payload".to_string(),
-                HashMap::new(),
-            )
-            .await;
-
-        let applied = tm
-            .update_from_worker_with_stage_progress(
-                &task_id,
-                TaskState::Running,
-                None,
-                None,
-                Some("1".to_string()),
-                Some(3),
-                Some(2),
-                HashMap::new(),
-            )
-            .await;
-        assert!(applied);
-
-        let ignored = tm
-            .update_from_worker_with_stage_progress(
-                &task_id,
-                TaskState::Running,
-                None,
-                None,
-                Some("1".to_string()),
-                Some(3),
-                Some(1),
-                HashMap::new(),
-            )
-            .await;
-        assert!(!ignored);
-
-        let task = tm
-            .get_task(&task_id)
-            .await
-            .expect("task must exist")
-            .lock()
-            .await
-            .clone();
-        assert_eq!(
-            task.params.get("partition_completed"),
-            Some(&"2".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn ignores_updates_after_terminal_state() {
-        let tm = TaskManager::new();
-        let task_id = tm
-            .create_task(
-                "q2".to_string(),
-                "s2".to_string(),
-                "query".to_string(),
-                "payload".to_string(),
-                HashMap::new(),
-            )
-            .await;
-
-        let first = tm
-            .update_from_worker_with_stage_progress(
-                &task_id,
-                TaskState::Succeeded,
-                Some("loc1".to_string()),
-                None,
-                None,
-                None,
-                None,
-                HashMap::new(),
-            )
-            .await;
-        assert!(first);
-
-        let second = tm
-            .update_from_worker_with_stage_progress(
-                &task_id,
-                TaskState::Failed,
-                Some("loc2".to_string()),
-                Some("late failure".to_string()),
-                None,
-                None,
-                None,
-                HashMap::new(),
-            )
-            .await;
-        assert!(!second);
-
-        let task = tm
-            .get_task(&task_id)
-            .await
-            .expect("task must exist")
-            .lock()
-            .await
-            .clone();
-        assert_eq!(task.state, TaskState::Succeeded);
-        assert_eq!(task.result_location, Some("loc1".to_string()));
-    }
-}
-
+#[allow(dead_code)]
 pub fn sample_task_request_from_task(
     _task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
@@ -466,19 +382,261 @@ pub fn sample_task_request_from_task(
     }
 }
 
+/// What: Extract the first structured filter predicate from task payload operators.
+///
+/// Inputs:
+/// - `task`: Server-side task containing canonical payload JSON.
+///
+/// Output:
+/// - Structured predicate when a filter operator contains `PhysicalExpr::Predicate`.
+///
+/// Details:
+/// - Supports stage payload shapes (`[operators]`, `{operators:[...]}`) and canonical query payload (`{physical_plan:{...}}`).
+fn extract_structured_predicate_from_payload(task: &Task) -> Option<PredicateExpr> {
+    fn first_filter_predicate(operators: &[PhysicalOperator]) -> Option<PredicateExpr> {
+        operators.iter().find_map(|op| {
+            if let PhysicalOperator::Filter {
+                predicate: PhysicalExpr::Predicate { predicate },
+            } = op
+            {
+                return Some(predicate.clone());
+            }
+            None
+        })
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(&task.payload).ok()?;
+
+    if payload.is_array() {
+        let operators: Vec<PhysicalOperator> = serde_json::from_value(payload).ok()?;
+        return first_filter_predicate(&operators);
+    }
+
+    if let Some(operators_value) = payload.get("operators") {
+        let operators: Vec<PhysicalOperator> =
+            serde_json::from_value(operators_value.clone()).ok()?;
+        if let Some(predicate) = first_filter_predicate(&operators) {
+            return Some(predicate);
+        }
+    }
+
+    let plan_value = payload.get("physical_plan")?.clone();
+    let plan: PhysicalPlan = serde_json::from_value(plan_value).ok()?;
+    first_filter_predicate(&plan.operators)
+}
+
+/// What: Convert planner literal value into protobuf filter value representation.
+///
+/// Inputs:
+/// - `value`: Planner literal value.
+///
+/// Output:
+/// - Protobuf scalar value and type tag for transmission.
+fn predicate_value_to_proto_scalar(
+    value: &PredicateValue,
+) -> Option<(
+    crate::services::worker_service_client::worker_service::FilterValue,
+    crate::services::worker_service_client::worker_service::FilterValueType,
+)> {
+    use crate::services::worker_service_client::worker_service as ws;
+
+    match value {
+        PredicateValue::Int(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::IntValue(*v)),
+            },
+            ws::FilterValueType::Int,
+        )),
+        PredicateValue::Bool(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::BoolValue(*v)),
+            },
+            ws::FilterValueType::Bool,
+        )),
+        PredicateValue::Str(v) => Some((
+            ws::FilterValue {
+                variant: Some(ws::filter_value::Variant::StringValue(v.clone())),
+            },
+            ws::FilterValueType::String,
+        )),
+        PredicateValue::IntList(_) | PredicateValue::BoolList(_) | PredicateValue::StrList(_) => {
+            None
+        }
+    }
+}
+
+/// What: Convert planner predicate expression into protobuf task transport representation.
+///
+/// Inputs:
+/// - `predicate`: Structured planner predicate.
+///
+/// Output:
+/// - Serializable protobuf filter predicate.
+fn predicate_expr_to_proto(
+    predicate: &PredicateExpr,
+) -> Option<crate::services::worker_service_client::worker_service::FilterPredicate> {
+    use crate::services::worker_service_client::worker_service as ws;
+
+    let variant = match predicate {
+        PredicateExpr::Conjunction { clauses } => {
+            let clauses = clauses
+                .iter()
+                .map(predicate_expr_to_proto)
+                .collect::<Option<Vec<_>>>()?;
+            ws::filter_predicate::Variant::Conjunction(ws::PredicateConjunction { clauses })
+        }
+        PredicateExpr::Comparison { column, op, value } => {
+            let (proto_value, value_type) = predicate_value_to_proto_scalar(value)?;
+            let operator = match op {
+                PredicateComparisonOp::Eq => ws::ComparisonOperator::Equal,
+                PredicateComparisonOp::Ne => ws::ComparisonOperator::NotEqual,
+                PredicateComparisonOp::Gt => ws::ComparisonOperator::GreaterThan,
+                PredicateComparisonOp::Ge => ws::ComparisonOperator::GreaterEqual,
+                PredicateComparisonOp::Lt => ws::ComparisonOperator::LessThan,
+                PredicateComparisonOp::Le => ws::ComparisonOperator::LessEqual,
+            };
+            ws::filter_predicate::Variant::Comparison(ws::PredicateComparison {
+                column_name: column.clone(),
+                operator: operator as i32,
+                value: Some(proto_value),
+                value_type: value_type as i32,
+            })
+        }
+        PredicateExpr::Between {
+            column,
+            lower,
+            upper,
+            negated,
+        } => {
+            let (lower_value, lower_type) = predicate_value_to_proto_scalar(lower)?;
+            let (upper_value, upper_type) = predicate_value_to_proto_scalar(upper)?;
+            if lower_type != upper_type {
+                return None;
+            }
+            ws::filter_predicate::Variant::Between(ws::PredicateBetween {
+                column_name: column.clone(),
+                lower: Some(lower_value),
+                upper: Some(upper_value),
+                value_type: lower_type as i32,
+                is_negated: *negated,
+            })
+        }
+        PredicateExpr::InList { column, values } => {
+            let (proto_values, value_type) = match values {
+                PredicateValue::IntList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::IntValue(*value)),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::Int,
+                ),
+                PredicateValue::BoolList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::BoolValue(*value)),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::Bool,
+                ),
+                PredicateValue::StrList(values) => (
+                    values
+                        .iter()
+                        .map(|value| ws::FilterValue {
+                            variant: Some(ws::filter_value::Variant::StringValue(value.clone())),
+                        })
+                        .collect::<Vec<_>>(),
+                    ws::FilterValueType::String,
+                ),
+                PredicateValue::Int(_) | PredicateValue::Bool(_) | PredicateValue::Str(_) => {
+                    return None;
+                }
+            };
+
+            ws::filter_predicate::Variant::InList(ws::PredicateIn {
+                column_name: column.clone(),
+                values: proto_values,
+                value_type: value_type as i32,
+            })
+        }
+        PredicateExpr::IsNull { column } => {
+            ws::filter_predicate::Variant::IsNull(ws::PredicateIsNull {
+                column_name: column.clone(),
+            })
+        }
+        PredicateExpr::IsNotNull { column } => {
+            ws::filter_predicate::Variant::IsNotNull(ws::PredicateIsNotNull {
+                column_name: column.clone(),
+            })
+        }
+    };
+
+    Some(ws::FilterPredicate {
+        variant: Some(variant),
+    })
+}
+
 pub fn task_to_request(
     task: &Task,
 ) -> crate::services::worker_service_client::worker_service::TaskRequest {
-    crate::services::worker_service_client::worker_service::TaskRequest {
+    use crate::services::worker_service_client::worker_service::{
+        self as ws, StagePartitionExecution,
+    };
+
+    let filter_predicate = extract_structured_predicate_from_payload(task)
+        .and_then(|predicate| predicate_expr_to_proto(&predicate));
+    let stage_metadata = task.stage_metadata.as_ref();
+    let stage_id = stage_metadata.map_or(0, |value| value.stage_id);
+    let partition_id = stage_metadata.map_or(0, |value| value.partition_id);
+    let execution_mode_hint = stage_metadata.map_or(0, |value| value.execution_mode_hint);
+    let output_destinations = stage_metadata
+        .map(|value| value.output_destinations.clone())
+        .unwrap_or_default();
+    let partition_count = stage_metadata.map_or(1, |value| value.partition_count);
+    let upstream_stage_ids = stage_metadata
+        .map(|value| value.upstream_stage_ids.clone())
+        .unwrap_or_default();
+    let upstream_partition_counts = stage_metadata
+        .map(|value| value.upstream_partition_counts.clone())
+        .unwrap_or_default();
+    let partition_spec = stage_metadata
+        .map(|value| value.partition_spec.clone())
+        .unwrap_or_else(|| "\"Single\"".to_string());
+    let query_run_id = task
+        .stage_metadata
+        .as_ref()
+        .and_then(|value| value.query_run_id.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if task.query_id.trim().is_empty() {
+                format!("legacy-task-{}", task.id)
+            } else {
+                task.query_id.clone()
+            }
+        });
+
+    ws::TaskRequest {
         session_id: task.session_id.clone(),
-        tasks: vec![
-            crate::services::worker_service_client::worker_service::Task {
-                task_id: task.id.clone(),
-                input: task.payload.clone(),
-                operation: task.operation.clone(),
-                output: String::new(),
-                params: task.params.clone(),
-            },
-        ],
+        tasks: vec![StagePartitionExecution {
+            task_id: task.id.clone(),
+            input: task.payload.clone(),
+            operation: task.operation.clone(),
+            output: String::new(),
+            params: task.params.clone(),
+            filter_predicate,
+            query_id: task.query_id.clone(),
+            stage_id,
+            partition_id,
+            execution_plan: task.payload.as_bytes().to_vec(),
+            output_destinations,
+            execution_mode_hint,
+            partition_count,
+            upstream_stage_ids,
+            upstream_partition_counts,
+            partition_spec,
+            query_run_id,
+        }],
     }
 }

@@ -1,5 +1,10 @@
+use crate::planner::aggregate_spec::PhysicalAggregateSpec;
+use crate::planner::join_spec::PhysicalJoinSpec;
 use crate::planner::logical_plan::{LogicalExpr, LogicalRelation};
+use crate::planner::predicate_expr::PredicateExpr;
+use crate::sql::datatypes::ColumnDatatypeSpec;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// What: Phase 2 physical expression model carried by physical operators.
 ///
@@ -12,6 +17,35 @@ use serde::{Deserialize, Serialize};
 pub enum PhysicalExpr {
     ColumnRef { name: String },
     Raw { sql: String },
+    Predicate { predicate: PredicateExpr },
+}
+
+/// What: One physical ORDER BY expression.
+///
+/// Inputs:
+/// - `expression`: Sort key expression.
+/// - `ascending`: `true` for ASC, `false` for DESC.
+///
+/// Output:
+/// - Serializable sort directive consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalSortExpr {
+    pub expression: PhysicalExpr,
+    pub ascending: bool,
+}
+
+/// What: Physical LIMIT/OFFSET directive.
+///
+/// Inputs:
+/// - `count`: Maximum number of rows to return after offset.
+/// - `offset`: Number of rows to skip before returning rows.
+///
+/// Output:
+/// - Serializable limit directive consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalLimitSpec {
+    pub count: u64,
+    pub offset: u64,
 }
 
 /// What: Supported and cataloged physical operators for query execution planning.
@@ -32,12 +66,12 @@ pub enum PhysicalOperator {
     Projection { expressions: Vec<PhysicalExpr> },
     Materialize,
 
-    HashJoin { on: Vec<String> },
+    HashJoin { spec: PhysicalJoinSpec },
     NestedLoopJoin,
-    AggregatePartial,
-    AggregateFinal,
-    Sort,
-    Limit,
+    AggregatePartial { spec: PhysicalAggregateSpec },
+    AggregateFinal { spec: PhysicalAggregateSpec },
+    Sort { keys: Vec<PhysicalSortExpr> },
+    Limit { spec: PhysicalLimitSpec },
     ExchangeShuffle { keys: Vec<String> },
     ExchangeBroadcast,
     Repartition,
@@ -61,10 +95,10 @@ impl PhysicalOperator {
             PhysicalOperator::Materialize => "Materialize",
             PhysicalOperator::HashJoin { .. } => "HashJoin",
             PhysicalOperator::NestedLoopJoin => "NestedLoopJoin",
-            PhysicalOperator::AggregatePartial => "AggregatePartial",
-            PhysicalOperator::AggregateFinal => "AggregateFinal",
-            PhysicalOperator::Sort => "Sort",
-            PhysicalOperator::Limit => "Limit",
+            PhysicalOperator::AggregatePartial { .. } => "AggregatePartial",
+            PhysicalOperator::AggregateFinal { .. } => "AggregateFinal",
+            PhysicalOperator::Sort { .. } => "Sort",
+            PhysicalOperator::Limit { .. } => "Limit",
             PhysicalOperator::ExchangeShuffle { .. } => "ExchangeShuffle",
             PhysicalOperator::ExchangeBroadcast => "ExchangeBroadcast",
             PhysicalOperator::Repartition => "Repartition",
@@ -79,13 +113,21 @@ impl PhysicalOperator {
 /// Inputs:
 /// - `operators`: Ordered operator pipeline.
 /// - `sql`: Canonical SQL string used for explain and diagnostics.
+/// - `schema_metadata`: Optional table column type contract for type coercion enforcement (Phase 9b+).
 ///
 /// Output:
 /// - Deterministic physical plan representation for query payload emission.
+///
+/// Details:
+/// - schema_metadata is optional for backward compatibility with existing queries.
+/// - When present, populated with ColumnDatatypeSpec entries mapping column names to type info.
+/// - Used by Filter validator and worker runtime for strict type coercion policies.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PhysicalPlan {
     pub operators: Vec<PhysicalOperator>,
     pub sql: String,
+    #[serde(default)]
+    pub schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
 }
 
 impl From<&LogicalExpr> for PhysicalExpr {

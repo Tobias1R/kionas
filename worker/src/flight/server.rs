@@ -1,6 +1,13 @@
-use crate::state::SharedData;
+#![allow(dead_code)]
+
+use crate::execution::artifacts::persist_query_artifacts;
+use crate::flight::client_pool::FlightClientPool;
+use crate::state::{SharedData, WorkerInformation};
 use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -8,12 +15,17 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, Location, PutResult, SchemaResult, Ticket,
 };
 use bytes::Bytes;
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tonic14::metadata::MetadataValue;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
 
@@ -82,8 +94,10 @@ fn dispatch_context_from_flight_metadata(
     let query_id = metadata
         .get("query_id")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Status::permission_denied("missing query_id metadata"))?
+        .to_string();
 
     Ok(crate::authz::DispatchAuthContext {
         session_id,
@@ -97,12 +111,529 @@ fn dispatch_context_from_flight_metadata(
 #[derive(Clone)]
 pub(crate) struct WorkerFlightService {
     shared_data: SharedData,
+    /// Pooled Flight client connections to downstream workers
+    client_pool: Arc<FlightClientPool>,
 }
 
 impl WorkerFlightService {
+    /// What: Create new worker Flight service with client pool.
+    ///
+    /// Inputs:
+    /// - `shared_data`: Worker shared state.
+    ///
+    /// Output:
+    /// - Initialized service with lazy-load client pool.
     pub(crate) fn new(shared_data: SharedData) -> Self {
-        Self { shared_data }
+        Self {
+            shared_data,
+            // Initialize pool: max 8 connections per endpoint, 5s connection timeout
+            client_pool: Arc::new(FlightClientPool::new(8, Duration::from_secs(5))),
+        }
     }
+
+    /// What: Get a Flight client channel to a downstream worker.
+    ///
+    /// Inputs:
+    /// - `endpoint_uri`: Destination worker Flight endpoint.
+    ///
+    /// Output:
+    /// - Pooled gRPC channel or error if connection fails.
+    ///
+    /// Details:
+    /// - Reuses channels per endpoint to reduce TLS overhead
+    /// - Returns error if endpoint is unreachable (upstream death scenario)
+    pub(crate) async fn get_downstream_channel(
+        &self,
+        endpoint_uri: &str,
+    ) -> Result<tonic14::transport::Channel, Status> {
+        self.client_pool
+            .get_channel(endpoint_uri)
+            .await
+            .map_err(|e| {
+                let code = match e {
+                    crate::flight::client_pool::FlightClientPoolError::ConnectionTimeout => {
+                        tonic14::Code::DeadlineExceeded
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::PoolExhausted => {
+                        tonic14::Code::ResourceExhausted
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::InvalidEndpoint => {
+                        tonic14::Code::InvalidArgument
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::TlsError(_) => {
+                        tonic14::Code::Unauthenticated
+                    }
+                    crate::flight::client_pool::FlightClientPoolError::ChannelError(_) => {
+                        tonic14::Code::Unavailable
+                    }
+                };
+                Status::new(code, e.to_string())
+            })
+    }
+}
+
+/// What: Normalize one destination address into a valid Flight endpoint URI.
+///
+/// Inputs:
+/// - `raw`: Worker address from stage output destination.
+///
+/// Output:
+/// - HTTP endpoint URI accepted by tonic Flight clients.
+fn normalize_destination_endpoint(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("output destination worker address is empty".to_string());
+    }
+
+    let candidate = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    let parsed = Url::parse(&candidate)
+        .map_err(|e| format!("invalid output destination worker address '{}': {}", raw, e))?;
+    let host = parsed.host_str().ok_or_else(|| {
+        format!(
+            "invalid output destination worker address '{}': host and port are required",
+            raw
+        )
+    })?;
+    let parsed_port = parsed.port().ok_or_else(|| {
+        format!(
+            "invalid output destination worker address '{}': host and port are required",
+            raw
+        )
+    })?;
+
+    let interops_port = resolve_worker_interops_port();
+    let endpoint_port = if u32::from(parsed_port) == interops_port {
+        resolve_worker_flight_port(interops_port)
+    } else {
+        u32::from(parsed_port)
+    };
+
+    Ok(format!("{}://{}:{}", parsed.scheme(), host, endpoint_port))
+}
+
+fn stage_destination_task_id(
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    destination: &crate::services::worker_service_server::worker_service::OutputDestination,
+    worker_address: &str,
+    worker_index: usize,
+) -> String {
+    let sanitized = worker_address
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let query_run = if task.query_run_id.trim().is_empty() {
+        format!("legacy-task-{}", task.task_id)
+    } else {
+        task.query_run_id.clone()
+    };
+
+    format!(
+        "stage-{}-part-{}-to-stage-{}-dest-{}-{}-{}",
+        task.stage_id,
+        task.partition_id,
+        destination.downstream_stage_id,
+        worker_index,
+        query_run,
+        sanitized
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownstreamRoutingLimits {
+    queue_capacity: usize,
+    enqueue_timeout: Duration,
+    request_timeout: Duration,
+    startup_delay: Duration,
+}
+
+fn read_env_usize_with_min(var: &str, default: usize, min: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn read_env_u64_with_min(var: &str, default: u64, min: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn downstream_routing_limits() -> DownstreamRoutingLimits {
+    DownstreamRoutingLimits {
+        queue_capacity: read_env_usize_with_min("WORKER_FLIGHT_ROUTER_QUEUE_CAPACITY", 16, 1),
+        enqueue_timeout: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_ENQUEUE_TIMEOUT_MS",
+            500,
+            1,
+        )),
+        request_timeout: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_REQUEST_TIMEOUT_MS",
+            10_000,
+            1,
+        )),
+        startup_delay: Duration::from_millis(read_env_u64_with_min(
+            "WORKER_FLIGHT_ROUTER_CONSUMER_START_DELAY_MS",
+            0,
+            0,
+        )),
+    }
+}
+
+fn flight_payload_wire_size_bytes(payload: &FlightData) -> usize {
+    payload
+        .data_header
+        .len()
+        .saturating_add(payload.data_body.len())
+        .saturating_add(payload.app_metadata.len())
+        .saturating_add(
+            payload
+                .flight_descriptor
+                .as_ref()
+                .map(|descriptor| {
+                    descriptor
+                        .path
+                        .iter()
+                        .map(std::string::String::len)
+                        .sum::<usize>()
+                        .saturating_add(descriptor.cmd.len())
+                })
+                .unwrap_or(0),
+        )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownstreamDispatchMetrics {
+    queued_frames: usize,
+    queued_bytes: usize,
+    enqueue_wait_ms: u128,
+    stream_time_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DownstreamNetworkSummary {
+    pub endpoint_count: usize,
+    pub queued_frames: usize,
+    pub queued_bytes: usize,
+    pub stream_time_ms: u128,
+}
+
+fn log_downstream_dispatch_metrics(
+    endpoint: &str,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    metrics: DownstreamDispatchMetrics,
+) {
+    log::info!(
+        "event=flight.downstream_dispatch_metrics query_run_id={} stage_id={} partition_id={} endpoint={} queued_frames={} queued_bytes={} enqueue_wait_ms={} stream_time_ms={}",
+        task.query_run_id,
+        task.stage_id,
+        task.partition_id,
+        endpoint,
+        metrics.queued_frames,
+        metrics.queued_bytes,
+        metrics.enqueue_wait_ms,
+        metrics.stream_time_ms
+    );
+}
+
+fn insert_dispatch_metadata_for_downstream(
+    request: &mut Request<impl Sized>,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+) -> Result<(), String> {
+    let auth_scope = task
+        .params
+        .get("__auth_scope")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query authorization scope metadata is missing".to_string())?;
+    let rbac_user = task
+        .params
+        .get("__rbac_user")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query rbac_user metadata is missing".to_string())?;
+    let rbac_role = task
+        .params
+        .get("__rbac_role")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "query rbac_role metadata is missing".to_string())?;
+    let query_id = task
+        .params
+        .get("__query_id")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+
+    let metadata = request.metadata_mut();
+    metadata.insert(
+        "session_id",
+        MetadataValue::try_from(session_id)
+            .map_err(|e| format!("invalid session_id metadata: {}", e))?,
+    );
+    metadata.insert(
+        "rbac_user",
+        MetadataValue::try_from(rbac_user)
+            .map_err(|e| format!("invalid rbac_user metadata: {}", e))?,
+    );
+    metadata.insert(
+        "rbac_role",
+        MetadataValue::try_from(rbac_role)
+            .map_err(|e| format!("invalid rbac_role metadata: {}", e))?,
+    );
+    metadata.insert(
+        "auth_scope",
+        MetadataValue::try_from(auth_scope)
+            .map_err(|e| format!("invalid auth_scope metadata: {}", e))?,
+    );
+    metadata.insert(
+        "query_id",
+        MetadataValue::try_from(query_id)
+            .map_err(|e| format!("invalid query_id metadata: {}", e))?,
+    );
+
+    Ok(())
+}
+
+/// What: Stream stage partition output batches to downstream worker destinations via Flight.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state used for Flight client configuration.
+/// - `task`: Stage task carrying output destination routing contract.
+/// - `session_id`: Session identifier for auth and descriptor scope.
+/// - `batches`: Normalized stage output batches to stream.
+/// - `routed_batches_by_destination`: Optional per-destination batch payloads indexed by output destination order.
+///
+/// Output:
+/// - `Ok(())` when all destination do_put streams are acknowledged.
+/// - `Err(message)` when any destination connection or stream fails.
+pub(crate) async fn stream_stage_partition_to_output_destinations(
+    shared_data: &SharedData,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+    batches: &[RecordBatch],
+    routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
+) -> Result<DownstreamNetworkSummary, String> {
+    stream_stage_partition_to_output_destinations_with_limits(
+        shared_data,
+        task,
+        session_id,
+        batches,
+        routed_batches_by_destination,
+        downstream_routing_limits(),
+    )
+    .await
+}
+
+async fn stream_stage_partition_to_output_destinations_with_limits(
+    shared_data: &SharedData,
+    task: &crate::services::worker_service_server::worker_service::StagePartitionExecution,
+    session_id: &str,
+    batches: &[RecordBatch],
+    routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
+    limits: DownstreamRoutingLimits,
+) -> Result<DownstreamNetworkSummary, String> {
+    if task.output_destinations.is_empty() {
+        return Ok(DownstreamNetworkSummary::default());
+    }
+
+    if batches.is_empty() {
+        return Err("cannot stream empty stage output batches to downstream workers".to_string());
+    }
+
+    let service = WorkerFlightService::new(shared_data.clone());
+    let mut network_summary = DownstreamNetworkSummary::default();
+
+    if let Some(routed_batches) = routed_batches_by_destination
+        && routed_batches.len() != task.output_destinations.len()
+    {
+        return Err(format!(
+            "routed destination batch count mismatch: expected {}, found {}",
+            task.output_destinations.len(),
+            routed_batches.len()
+        ));
+    }
+
+    for (destination_index, destination) in task.output_destinations.iter().enumerate() {
+        if destination.worker_addresses.is_empty() {
+            return Err(format!(
+                "output destination for downstream_stage_id={} has no worker addresses",
+                destination.downstream_stage_id
+            ));
+        }
+
+        let destination_batches = match routed_batches_by_destination
+            .and_then(|routed| routed.get(destination_index))
+            .filter(|routed| !routed.is_empty())
+        {
+            Some(routed) => routed.as_slice(),
+            None => batches,
+        };
+
+        let base_payloads = batches_to_flight_data(
+            destination_batches[0].schema().as_ref(),
+            destination_batches.to_vec(),
+        )
+        .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
+
+        for (worker_index, worker_address) in destination.worker_addresses.iter().enumerate() {
+            let endpoint = normalize_destination_endpoint(worker_address)?;
+            let downstream_task_id =
+                stage_destination_task_id(task, destination, worker_address, worker_index);
+
+            let mut payloads = base_payloads.clone();
+            if let Some(first) = payloads.first_mut() {
+                first.flight_descriptor = Some(FlightDescriptor::new_path(vec![
+                    session_id.to_string(),
+                    downstream_task_id,
+                ]));
+            }
+
+            let (tx, rx) = mpsc::channel::<FlightData>(limits.queue_capacity);
+            let task_clone = task.clone();
+            let endpoint_clone = endpoint.clone();
+            let session_id_owned = session_id.to_string();
+            let service_clone = service.clone();
+
+            let stream_started_at = Instant::now();
+            let consumer = tokio::spawn(async move {
+                if limits.startup_delay > Duration::from_millis(0) {
+                    tokio::time::sleep(limits.startup_delay).await;
+                }
+
+                let channel = service_clone
+                    .get_downstream_channel(&endpoint_clone)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "failed to connect downstream Flight endpoint {}: {}",
+                            endpoint_clone, e
+                        )
+                    })?;
+
+                let request_stream = stream::unfold(rx, |mut receiver| async {
+                    receiver.recv().await.map(|payload| (payload, receiver))
+                });
+                let mut request = Request::new(request_stream);
+                insert_dispatch_metadata_for_downstream(
+                    &mut request,
+                    &task_clone,
+                    &session_id_owned,
+                )?;
+
+                let mut client = FlightServiceClient::new(channel);
+                let mut response =
+                    tokio::time::timeout(limits.request_timeout, client.do_put(request))
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "downstream endpoint {} request timed out after {:?}",
+                                endpoint_clone, limits.request_timeout
+                            )
+                        })?
+                        .map_err(|e| {
+                            format!(
+                                "failed to stream stage output to downstream endpoint {}: {}",
+                                endpoint_clone, e
+                            )
+                        })?
+                        .into_inner();
+
+                while response
+                    .message()
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "downstream endpoint {} failed while acknowledging stage stream: {}",
+                            endpoint_clone, e
+                        )
+                    })?
+                    .is_some()
+                {}
+
+                Ok::<u128, String>(stream_started_at.elapsed().as_millis())
+            });
+
+            let mut queued_frames = 0usize;
+            let mut queued_bytes = 0usize;
+            let mut enqueue_wait_ms = 0u128;
+
+            let mut dispatch_error = None::<String>;
+            for payload in payloads {
+                let payload_size = flight_payload_wire_size_bytes(&payload);
+                let send_started = Instant::now();
+                let send_result =
+                    tokio::time::timeout(limits.enqueue_timeout, tx.send(payload)).await;
+                enqueue_wait_ms =
+                    enqueue_wait_ms.saturating_add(send_started.elapsed().as_millis());
+
+                match send_result {
+                    Ok(Ok(())) => {
+                        queued_frames = queued_frames.saturating_add(1);
+                        queued_bytes = queued_bytes.saturating_add(payload_size);
+                    }
+                    Ok(Err(_)) => {
+                        dispatch_error = Some(format!(
+                            "downstream endpoint {} closed queue while receiving stage output",
+                            endpoint
+                        ));
+                        break;
+                    }
+                    Err(_) => {
+                        dispatch_error = Some(format!(
+                            "downstream endpoint {} is too slow; bounded queue capacity={} timed out after {:?}",
+                            endpoint, limits.queue_capacity, limits.enqueue_timeout
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            drop(tx);
+
+            if let Some(error) = dispatch_error {
+                consumer.abort();
+                return Err(error);
+            }
+
+            let stream_time_ms = consumer.await.map_err(|e| {
+                format!(
+                    "downstream endpoint {} dispatch task panicked: {}",
+                    endpoint, e
+                )
+            })??;
+
+            log_downstream_dispatch_metrics(
+                &endpoint,
+                task,
+                DownstreamDispatchMetrics {
+                    queued_frames,
+                    queued_bytes,
+                    enqueue_wait_ms,
+                    stream_time_ms,
+                },
+            );
+            network_summary.endpoint_count = network_summary.endpoint_count.saturating_add(1);
+            network_summary.queued_frames =
+                network_summary.queued_frames.saturating_add(queued_frames);
+            network_summary.queued_bytes =
+                network_summary.queued_bytes.saturating_add(queued_bytes);
+            network_summary.stream_time_ms = network_summary
+                .stream_time_ms
+                .saturating_add(stream_time_ms);
+        }
+    }
+
+    Ok(network_summary)
 }
 
 /// What: Decode and verify the signed internal Flight ticket.
@@ -144,6 +675,21 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
         .unwrap_or(default_worker_port.saturating_add(1))
 }
 
+/// What: Resolve worker interops port from environment with stable default.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Worker interops port used for endpoint normalization.
+fn resolve_worker_interops_port() -> u32 {
+    std::env::var("WORKER_INTEROPS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(50051)
+}
+
 /// What: Build worker Flight endpoint URI advertised in FlightInfo.
 ///
 /// Inputs:
@@ -155,6 +701,295 @@ fn resolve_worker_flight_port(default_worker_port: u32) -> u32 {
 fn resolve_flight_endpoint(host: &str, default_worker_port: u32) -> String {
     let flight_port = resolve_worker_flight_port(default_worker_port);
     format!("http://{}:{}", host, flight_port)
+}
+
+/// What: Backpressure limits applied to one ingest request.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Limit bundle used by ingest stream validation.
+///
+/// Details:
+/// - Caps decoded batches and rows so a single client stream cannot exhaust worker memory.
+#[derive(Debug, Clone, Copy)]
+struct IngestBackpressureLimits {
+    max_batches: usize,
+    max_rows: usize,
+    max_wire_bytes: usize,
+}
+
+/// What: Resolve ingest backpressure limits for worker Flight streams.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Static limits used by `do_put` and `do_exchange` ingest validation.
+///
+/// Details:
+/// - Limits are intentionally conservative for now and can be made configurable later.
+fn ingest_backpressure_limits() -> IngestBackpressureLimits {
+    IngestBackpressureLimits {
+        max_batches: 128,
+        max_rows: 1_000_000,
+        max_wire_bytes: 32 * 1024 * 1024,
+    }
+}
+
+/// What: Estimate one FlightData frame wire footprint in bytes.
+///
+/// Inputs:
+/// - `frame`: Flight frame to size.
+///
+/// Output:
+/// - Approximate on-wire byte size used for request guardrails.
+///
+/// Details:
+/// - Includes descriptor cmd/path strings and body/header/app metadata payloads.
+fn flight_data_wire_size_bytes(frame: &FlightData) -> usize {
+    let mut total = 0usize;
+    total = total.saturating_add(frame.data_header.len());
+    total = total.saturating_add(frame.data_body.len());
+    total = total.saturating_add(frame.app_metadata.len());
+
+    if let Some(descriptor) = frame.flight_descriptor.as_ref() {
+        total = total.saturating_add(descriptor.cmd.len());
+        for segment in &descriptor.path {
+            total = total.saturating_add(segment.len());
+        }
+    }
+
+    total
+}
+
+/// What: Build a deterministic result location for Flight do_put ingestion.
+///
+/// Inputs:
+/// - `worker_info`: Worker metadata used for URI composition.
+/// - `session_id`: Ingest session identifier.
+/// - `task_id`: Ingest task identifier.
+///
+/// Output:
+/// - Result location URI compatible with task-scoped staging prefixes.
+fn build_ingest_result_location(
+    worker_info: &WorkerInformation,
+    session_id: &str,
+    task_id: &str,
+) -> String {
+    format!(
+        "flight://{}:{}/query/flight/{}/{}/{}",
+        worker_info.host, worker_info.port, session_id, task_id, worker_info.worker_id
+    )
+}
+
+/// What: Resolve existing task result location or create one for Flight ingestion.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state.
+/// - `session_id`: Session identifier.
+/// - `task_id`: Task identifier.
+///
+/// Output:
+/// - Existing or newly provisioned result location URI.
+async fn resolve_or_create_ingest_result_location(
+    shared_data: &SharedData,
+    session_id: &str,
+    task_id: &str,
+) -> String {
+    if let Some(existing) = shared_data
+        .get_task_result_location(session_id, task_id)
+        .await
+    {
+        return existing;
+    }
+
+    let created = build_ingest_result_location(&shared_data.worker_info, session_id, task_id);
+    shared_data
+        .set_task_result_location(session_id, task_id, &created)
+        .await;
+    created
+}
+
+/// What: Validate, decode, and persist one Flight ingest stream.
+///
+/// Inputs:
+/// - `shared_data`: Worker shared state with optional storage provider.
+/// - `request`: Streaming FlightData request.
+/// - `stream_name`: Stream label used for user-facing error messages.
+///
+/// Output:
+/// - `Ok(())` when at least one IPC record batch is decoded and persisted.
+/// - `Err(Status)` for auth, scope, decode, or persistence failures.
+async fn ingest_flight_stream(
+    shared_data: &SharedData,
+    request: Request<Streaming<FlightData>>,
+    stream_name: &str,
+) -> Result<(), Status> {
+    let ingest_started_at = Instant::now();
+    let decode_started_at = Instant::now();
+    let stream_name_owned = stream_name.to_string();
+    let authz = crate::authz::WorkerAuthorizer::new();
+    let metadata = request.metadata().clone();
+    let mut input = request.into_inner();
+
+    let first_message = input
+        .message()
+        .await
+        .map_err(|e| {
+            Status::internal(format!(
+                "failed to read {} stream: {}",
+                stream_name_owned, e
+            ))
+        })?
+        .ok_or_else(|| {
+            Status::invalid_argument(format!("{} stream is empty", stream_name_owned))
+        })?;
+
+    let descriptor = first_message.flight_descriptor.as_ref().ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "first {} FlightData must include flight descriptor",
+            stream_name_owned
+        ))
+    })?;
+    let (session_id, task_id) = parse_descriptor_scope(descriptor)?;
+    let dispatch_ctx = dispatch_context_from_flight_metadata(&metadata, &session_id)?;
+    authz
+        .validate_dispatch_context(&dispatch_ctx)
+        .await
+        .map_err(map_tonic_status)?;
+
+    if dispatch_ctx.session_id != session_id {
+        return Err(Status::permission_denied(
+            "flight descriptor session_id does not match auth context",
+        ));
+    }
+
+    let limits = ingest_backpressure_limits();
+    let initial_wire_bytes = flight_data_wire_size_bytes(&first_message);
+    if initial_wire_bytes > limits.max_wire_bytes {
+        return Err(Status::resource_exhausted(format!(
+            "{} stream exceeded wire byte limit: max_wire_bytes={}",
+            stream_name_owned, limits.max_wire_bytes
+        )));
+    }
+
+    let accumulated_wire_bytes =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(initial_wire_bytes));
+    let accumulated_wire_bytes_for_remaining = std::sync::Arc::clone(&accumulated_wire_bytes);
+
+    let stream_name_for_remaining = stream_name_owned.clone();
+    let remaining = stream::try_unfold((input, initial_wire_bytes), move |state| {
+        let (mut stream_input, accumulated_wire_bytes) = state;
+        let stream_name_for_remaining = stream_name_for_remaining.clone();
+        let accumulated_wire_bytes_for_remaining =
+            std::sync::Arc::clone(&accumulated_wire_bytes_for_remaining);
+        async move {
+            match stream_input.message().await {
+                Ok(Some(data)) => {
+                    let next_wire_bytes =
+                        accumulated_wire_bytes.saturating_add(flight_data_wire_size_bytes(&data));
+                    if next_wire_bytes > limits.max_wire_bytes {
+                        return Err(Status::resource_exhausted(format!(
+                            "{} stream exceeded wire byte limit: max_wire_bytes={}",
+                            stream_name_for_remaining, limits.max_wire_bytes
+                        )));
+                    }
+                    accumulated_wire_bytes_for_remaining
+                        .store(next_wire_bytes, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Some((data, (stream_input, next_wire_bytes))))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(Status::internal(format!(
+                    "failed to read {} stream: {}",
+                    stream_name_for_remaining, e
+                ))),
+            }
+        }
+    });
+
+    let flight_data_stream = stream::once(async move { Ok::<FlightData, Status>(first_message) })
+        .chain(remaining)
+        .map_err(Into::into);
+
+    let mut decoder = FlightRecordBatchStream::new_from_flight_data(flight_data_stream);
+    let mut decoded_batches = Vec::<RecordBatch>::new();
+    let mut decoded_rows = 0usize;
+
+    while let Some(batch) = decoder.next().await {
+        let batch = batch.map_err(|e| {
+            Status::invalid_argument(format!(
+                "failed to decode {} FlightData stream: {}",
+                stream_name_owned, e
+            ))
+        })?;
+
+        if decoded_batches.len() >= limits.max_batches {
+            return Err(Status::resource_exhausted(format!(
+                "{} stream exceeded batch limit: max_batches={}",
+                stream_name_owned, limits.max_batches
+            )));
+        }
+
+        decoded_rows = decoded_rows.saturating_add(batch.num_rows());
+        if decoded_rows > limits.max_rows {
+            return Err(Status::resource_exhausted(format!(
+                "{} stream exceeded row limit: max_rows={}",
+                stream_name_owned, limits.max_rows
+            )));
+        }
+
+        decoded_batches.push(batch);
+    }
+
+    let decode_ms = decode_started_at.elapsed().as_millis();
+
+    if decoded_batches.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{} stream must include at least one IPC record batch",
+            stream_name_owned
+        )));
+    }
+
+    let result_location =
+        resolve_or_create_ingest_result_location(shared_data, &session_id, &task_id).await;
+
+    let persist_started_at = Instant::now();
+
+    persist_query_artifacts(
+        shared_data,
+        &result_location,
+        &session_id,
+        &task_id,
+        &decoded_batches,
+    )
+    .await
+    .map_err(|e| {
+        if e.contains("storage provider is not configured") {
+            Status::failed_precondition(e)
+        } else {
+            Status::internal(e)
+        }
+    })?;
+
+    let persist_ms = persist_started_at.elapsed().as_millis();
+    let total_ms = ingest_started_at.elapsed().as_millis();
+    let ingested_wire_bytes = accumulated_wire_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "event=flight.ingest_metrics stream={} session_id={} task_id={} wire_bytes={} decoded_batches={} decoded_rows={} decode_ms={} persist_ms={} total_ms={}",
+        stream_name_owned,
+        session_id,
+        task_id,
+        ingested_wire_bytes,
+        decoded_batches.len(),
+        decoded_rows,
+        decode_ms,
+        persist_ms,
+        total_ms
+    );
+
+    Ok(())
 }
 
 /// What: Parse session and task identifiers from a Flight descriptor.
@@ -507,6 +1342,117 @@ fn validate_metadata_alignment(
     Ok(())
 }
 
+/// What: Parse Arrow data type from metadata-encoded debug string.
+///
+/// Inputs:
+/// - `raw`: Data type string from metadata JSON.
+///
+/// Output:
+/// - Arrow data type supported by current query result metadata contract.
+fn parse_metadata_data_type(raw: &str) -> Result<DataType, Status> {
+    match raw.trim() {
+        "Int16" => Ok(DataType::Int16),
+        "Int32" => Ok(DataType::Int32),
+        "Int64" => Ok(DataType::Int64),
+        "Boolean" => Ok(DataType::Boolean),
+        "Utf8" => Ok(DataType::Utf8),
+        "Date32" => Ok(DataType::Date32),
+        "Date64" => Ok(DataType::Date64),
+        "Null" => Ok(DataType::Null),
+        other => parse_timestamp_metadata_data_type(other).ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "unsupported metadata column data_type '{}'",
+                other
+            ))
+        }),
+    }
+}
+
+fn parse_timestamp_metadata_data_type(raw: &str) -> Option<DataType> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix("Timestamp(")?
+        .strip_suffix(')')?
+        .trim();
+    let (unit_raw, timezone_raw) = inner.split_once(',')?;
+
+    let unit = match unit_raw.trim() {
+        "Second" => TimeUnit::Second,
+        "Millisecond" => TimeUnit::Millisecond,
+        "Microsecond" => TimeUnit::Microsecond,
+        "Nanosecond" => TimeUnit::Nanosecond,
+        _ => return None,
+    };
+
+    let timezone = parse_timestamp_timezone(timezone_raw.trim());
+    Some(DataType::Timestamp(unit, timezone))
+}
+
+fn parse_timestamp_timezone(raw: &str) -> Option<Arc<str>> {
+    if raw == "None" {
+        return None;
+    }
+
+    let value = raw
+        .strip_prefix("Some(\"")
+        .and_then(|v| v.strip_suffix("\")"))?;
+    Some(value.to_string().into())
+}
+
+/// What: Build Arrow schema from result metadata columns.
+///
+/// Inputs:
+/// - `metadata`: Parsed query result metadata JSON.
+///
+/// Output:
+/// - Arrow schema reconstructed from metadata column entries.
+fn schema_from_metadata(metadata: &serde_json::Value) -> Result<Schema, Status> {
+    let columns = metadata
+        .get("columns")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Status::failed_precondition("result metadata missing columns"))?;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    for (idx, column) in columns.iter().enumerate() {
+        let name = column
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing name",
+                    idx
+                ))
+            })?;
+
+        let data_type_raw = column
+            .get("data_type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing data_type",
+                    idx
+                ))
+            })?;
+        let data_type = parse_metadata_data_type(data_type_raw)?;
+
+        let nullable = column
+            .get("nullable")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "result metadata column at index {} missing nullable",
+                    idx
+                ))
+            })?;
+
+        fields.push(Field::new(name, data_type, nullable));
+    }
+
+    Ok(Schema::new(fields))
+}
+
 /// What: Load all staged parquet batches for a worker task result location.
 ///
 /// Inputs:
@@ -587,9 +1533,18 @@ async fn load_result_batches(
     }
 
     if all_batches.is_empty() {
-        return Err(Status::not_found(
-            "result parquet files contain no record batches",
-        ));
+        let expected_row_count = metadata
+            .get("row_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Status::failed_precondition("result metadata missing row_count"))?;
+        if expected_row_count == 0 {
+            let schema = schema_from_metadata(&metadata)?;
+            all_batches.push(RecordBatch::new_empty(std::sync::Arc::new(schema)));
+        } else {
+            return Err(Status::not_found(
+                "result parquet files contain no record batches",
+            ));
+        }
     }
 
     validate_metadata_alignment(
@@ -755,6 +1710,7 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let do_get_started_at = Instant::now();
         let authz = crate::authz::WorkerAuthorizer::new();
         let metadata = request.metadata().clone();
         let ticket = request.into_inner();
@@ -807,7 +1763,7 @@ impl FlightService for WorkerFlightService {
             .first()
             .map(|b| b.schema())
             .ok_or_else(|| Status::not_found("no record batches available for DoGet"))?;
-        let schema_owned = Schema::from(schema.as_ref().clone());
+        let schema_owned = schema.as_ref().clone();
 
         let payloads = batches_to_flight_data(&schema_owned, batches)
             .map_err(|e| Status::internal(format!("failed to encode FlightData: {}", e)))?
@@ -815,26 +1771,49 @@ impl FlightService for WorkerFlightService {
             .map(Ok)
             .collect::<Vec<Result<FlightData, Status>>>();
 
+        let payload_count = payloads.len();
+        let payload_bytes = payloads.iter().fold(0usize, |acc, payload| {
+            acc.saturating_add(
+                payload
+                    .as_ref()
+                    .map(flight_data_wire_size_bytes)
+                    .unwrap_or(0),
+            )
+        });
+        let total_ms = do_get_started_at.elapsed().as_millis();
+        log::info!(
+            "event=flight.do_get_metrics session_id={} task_id={} payload_count={} payload_bytes={} total_ms={}",
+            claims.sid,
+            claims.tid,
+            payload_count,
+            payload_bytes,
+            total_ms
+        );
+
         let output = stream::iter(payloads);
         Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented(
-            "worker Flight do_put is not implemented yet",
-        ))
+        ingest_flight_stream(&self.shared_data, request, "do_put").await?;
+
+        let output = stream::iter(vec![Ok(PutResult {
+            app_metadata: bytes::Bytes::new(),
+        })]);
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented(
-            "worker Flight do_exchange is not implemented yet",
-        ))
+        ingest_flight_stream(&self.shared_data, request, "do_exchange").await?;
+
+        let output = stream::empty::<Result<FlightData, Status>>();
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn do_action(
@@ -870,175 +1849,5 @@ pub(crate) async fn serve_flight(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        checksum_fnv64_hex, expected_artifacts_from_metadata, to_staging_prefix,
-        validate_metadata_alignment,
-    };
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
-
-    fn sample_batches() -> Vec<RecordBatch> {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef],
-        )
-        .expect("batch must build");
-        vec![batch]
-    }
-
-    fn sample_two_column_batches() -> Vec<RecordBatch> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
-            ],
-        )
-        .expect("batch must build");
-        vec![batch]
-    }
-
-    #[test]
-    fn builds_task_scoped_staging_prefix() {
-        let prefix = to_staging_prefix(
-            "flight://worker:32001/query/db1/s1/t1/worker1?session_id=s1&task_id=t1",
-            "s1",
-            "t1",
-        )
-        .expect("prefix must build");
-
-        assert_eq!(prefix, "query/db1/s1/t1/worker1/staging/s1/t1/");
-    }
-
-    #[test]
-    fn rejects_empty_result_path() {
-        let err = to_staging_prefix("flight://worker:32001", "s1", "t1")
-            .expect_err("empty path must be rejected");
-        assert_eq!(err.code(), tonic14::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn validates_metadata_alignment_success() {
-        let batches = sample_batches();
-        let metadata = serde_json::json!({
-            "row_count": 2,
-            "source_batch_count": 1,
-            "parquet_file_count": 1,
-            "columns": [{"name": "id", "data_type": "Int64", "nullable": false}],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        validate_metadata_alignment(&metadata, &batches, 1, 1).expect("metadata should align");
-    }
-
-    #[test]
-    fn rejects_metadata_alignment_mismatch() {
-        let batches = sample_batches();
-        let metadata = serde_json::json!({
-            "row_count": 99,
-            "source_batch_count": 1,
-            "parquet_file_count": 1,
-            "columns": [{"name": "id", "data_type": "Int64", "nullable": false}],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
-            .expect_err("row_count mismatch must fail");
-        assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn rejects_metadata_file_count_mismatch() {
-        let batches = sample_batches();
-        let metadata = serde_json::json!({
-            "row_count": 2,
-            "source_batch_count": 1,
-            "parquet_file_count": 2,
-            "columns": [{"name": "id", "data_type": "Int64", "nullable": false}],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
-            .expect_err("file count mismatch must fail");
-        assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn parses_expected_artifacts_map() {
-        let metadata = serde_json::json!({
-            "artifacts": [
-                {"key": "k1", "size_bytes": 10, "checksum_fnv64": "aaaaaaaaaaaaaaaa"},
-                {"key": "k2", "size_bytes": 20, "checksum_fnv64": "bbbbbbbbbbbbbbbb"}
-            ]
-        });
-
-        let parsed = expected_artifacts_from_metadata(&metadata).expect("must parse artifacts");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed.get("k1").map(|v| v.size_bytes), Some(10));
-    }
-
-    #[test]
-    fn computes_stable_fnv64_checksum() {
-        let checksum = checksum_fnv64_hex(b"abc");
-        assert_eq!(checksum, "e71fa2190541574b");
-    }
-
-    #[test]
-    fn rejects_metadata_column_name_mismatch() {
-        let batches = sample_batches();
-        let metadata = serde_json::json!({
-            "row_count": 2,
-            "source_batch_count": 1,
-            "parquet_file_count": 1,
-            "columns": [{"name": "wrong_id", "data_type": "Int64", "nullable": false}],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
-            .expect_err("column name mismatch must fail");
-        assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn rejects_metadata_column_type_mismatch() {
-        let batches = sample_batches();
-        let metadata = serde_json::json!({
-            "row_count": 2,
-            "source_batch_count": 1,
-            "parquet_file_count": 1,
-            "columns": [{"name": "id", "data_type": "Utf8", "nullable": false}],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
-            .expect_err("column type mismatch must fail");
-        assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
-    }
-
-    #[test]
-    fn rejects_metadata_column_order_mismatch() {
-        let batches = sample_two_column_batches();
-        let metadata = serde_json::json!({
-            "row_count": 2,
-            "source_batch_count": 1,
-            "parquet_file_count": 1,
-            "columns": [
-                {"name": "name", "data_type": "Utf8", "nullable": false},
-                {"name": "id", "data_type": "Int64", "nullable": false}
-            ],
-            "artifacts": [{"key": "k1", "size_bytes": 16, "checksum_fnv64": "0011223344556677"}],
-        });
-
-        let err = validate_metadata_alignment(&metadata, &batches, 1, 1)
-            .expect_err("column order mismatch must fail");
-        assert_eq!(err.code(), tonic14::Code::FailedPrecondition);
-    }
-}
+#[path = "../tests/flight_server_tests.rs"]
+mod tests;

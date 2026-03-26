@@ -9,10 +9,6 @@ pub fn init_logging(
     output: &str,
     _format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Extract logging settings
-    let level = level;
-    let output = output;
-
     // Map level string to LevelFilter
     let log_level = match level.to_string().as_str() {
         "trace" => LevelFilter::Trace,

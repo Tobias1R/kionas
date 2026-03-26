@@ -1,30 +1,15 @@
-pub(crate) mod create_database;
-pub(crate) mod create_schema;
-pub(crate) mod create_table;
-pub(crate) mod distributed_dag;
-pub(crate) mod helpers;
-pub(crate) mod query_select;
-pub(crate) mod rbac;
-pub mod use_warehouse;
+pub(crate) mod ddl;
+pub(crate) mod dml;
+pub(crate) mod query;
+pub(crate) mod shared;
+pub(crate) mod utility;
 
+use crate::parser::datafusion_sql::sqlparser::ast::Statement;
 use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
-use kionas::parser::datafusion_sql::sqlparser::ast::Statement;
-use std::collections::HashMap;
-
-fn canonicalize_insert_table_name(raw_table_name: &str, default_schema: &str) -> String {
-    let cleaned = raw_table_name.trim().trim_matches('"').trim_matches('`');
-    if cleaned.is_empty() {
-        return cleaned.to_string();
-    }
-    if cleaned.contains('.') {
-        cleaned.to_string()
-    } else {
-        format!("deltalake.{}.{}", default_schema, cleaned)
-    }
-}
 
 /// Discover worker address tied to session
+#[allow(dead_code)]
 pub async fn get_worker_addr_for_session(
     shared_data: &SharedData,
     session_id: &str,
@@ -46,7 +31,7 @@ pub async fn get_worker_addr_for_session(
     // Try by digested warehouse uuid first
     let worker_uuid = session.get_warehouse_uuid();
     let warehouses_map = state.warehouses.lock().await;
-    log::info!(
+    log::debug!(
         "Resolving worker for session {} -> warehouse='{}' uuid={}",
         session_id,
         session.get_warehouse(),
@@ -54,7 +39,7 @@ pub async fn get_worker_addr_for_session(
     );
     // Dump registered warehouses for diagnostics
     for (k, w) in warehouses_map.iter() {
-        log::info!(
+        log::debug!(
             "Registered warehouse key={} name={} host={} port={}",
             k,
             w.get_name(),
@@ -65,7 +50,7 @@ pub async fn get_worker_addr_for_session(
     // Dump worker pools keys
     let worker_pools_map = state.worker_pools.lock().await;
     for (k, _) in worker_pools_map.iter() {
-        log::info!("Worker pool key={}", k);
+        log::debug!("Worker pool key={}", k);
     }
     if let Some(warehouse) = warehouses_map.get(&worker_uuid) {
         let scheme = if warehouse.get_port() == 443 {
@@ -88,7 +73,7 @@ pub async fn get_worker_addr_for_session(
         let wname = w.get_name();
         let whost = w.get_host();
         if wname == plain || wname.ends_with(&plain) || wname.contains(&plain) || whost == plain {
-            log::info!(
+            log::debug!(
                 "Fuzzy matched warehouse '{}' to session warehouse '{}'",
                 wname,
                 plain
@@ -115,50 +100,16 @@ pub async fn handle_statement(
 ) -> String {
     match stmt {
         Statement::Insert(insert_stmt) => {
-            // Server phase for INSERT: accept statement and dispatch a worker task.
-            // We send the normalized SQL text as payload and keep operation explicit.
-            let payload = stmt.to_string();
-            let default_schema = {
-                let state = shared_data.lock().await;
-                match state
-                    .session_manager
-                    .get_session(session_id.to_string())
-                    .await
-                {
-                    Some(s) => s.get_use_database(),
-                    None => "default".to_string(),
-                }
-            };
-            let mut params = HashMap::new();
-            let table_name =
-                canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
-            params.insert("table_name".to_string(), table_name);
-
-            match helpers::run_task_for_input_with_params(
-                shared_data,
-                session_id,
-                "insert",
-                payload,
-                params,
-                None,
-                30,
-            )
-            .await
-            {
-                Ok(result_location) => {
-                    format!("Insert dispatched successfully: {}", result_location)
-                }
-                Err(e) => format!("Failed to dispatch insert: {}", e),
-            }
+            dml::insert::handle_insert_statement(shared_data, session_id, stmt, insert_stmt).await
         }
         Statement::Query(_) => {
-            let ast = match query_select::select_ast_from_statement(stmt) {
+            let ast = match query::select::select_ast_from_statement(stmt) {
                 Ok(parsed_ast) => parsed_ast,
                 Err(e) => {
                     return format!("RESULT|VALIDATION|INVALID_QUERY_STATEMENT|{}", e);
                 }
             };
-            query_select::handle_select_query(shared_data, session_id, ctx, ast).await
+            query::select::handle_select_query(shared_data, session_id, ctx, ast).await
         }
         Statement::CreateSchema {
             schema_name,
@@ -168,10 +119,10 @@ pub async fn handle_statement(
             default_collate_spec,
             clone,
         } => {
-            create_schema::handle_create_schema(
+            ddl::create_schema::handle_create_schema(
                 shared_data,
                 session_id,
-                create_schema::CreateSchemaAst {
+                ddl::create_schema::CreateSchemaAst {
                     schema_name,
                     if_not_exists: *if_not_exists,
                     with: with.as_ref(),
@@ -183,10 +134,10 @@ pub async fn handle_statement(
             .await
         }
         Statement::CreateTable(create_table) => {
-            create_table::handle_create_table(
+            ddl::create_table::handle_create_table(
                 shared_data,
                 session_id,
-                create_table::CreateTableAst { create_table },
+                ddl::create_table::CreateTableAst { create_table },
             )
             .await
         }
@@ -214,10 +165,10 @@ pub async fn handle_statement(
             with_contacts,
             ..
         } => {
-            create_database::handle_create_database(
+            ddl::create_database::handle_create_database(
                 shared_data,
                 session_id,
-                create_database::CreateDatabaseAst {
+                ddl::create_database::CreateDatabaseAst {
                     db_name,
                     if_not_exists: *if_not_exists,
                     location: location.as_ref(),
@@ -257,7 +208,8 @@ pub async fn maybe_handle_direct_command(
     session_id: &str,
     shared_data: &SharedData,
 ) -> Option<String> {
-    if let Some(msg) = rbac::maybe_handle_rbac_direct_command(query, session_id, shared_data).await
+    if let Some(msg) =
+        utility::rbac::maybe_handle_rbac_direct_command(query, session_id, shared_data).await
     {
         return Some(msg);
     }
@@ -265,7 +217,7 @@ pub async fn maybe_handle_direct_command(
     let q_trim = query.trim();
     let q_lower = q_trim.to_lowercase();
     if q_lower.starts_with("use warehouse") {
-        match use_warehouse::handle_use_warehouse(q_trim, session_id, shared_data).await {
+        match utility::use_warehouse::handle_use_warehouse(q_trim, session_id, shared_data).await {
             Ok(msg) => return Some(msg),
             Err(e) => return Some(format!("ERROR: {}", e)),
         }

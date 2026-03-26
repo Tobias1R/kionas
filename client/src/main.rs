@@ -47,6 +47,31 @@ struct ParsedHandle {
     task_id: String,
     worker_id: String,
     signed_ticket: Option<String>,
+    stage_latency: Vec<StageLatencyDisplay>,
+    total_network_write_ms: Option<u128>,
+    total_network_batches: Option<u128>,
+    total_network_bytes: Option<u128>,
+}
+
+/// What: Client-facing stage latency display model parsed from query handles.
+///
+/// Inputs:
+/// - `stage_id`: Distributed stage identifier.
+/// - `queue_ms`: Queue latency in milliseconds.
+/// - `exec_ms`: Execution latency in milliseconds.
+/// - `network_ms`: Network latency in milliseconds.
+///
+/// Output:
+/// - Display record used to print stage latency breakdown lines.
+#[derive(Debug, Clone)]
+struct StageLatencyDisplay {
+    stage_id: u32,
+    queue_ms: u128,
+    exec_ms: u128,
+    network_ms: u128,
+    network_write_ms: u128,
+    network_batches: u128,
+    network_bytes: u128,
 }
 
 /// What: Decode a query handle from structured response bytes.
@@ -107,6 +132,22 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
     let mut session_id = String::new();
     let mut task_id = String::new();
     let mut signed_ticket = None;
+    let mut queue_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut exec_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_write_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_batches_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut network_bytes_by_stage = std::collections::HashMap::<u32, u128>::new();
+    let mut total_network_write_ms = None;
+    let mut total_network_batches = None;
+    let mut total_network_bytes = None;
+
+    fn parse_stage_latency_key(key: &str, suffix: &str) -> Option<u32> {
+        let stage_part = key.strip_prefix("latency_stage_")?;
+        let stage_part = stage_part.strip_suffix(suffix)?;
+        stage_part.parse::<u32>().ok()
+    }
+
     for pair in query.split('&') {
         let (k, v) = pair
             .split_once('=')
@@ -117,6 +158,36 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
             task_id = v.to_string();
         } else if k == "ticket" {
             signed_ticket = Some(v.to_string());
+        } else if k == "latency_total_network_write_ms" {
+            total_network_write_ms = v.parse::<u128>().ok();
+        } else if k == "latency_total_network_batches" {
+            total_network_batches = v.parse::<u128>().ok();
+        } else if k == "latency_total_network_bytes" {
+            total_network_bytes = v.parse::<u128>().ok();
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_queue_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                queue_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_exec_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                exec_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_ms")
+            && let Ok(value) = v.parse::<u128>()
+        {
+            network_by_stage.insert(stage_id, value);
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_write_ms") {
+            if let Ok(value) = v.parse::<u128>() {
+                network_write_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_batches") {
+            if let Ok(value) = v.parse::<u128>() {
+                network_batches_by_stage.insert(stage_id, value);
+            }
+        } else if let Some(stage_id) = parse_stage_latency_key(k, "_network_bytes")
+            && let Ok(value) = v.parse::<u128>()
+        {
+            network_bytes_by_stage.insert(stage_id, value);
         }
     }
 
@@ -127,13 +198,83 @@ fn parse_structured_query_handle(handle: &str) -> Result<ParsedHandle, String> {
         return Err("query handle missing task_id".to_string());
     }
 
+    let mut stage_ids = queue_by_stage
+        .keys()
+        .chain(exec_by_stage.keys())
+        .chain(network_by_stage.keys())
+        .chain(network_write_by_stage.keys())
+        .chain(network_batches_by_stage.keys())
+        .chain(network_bytes_by_stage.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    stage_ids.sort_unstable();
+    stage_ids.dedup();
+
+    let stage_latency = stage_ids
+        .into_iter()
+        .map(|stage_id| StageLatencyDisplay {
+            stage_id,
+            queue_ms: queue_by_stage.get(&stage_id).copied().unwrap_or(0),
+            exec_ms: exec_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_ms: network_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_write_ms: network_write_by_stage.get(&stage_id).copied().unwrap_or(0),
+            network_batches: network_batches_by_stage
+                .get(&stage_id)
+                .copied()
+                .unwrap_or(0),
+            network_bytes: network_bytes_by_stage.get(&stage_id).copied().unwrap_or(0),
+        })
+        .collect::<Vec<_>>();
+
     Ok(ParsedHandle {
         endpoint: format!("http://{}", authority),
         session_id,
         task_id,
         worker_id,
         signed_ticket,
+        stage_latency,
+        total_network_write_ms,
+        total_network_batches,
+        total_network_bytes,
     })
+}
+
+fn print_stage_latency_breakdown(handle: &str) -> Result<(), String> {
+    let parsed = parse_structured_query_handle(handle)?;
+    if parsed.stage_latency.is_empty() {
+        return Ok(());
+    }
+
+    for stage in &parsed.stage_latency {
+        let total = stage
+            .queue_ms
+            .saturating_add(stage.exec_ms)
+            .saturating_add(stage.network_ms);
+        println!(
+            "Stage {}: {}ms (queue) + {}ms (exec) + {}ms (network) = {}ms total | write={}ms transfer={} batches / {} bytes",
+            stage.stage_id,
+            stage.queue_ms,
+            stage.exec_ms,
+            stage.network_ms,
+            total,
+            stage.network_write_ms,
+            stage.network_batches,
+            stage.network_bytes
+        );
+    }
+
+    if let (Some(write_ms), Some(batches), Some(bytes)) = (
+        parsed.total_network_write_ms,
+        parsed.total_network_batches,
+        parsed.total_network_bytes,
+    ) {
+        println!(
+            "Network transfer totals: write_ms={} batches={} bytes={}",
+            write_ms, batches, bytes
+        );
+    }
+
+    Ok(())
 }
 
 /// What: Build worker-internal ticket payload from handle components.
@@ -335,6 +476,19 @@ async fn run_retrieval_determinism_check(handle: &str) -> Result<(), String> {
 
 type WarehouseClient = warehouse_service::warehouse_service_client::WarehouseServiceClient<Channel>;
 
+/// What: Install process-level rustls crypto provider for TLS operations.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - `Ok(())` when a provider is available for rustls client config builders.
+/// - `Err(message)` when no supported provider feature is compiled.
+fn install_rustls_crypto_provider() -> Result<(), String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    Ok(())
+}
+
 /// What: Create an authenticated warehouse channel using configured server URL.
 ///
 /// Inputs:
@@ -506,7 +660,8 @@ fn print_batches_as_table(batches: &[RecordBatch]) -> Result<(), String> {
 /// - `query`: SQL string to execute.
 ///
 /// Output:
-/// - `Ok(())` when query and optional DoGet flow succeed.
+/// - `Ok(true)` when query succeeds from the control plane perspective.
+/// - `Ok(false)` when query is accepted but returns non-success status/error code.
 /// - `Err(message)` on RPC dispatch, metadata, or Flight decode/render failures.
 ///
 /// Details:
@@ -516,10 +671,10 @@ async fn execute_and_render_query(
     session_id: &str,
     token: &str,
     query: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
 
     let mut request = Request::new(warehouse_service::QueryRequest {
@@ -533,18 +688,239 @@ async fn execute_and_render_query(
         .map_err(|e| format!("query dispatch failed: {}", e))?
         .into_inner();
 
-    println!(
-        "status={} error_code={} message={}",
-        response.status, response.error_code, response.message
-    );
+    // if status is not OK, we expect error_code and message to be populated for debugging. If status is OK, error_code should be 0 and message may or may not be populated but should not contain critical error info.
+    // print the error code and message in either case for visibility, but the client should primarily rely on the status field for control flow decisions.
 
-    if let Some(handle) = query_handle_from_response(&response) {
-        println!("Structured query handle: {}", handle);
-        let batches = fetch_doget_batches(&handle).await?;
-        print_batches_as_table(&batches)?;
+    if response.error_code != "0" {
+        println!(
+            "Query failed with status={} error_code={} message={}",
+            response.status, response.error_code, response.message
+        );
+        Ok(false)
+    } else {
+        if let Some(handle) = query_handle_from_response(&response) {
+            // println!("Structured query handle: {}", handle);
+            let batches = fetch_doget_batches(&handle).await?;
+            print_batches_as_table(&batches)?;
+            print_stage_latency_breakdown(&handle)?;
+        }
+        if response.status == "OK" {
+            println!("Query executed successfully");
+            Ok(true)
+        } else {
+            println!(
+                "Query completed with status={} error_code={} message={}",
+                response.status, response.error_code, response.message
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// What: Split SQL script text into statements while respecting quotes and comments.
+///
+/// Inputs:
+/// - `script`: Raw SQL script text that may contain multiple statements.
+///
+/// Output:
+/// - Ordered SQL statements without trailing semicolons.
+///
+/// Details:
+/// - Ignores semicolons inside single quotes, double quotes, line comments, and block comments.
+fn split_sql_statements(script: &str) -> Vec<String> {
+    let chars = script.chars().collect::<Vec<char>>();
+    let mut out = Vec::<String>::new();
+    let mut current = String::new();
+
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        let next = if idx + 1 < chars.len() {
+            Some(chars[idx + 1])
+        } else {
+            None
+        };
+
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+                current.push(ch);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if ch == '*' && next == Some('/') {
+                in_block_comment = false;
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            if ch == '-' && next == Some('-') {
+                in_line_comment = true;
+                idx += 2;
+                continue;
+            }
+            if ch == '/' && next == Some('*') {
+                in_block_comment = true;
+                idx += 2;
+                continue;
+            }
+        }
+
+        if ch == '\'' && !in_double_quote {
+            current.push(ch);
+            if in_single_quote {
+                if next == Some('\'') {
+                    current.push('\'');
+                    idx += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            } else {
+                in_single_quote = true;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            current.push(ch);
+            idx += 1;
+            continue;
+        }
+
+        if ch == ';' && !in_single_quote && !in_double_quote {
+            let stmt = current.trim();
+            if !stmt.is_empty() {
+                out.push(stmt.to_string());
+            }
+            current.clear();
+            idx += 1;
+            continue;
+        }
+
+        current.push(ch);
+        idx += 1;
     }
 
-    Ok(())
+    let tail = current.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+
+    out
+}
+
+/// What: Execute a SQL file as an ordered multi-statement script.
+///
+/// Inputs:
+/// - `warehouse_client`: Warehouse gRPC client.
+/// - `session_id`: Active session id.
+/// - `token`: JWT token.
+/// - `query_file`: File path containing SQL statements.
+///
+/// Output:
+/// - `Ok(())` when all statements execute successfully.
+/// - `Err(message)` when one or more statements fail or cannot be executed.
+///
+/// Details:
+/// - Continues executing remaining statements after failures and returns a summary error at the end.
+async fn run_query_file(
+    warehouse_client: &mut WarehouseClient,
+    session_id: &str,
+    token: &str,
+    query_file: &str,
+) -> Result<(), String> {
+    let script = fs::read_to_string(query_file)
+        .map_err(|e| format!("failed to read query file '{}': {}", query_file, e))?;
+    let statements = split_sql_statements(&script);
+
+    let start_time = std::time::Instant::now();
+
+    if statements.is_empty() {
+        return Err(format!(
+            "query file '{}' contains no executable statements",
+            query_file
+        ));
+    }
+
+    println!(
+        "Running {} SQL statements from file: {}",
+        statements.len(),
+        query_file
+    );
+
+    let mut success_count = 0usize;
+    let mut failed_indices = Vec::<usize>::new();
+
+    for (index, statement) in statements.iter().enumerate() {
+        let ordinal = index + 1;
+        println!("\\n--- Statement {}/{} ---", ordinal, statements.len());
+        //println!("{}", statement);
+        let stament_start = std::time::Instant::now();
+
+        match execute_and_render_query(warehouse_client, session_id, token, statement).await {
+            Ok(true) => {
+                success_count += 1;
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: SUCCESS ({} ms)",
+                    ordinal,
+                    duration.as_millis()
+                );
+            }
+            Ok(false) => {
+                failed_indices.push(ordinal);
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: FAILED (non-success status, {} ms)",
+                    ordinal,
+                    duration.as_millis()
+                );
+            }
+            Err(e) => {
+                failed_indices.push(ordinal);
+                let duration = stament_start.elapsed();
+                println!(
+                    "statement {}: ERROR ({} ms) ({})",
+                    ordinal,
+                    duration.as_millis(),
+                    e
+                );
+            }
+        }
+    }
+    let total_duration = start_time.elapsed();
+
+    println!(
+        "\\nExecution summary: {} \\ntotal={} success={} failed={} ({} ms)",
+        query_file,
+        statements.len(),
+        success_count,
+        failed_indices.len(),
+        total_duration.as_millis()
+    );
+
+    if failed_indices.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed statements at indexes: {:?}",
+            failed_indices
+        ))
+    }
 }
 
 /// What: Run interactive query loop.
@@ -605,8 +981,10 @@ struct Args {
     username: Option<String>,
     #[arg(short, long)]
     password: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "query_file")]
     query: Option<String>,
+    #[arg(long, conflicts_with = "query")]
+    query_file: Option<String>,
     #[arg(long)]
     check_handle: Option<String>,
     #[arg(long)]
@@ -617,6 +995,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_rustls_crypto_provider()
+        .map_err(|e| format!("failed to initialize TLS crypto provider: {}", e))?;
+
     let args = Args::parse();
 
     if let Some(handle) = args.check_malformed_ticket.as_deref() {
@@ -661,10 +1042,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut warehouse_client = WarehouseClient::new(channel);
 
     if let Some(query) = args.query.as_deref() {
-        if let Err(e) =
-            execute_and_render_query(&mut warehouse_client, &session_id, &token, query).await
+        if let Err(e) = execute_and_render_query(&mut warehouse_client, &session_id, &token, query)
+            .await
+            .map(|_| ())
         {
             println!("query error: {}", e);
+        }
+        return Ok(());
+    }
+
+    if let Some(query_file) = args.query_file.as_deref() {
+        if let Err(e) = run_query_file(&mut warehouse_client, &session_id, &token, query_file).await
+        {
+            println!("query-file error: {}", e);
         }
         return Ok(());
     }
@@ -675,3 +1065,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/main_tests.rs"]
+mod tests;

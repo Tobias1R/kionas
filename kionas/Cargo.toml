@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-datafusion = "52.2.0"
-deltalake = "0.31.0"
-s3 = "0.1.22"
+deltalake = "0.31.1"
+sqlparser = "0.59.0"
 uuid = { version = "1.0", features = ["v4"] }
 tokio.workspace = true
 chrono = "0.4.38"
@@ -17,7 +16,7 @@ config = "0.13"
 regex = "1.5"
 md5 = "0.7.0"
 get_if_addrs = "0.5"
-redis = { version = "0.25", features = ["tokio-comp"] }
+redis = { version = "1.1.0", features = ["tokio-comp"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -3,8 +3,8 @@
 
 - [x] Clarify Project Requirements
 - [x] Scaffold the Project
-- [ ] Customize the Project
-- [ ] Install Required Extensions
+- [x] Customize the Project
+- [x] Install Required Extensions
 - [ ] Compile the Project
 - [ ] Create and Run Task
 - [ ] Launch the Project
@@ -38,8 +38,6 @@
 
 ## Cargo Check runs
 - project is taking up to 5 minutes to compile, so we want to make sure we are only running it when necessary
-- if on windows run through docker
-- docker run --rm -v "${PWD}:/workspace" -w /workspace docker-devcontainer cargo check -p server
 
 ## Cargo Clippy Configuration
 Check with cargo clippy after adding a new feature and fix clippy errors with the following settings:
@@ -112,8 +110,6 @@ If you add or change config keys:
 - **Do NOT create or update *.md files, unless explicitly asked**
 - **Do NOT update wiki pages, unless explicitly asked**
 - **Do NOT update README, unless explicitly asked**
-- **ROADMAPS** Are the only exception: update `ROADMAP.md` and create corresponding `ROADMAP_PHASEX_MATRIX.md` files as needed for phase signoff documentation.
-- Focus on code implementation and inline documentation (rustdoc comments)
 
 
 ## Complexity Thresholds
@@ -128,49 +124,4 @@ If you add or change config keys:
 - Focus on code quality, tests, and inline documentation
 - All changes must respect `--dry-run` flag
 - All changes must degrade gracefully if system tools are unavailable
-
-## Roadmping
-- We build our plans usig the roadmap format in `ROADMAP.md` and track phase completion with corresponding `ROADMAP_PHASEX_MATRIX.md` files.
-- Each roadmap phase should have a clear scope, mandatory criteria for completion, optional hardening items, and a signoff decision process.
-- The roadmap should be updated iteratively as we progress through phases, ensuring that all relevant files and documentation are maintained in sync with the current state of the project.
-
-## Roadmap Phase Signoff Matrix Requirements
-For each roadmap phase, create a corresponding `ROADMAP_PHASEX_MATRIX.md` file with the following structure:
-```markdown
-# Phase X Completion Matrix
-
-## Scope
-Describe the exact phase scope from [ROADMAP.md](ROADMAP.md).
-
-## Completion Matrix
-| Item | Status | Evidence | Notes |
-|---|---|---|---|
-| Mandatory criterion 1 | Not Started | N/A | |
-| Mandatory criterion 2 | Not Started | N/A | |
-| Mandatory criterion 3 | Not Started | N/A | |
-| Optional hardening 1 | Deferred | N/A | Non-blocking for phase signoff. |
-| Optional hardening 2 | Deferred | N/A | Non-blocking for phase signoff. |
-
-Status values:
-- `Done`
-- `Deferred`
-- `Blocked`
-- `Not Started`
-
-## Signoff Decision
-- Phase signoff: `Pending`
-- Blocking items:
-  - List mandatory criteria not marked `Done`.
-  - List optional hardening items not marked `Done`.
-
-## Gate Checklist
-1. All mandatory criteria are marked `Done`.
-2. Each `Done` item includes concrete evidence reference.
-3. `Deferred` items include rationale and are explicitly non-blocking.
-4. Final signoff decision is recorded in this file.
-
-## Environment and Parameters
-- Inform all environment variables required for the phase, if any. And where in the codebase they are expected to be used.
-- Inform any parameters that are expected to be used for the phase, if any. And where in the codebase they are expected to be used.
-```
 
