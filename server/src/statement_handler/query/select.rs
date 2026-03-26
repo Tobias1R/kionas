@@ -395,6 +395,73 @@ struct RuntimeWorkerAddressResolution {
     source: &'static str,
 }
 
+fn worker_address_from_host_port(host: &str, port: u32) -> String {
+    format!("{}:{}", host, port)
+}
+
+async fn resolve_pool_member_worker_addresses(
+    shared_data: &SharedData,
+    pool_members: &[String],
+) -> Vec<String> {
+    if pool_members.is_empty() {
+        log::info!("resolve_pool_member_worker_addresses: empty pool_members");
+        return Vec::new();
+    }
+
+    log::info!(
+        "resolve_pool_member_worker_addresses: resolving pool_members: {:?}",
+        pool_members
+    );
+
+    let shared = shared_data.lock().await;
+    let workers = shared.workers.lock().await;
+
+    log::info!(
+        "resolve_pool_member_worker_addresses: available workers: {:?}",
+        workers
+            .iter()
+            .map(|(k, entry)| (k.clone(), entry.warehouse.get_name()))
+            .collect::<Vec<_>>()
+    );
+
+    let mut addresses = Vec::<String>::new();
+    for member in pool_members {
+        let member_name = member.trim();
+        if member_name.is_empty() {
+            continue;
+        }
+
+        if let Some(worker) = workers
+            .values()
+            .find(|entry| entry.warehouse.get_name() == member_name)
+        {
+            let address = worker_address_from_host_port(
+                worker.warehouse.get_host().as_str(),
+                worker.warehouse.get_port(),
+            );
+            log::info!(
+                "resolve_pool_member_worker_addresses: found member '{}' at {}",
+                member_name,
+                address
+            );
+            addresses.push(address);
+        } else {
+            log::warn!(
+                "resolve_pool_member_worker_addresses: pool member '{}' not found in workers",
+                member_name
+            );
+        }
+    }
+
+    log::info!(
+        "resolve_pool_member_worker_addresses: resolved to {} addresses: {:?}",
+        addresses.len(),
+        addresses
+    );
+
+    addresses
+}
+
 /// What: Resolve runtime worker addresses with source diagnostics for distributed routing metadata.
 ///
 /// Inputs:
@@ -460,8 +527,49 @@ async fn resolve_runtime_worker_address_resolution(
 /// - Preserves runtime->effective pool source contracts and fallback activation behavior.
 async fn resolve_query_routing_context(
     shared_data: &SharedData,
+    session_id: &str,
     distributed_stage_count: usize,
 ) -> (Vec<String>, RoutingObservabilityContext<'static>) {
+    let session_pool_members = {
+        let shared = shared_data.lock().await;
+        shared
+            .session_manager
+            .get_session(session_id.to_string())
+            .await
+            .map(|session| session.get_pool_members())
+            .unwrap_or_default()
+    };
+
+    log::info!(
+        "resolve_query_routing_context: session_id={}, session_pool_members={:?}",
+        session_id,
+        session_pool_members
+    );
+
+    let session_pool_addresses =
+        resolve_pool_member_worker_addresses(shared_data, &session_pool_members).await;
+
+    log::info!(
+        "resolve_query_routing_context: session_pool_addresses resolved to: {:?}",
+        session_pool_addresses
+    );
+
+    if !session_pool_addresses.is_empty() {
+        log::info!(
+            "resolve_query_routing_context: using session pool addresses for DAG compilation: {:?}",
+            session_pool_addresses
+        );
+        let routing_observability = build_routing_observability_context(
+            distributed_dag::ROUTING_RUNTIME_SOURCE_SESSION_POOL,
+            session_pool_addresses.len(),
+            session_pool_addresses.len(),
+            distributed_dag::ROUTING_POOL_SOURCE_RUNTIME,
+            distributed_stage_count,
+        );
+
+        return (session_pool_addresses, routing_observability);
+    }
+
     let RuntimeWorkerAddressResolution {
         addresses: runtime_worker_addresses,
         source: routing_source,
@@ -852,6 +960,10 @@ fn compile_query_stage_groups(
     distributed_plan: &DistributedPhysicalPlan,
     routing_worker_pool: &[String],
 ) -> Result<Vec<distributed_dag::StageTaskGroup>, String> {
+    log::info!(
+        "compile_query_stage_groups: using routing_worker_pool: {:?}",
+        routing_worker_pool
+    );
     distributed_dag::compile_stage_task_groups_with_worker_pool(
         distributed_plan,
         DISTRIBUTED_STAGE_OPERATION_QUERY,
@@ -2035,9 +2147,12 @@ pub(crate) async fn handle_select_query(
         &datafusion_artifacts.stage_extraction,
     );
 
-    let (effective_routing_worker_pool, routing_observability) =
-        resolve_query_routing_context(shared_data, stage_extraction_counts.distributed_stage_count)
-            .await;
+    let (effective_routing_worker_pool, routing_observability) = resolve_query_routing_context(
+        shared_data,
+        session_id,
+        stage_extraction_counts.distributed_stage_count,
+    )
+    .await;
     let mut stage_groups =
         match compile_query_stage_groups(&distributed_plan, &effective_routing_worker_pool) {
             Ok(groups) => groups,

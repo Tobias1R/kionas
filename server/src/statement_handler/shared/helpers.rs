@@ -288,6 +288,97 @@ pub struct DispatchAuthContext {
     pub query_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionPoolContext {
+    pub session: crate::session::Session,
+    pub worker_key: String,
+    pub pool_members: Vec<String>,
+}
+
+fn normalize_worker_address_for_match(address: &str) -> String {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(parsed) = url::Url::parse(trimmed)
+        && let Some(host) = parsed.host_str()
+    {
+        return parsed
+            .port()
+            .map_or_else(|| host.to_string(), |port| format!("{}:{}", host, port));
+    }
+
+    let without_path = trimmed.split('/').next().unwrap_or(trimmed);
+    without_path.to_string()
+}
+
+async fn resolve_worker_key_by_name(
+    shared_data: &SharedData,
+    worker_name: &str,
+) -> Option<(String, String)> {
+    let worker_name = worker_name.trim();
+    if worker_name.is_empty() {
+        return None;
+    }
+
+    let state = shared_data.lock().await;
+    let workers = state.workers.lock().await;
+    for worker in workers.values() {
+        let name = worker.warehouse.get_name();
+        if name == worker_name {
+            return Some((worker.key.clone(), name));
+        }
+    }
+
+    None
+}
+
+async fn resolve_worker_key_by_address(
+    shared_data: &SharedData,
+    worker_address: &str,
+) -> Option<(String, String)> {
+    let normalized = normalize_worker_address_for_match(worker_address);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let state = shared_data.lock().await;
+    let workers = state.workers.lock().await;
+    for worker in workers.values() {
+        let host_port = format!(
+            "{}:{}",
+            worker.warehouse.get_host(),
+            worker.warehouse.get_port()
+        );
+        if host_port == normalized {
+            return Some((worker.key.clone(), worker.warehouse.get_name()));
+        }
+    }
+
+    None
+}
+
+fn routed_worker_address_from_stage_metadata(
+    stage_metadata: &crate::tasks::StageTaskMetadata,
+) -> Option<String> {
+    let partition_index = stage_metadata.partition_id as usize;
+
+    for destination in &stage_metadata.output_destinations {
+        if destination.worker_addresses.is_empty() {
+            continue;
+        }
+
+        let worker_index = partition_index % destination.worker_addresses.len();
+        let address = destination.worker_addresses[worker_index].trim();
+        if !address.is_empty() {
+            return Some(address.to_string());
+        }
+    }
+
+    None
+}
+
 /// Resolve session and worker key for a session id
 pub async fn resolve_session_and_key(
     shared_data: &SharedData,
@@ -327,6 +418,21 @@ pub async fn resolve_session_and_key(
     };
 
     Ok((session, key))
+}
+
+/// Resolve session, default worker key, and pool snapshot for dispatch decisions.
+pub async fn resolve_session_pool_context(
+    shared_data: &SharedData,
+    session_id: &str,
+) -> Result<SessionPoolContext, Box<dyn Error + Send + Sync>> {
+    let (session, worker_key) = resolve_session_and_key(shared_data, session_id).await?;
+    let pool_members = session.get_pool_members();
+
+    Ok(SessionPoolContext {
+        session,
+        worker_key,
+        pool_members,
+    })
 }
 
 /// Create a Task in TaskManager and mark it Scheduled.
@@ -454,7 +560,43 @@ pub async fn run_task_for_input_with_params(
     validate_query_dispatch_context(operation, &params, stage_metadata.as_ref(), auth_ctx)?;
 
     // Resolve session and worker key
-    let (session, key) = resolve_session_and_key(shared_data, session_id).await?;
+    let session_context = resolve_session_pool_context(shared_data, session_id).await?;
+    let session = session_context.session;
+    let key = session_context.worker_key;
+    let pool_members = session_context.pool_members;
+
+    let mut dispatch_target_key = key.clone();
+    let mut dispatch_target_warehouse = session.get_warehouse();
+    let mut used_routing_metadata = false;
+
+    if operation.eq_ignore_ascii_case("query")
+        && let Some(metadata) = stage_metadata.as_ref()
+    {
+        if let Some(routed_address) = routed_worker_address_from_stage_metadata(metadata) {
+            if let Some((routed_key, routed_warehouse)) =
+                resolve_worker_key_by_address(shared_data, &routed_address).await
+            {
+                dispatch_target_key = routed_key;
+                dispatch_target_warehouse = routed_warehouse;
+                used_routing_metadata = true;
+            } else {
+                log::warn!(
+                    "routing metadata address '{}' not found in worker registry; falling back to session routing",
+                    routed_address
+                );
+            }
+        }
+
+        if !used_routing_metadata && !pool_members.is_empty() {
+            let worker_index = (metadata.partition_id as usize) % pool_members.len();
+            if let Some((routed_key, routed_warehouse)) =
+                resolve_worker_key_by_name(shared_data, &pool_members[worker_index]).await
+            {
+                dispatch_target_key = routed_key;
+                dispatch_target_warehouse = routed_warehouse;
+            }
+        }
+    }
 
     // Create a query id and schedule task
     let query_id = auth_ctx
@@ -472,6 +614,11 @@ pub async fn run_task_for_input_with_params(
         .or_else(|| parse_u32_param(&params, "partition_count"))
         .filter(|v| *v > 0)
         .unwrap_or(1);
+    let diagnostics_partition_id = stage_metadata
+        .as_ref()
+        .map(|value| value.partition_id)
+        .or_else(|| parse_u32_param(&params, "partition_index"))
+        .unwrap_or(0);
     if operation.eq_ignore_ascii_case("query")
         && let Some(ctx) = auth_ctx
     {
@@ -546,7 +693,7 @@ pub async fn run_task_for_input_with_params(
                 &query_id_for_event,
                 stage_id,
                 &observability_route_source,
-                &key,
+                &dispatch_target_key,
                 &session.get_warehouse(),
                 observability_dag_metrics_present,
                 &observability_plan_validation_status,
@@ -555,11 +702,25 @@ pub async fn run_task_for_input_with_params(
                 &observability_distributed_stage_count,
             )
         );
+
+        log::info!(
+            "distributed scheduler dispatch target: stage_id={} partition_id={} routed_worker={} routing_metadata_used={} session_pool_size={}",
+            stage_id,
+            diagnostics_partition_id,
+            dispatch_target_warehouse,
+            used_routing_metadata,
+            pool_members.len(),
+        );
     }
 
     // Acquire pooled connection (validates via heartbeat)
-    let conn =
-        acquire_pooled_conn(shared_data, &key, &session.get_warehouse(), timeout_secs).await?;
+    let conn = acquire_pooled_conn(
+        shared_data,
+        &dispatch_target_key,
+        &dispatch_target_warehouse,
+        timeout_secs,
+    )
+    .await?;
 
     // Fetch task to convert into TaskRequest
     let task_arc_opt = {

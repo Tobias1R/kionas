@@ -17,6 +17,12 @@ pub async fn handle_use_warehouse(
         wh = wh.trim_end_matches(';').to_string();
     }
 
+    log::info!(
+        "handle_use_warehouse: session_id={}, warehouse={}",
+        session_id,
+        wh
+    );
+
     // Update the session's warehouse via SessionManager
     let session_opt = {
         let state = shared_data.lock().await;
@@ -29,8 +35,21 @@ pub async fn handle_use_warehouse(
     match session_opt {
         Some(mut s) => {
             s.set_warehouse(wh.clone());
+            log::info!(
+                "handle_use_warehouse: looking up pool members for warehouse: {}",
+                wh
+            );
             let state = shared_data.lock().await;
-            let pool_members = state.get_pool_members(&wh).await.unwrap_or_default();
+            let pool_members = state.get_pool_members(&wh).await;
+            log::info!(
+                "handle_use_warehouse: get_pool_members result: {:?}",
+                pool_members
+            );
+            let pool_members = pool_members.unwrap_or_default();
+            log::info!(
+                "handle_use_warehouse: setting pool_members on session: {:?}",
+                pool_members
+            );
             s.set_pool_members(pool_members);
             state
                 .session_manager

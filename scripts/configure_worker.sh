@@ -204,6 +204,14 @@ echo -e "${GREEN}✓${NC} Extracted worker information:"
 echo "  Worker ID:  $WORKER_ID"
 echo "  Hostname:   $WORKER_HOST"
 echo "  Port:       $WORKER_PORT"
+
+# Extract pool name from config
+WORKER_POOL=$(jq -r '.pool // empty' "$WORKER_CONFIG" 2>/dev/null || echo "")
+if [ -n "$WORKER_POOL" ]; then
+  echo "  Pool:       $WORKER_POOL"
+  # Export for worker registration
+  export WORKER_POOL_NAME="$WORKER_POOL"
+fi
 echo ""
 
 # Step 2: Upload configuration to Consul

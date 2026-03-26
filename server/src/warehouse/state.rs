@@ -103,10 +103,26 @@ impl SharedState {
     /// - Returns a snapshot clone of members at read time
     pub async fn get_pool_members(&self, pool_name: &str) -> Result<Vec<String>, String> {
         let pools = self.warehouse_pools.lock().await;
-        pools
-            .get(pool_name)
-            .map(|pool| pool.members.clone())
-            .ok_or_else(|| format!("Pool '{}' not found", pool_name))
+        log::info!(
+            "get_pool_members: looking for pool '{}', available pools: {:?}",
+            pool_name,
+            pools.keys().collect::<Vec<_>>()
+        );
+
+        match pools.get(pool_name) {
+            Some(pool) => {
+                log::info!(
+                    "get_pool_members: found pool '{}' with members: {:?}",
+                    pool_name,
+                    pool.members
+                );
+                Ok(pool.members.clone())
+            }
+            None => {
+                log::warn!("get_pool_members: pool '{}' not found", pool_name);
+                Err(format!("Pool '{}' not found", pool_name))
+            }
+        }
     }
 
     /// What: Resolve the default pool name derived from tier templates.
@@ -183,6 +199,7 @@ impl SharedState {
 
     /// Resolve the worker key (digest) for a given session id.
     /// Uses session affinity first, falls back to fuzzy warehouse name matching.
+    /// If warehouse name is a pool name, resolves to first member of that pool.
     pub async fn resolve_worker_key(&self, session_id: &str) -> Option<String> {
         // Get session
         let session_opt = self
@@ -191,29 +208,116 @@ impl SharedState {
             .await;
         let session = match session_opt {
             Some(s) => s,
-            None => return None,
+            None => {
+                log::warn!("resolve_worker_key: session {} not found", session_id);
+                return None;
+            }
         };
         let worker_uuid = session.get_warehouse_uuid();
+        let plain = session.get_warehouse();
 
-        // Exact match
+        log::info!(
+            "resolve_worker_key: session_id={}, warehouse={}, warehouse_uuid={}",
+            session_id,
+            plain,
+            worker_uuid
+        );
+
+        // Exact match on UUID
         {
             let warehouses = self.warehouses.lock().await;
             if warehouses.contains_key(&worker_uuid) {
+                log::info!(
+                    "resolve_worker_key: found exact uuid match for worker_uuid={}",
+                    worker_uuid
+                );
                 return Some(worker_uuid);
             }
         }
 
         // Fuzzy match by warehouse name or host
-        let plain = session.get_warehouse();
+        log::info!(
+            "resolve_worker_key: trying fuzzy match on warehouse name: {}",
+            plain
+        );
         let warehouses = self.warehouses.lock().await;
         for (k, w) in warehouses.iter() {
             let wname = w.get_name();
             let whost = w.get_host();
             if wname == plain || wname.ends_with(&plain) || wname.contains(&plain) || whost == plain
             {
+                log::info!(
+                    "resolve_worker_key: found fuzzy match - warehouse_name={}, worker_key={}",
+                    wname,
+                    k
+                );
                 return Some(k.clone());
             }
         }
+        log::info!("resolve_worker_key: no fuzzy match found for: {}", plain);
+        drop(warehouses);
+
+        // Check if warehouse name is a pool name
+        log::info!("resolve_worker_key: checking if {} is a pool name", plain);
+        let pools = self.warehouse_pools.lock().await;
+        log::info!(
+            "resolve_worker_key: available pools: {:?}",
+            pools.keys().collect::<Vec<_>>()
+        );
+
+        if let Some(pool) = pools.get(&plain).filter(|p| !p.members.is_empty()) {
+            log::info!(
+                "resolve_worker_key: found pool '{}' with members: {:?}",
+                plain,
+                pool.members
+            );
+            // Resolve first pool member to worker key
+            let first_member = pool.members[0].clone();
+            log::info!(
+                "resolve_worker_key: resolving to first pool member: {}",
+                first_member
+            );
+            drop(pools);
+
+            let warehouses = self.warehouses.lock().await;
+            log::info!(
+                "resolve_worker_key: available warehouses: {:?}",
+                warehouses
+                    .iter()
+                    .map(|(k, w)| (k.clone(), w.get_name()))
+                    .collect::<Vec<_>>()
+            );
+
+            for (k, w) in warehouses.iter() {
+                let wname = w.get_name();
+                if wname == first_member
+                    || wname.ends_with(&first_member)
+                    || wname.contains(&first_member)
+                {
+                    log::info!(
+                        "resolve_worker_key: matched pool member '{}' to worker_key={}",
+                        first_member,
+                        k
+                    );
+                    return Some(k.clone());
+                }
+            }
+            log::warn!(
+                "resolve_worker_key: pool member '{}' not found in warehouses",
+                first_member
+            );
+        } else {
+            log::info!(
+                "resolve_worker_key: '{}' is not a pool, or pool is empty",
+                plain
+            );
+        }
+
+        log::warn!(
+            "resolve_worker_key: failed to resolve warehouse '{}' for session {}",
+            plain,
+            session_id
+        );
         None
     }
 

@@ -17,6 +17,7 @@ pub(crate) const ROUTING_POOL_SOURCE_ENV: &str = "env";
 pub(crate) const ROUTING_POOL_SOURCE_DEFAULT: &str = "default";
 pub(crate) const ROUTING_RUNTIME_SOURCE_WORKERS: &str = "workers";
 pub(crate) const ROUTING_RUNTIME_SOURCE_WAREHOUSES: &str = "warehouses";
+pub(crate) const ROUTING_RUNTIME_SOURCE_SESSION_POOL: &str = "session_pool";
 pub(crate) const ROUTING_RUNTIME_SOURCE_FALLBACK: &str = "fallback";
 pub(crate) const OBS_DAG_METRICS_JSON_PARAM: &str = "distributed_dag_metrics_json";
 pub(crate) const OBS_PLAN_VALIDATION_STATUS_PARAM: &str = "distributed_plan_validation_status";
@@ -274,20 +275,41 @@ fn route_downstream_partitions_to_workers(
         worker_pool.to_vec()
     };
 
+    log::info!(
+        "route_downstream_partitions_to_workers: partitions={}, pool_size={}, pool={:?}",
+        downstream_partition_count,
+        normalized_pool.len(),
+        normalized_pool
+    );
+
     if downstream_partition_count == 0 {
         return Vec::new();
     }
 
-    (0..downstream_partition_count)
+    let result = (0..downstream_partition_count)
         .map(|partition_index| {
             let worker_index = (partition_index as usize) % normalized_pool.len();
-            normalized_pool[worker_index].clone()
+            let address = normalized_pool[worker_index].clone();
+            log::debug!(
+                "route_downstream_partitions_to_workers: partition {} -> worker_index {} -> {}",
+                partition_index,
+                worker_index,
+                address
+            );
+            address
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+
+    log::info!(
+        "route_downstream_partitions_to_workers: generated addresses: {:?}",
+        result
+    );
+    result
 }
 
 fn resolve_output_destinations(
     stage_id: u32,
+    current_stage_partition_count: u32,
     dependencies: &HashMap<u32, Vec<u32>>,
     partition_count_by_stage: &HashMap<u32, u32>,
     partition_spec_by_stage: &HashMap<u32, PartitionSpec>,
@@ -307,8 +329,21 @@ fn resolve_output_destinations(
                 .get(&downstream_stage_id)
                 .cloned()
                 .unwrap_or(PartitionSpec::Single);
+
+            // Generate routing addresses for ALL upstream partitions, not just downstream
+            // This ensures proper distribution when upstream > downstream
+            let routing_partition_count =
+                std::cmp::max(current_stage_partition_count, downstream_partition_count);
+            log::info!(
+                "resolve_output_destinations: stage_id={}, current_partitions={}, downstream_partitions={}, routing_count={}",
+                stage_id,
+                current_stage_partition_count,
+                downstream_partition_count,
+                routing_partition_count
+            );
+
             let worker_addresses =
-                route_downstream_partitions_to_workers(downstream_partition_count, worker_pool);
+                route_downstream_partitions_to_workers(routing_partition_count, worker_pool);
 
             OutputDestination {
                 downstream_stage_id,
@@ -500,6 +535,7 @@ pub(crate) fn compile_stage_task_groups_with_worker_pool(
             .map_err(|e| format!("failed to serialize stage operators: {}", e))?;
         let output_destinations = resolve_output_destinations(
             stage.stage_id,
+            partition_count,
             &downstream_by_stage,
             &partition_count_by_stage,
             &partition_spec_by_stage,

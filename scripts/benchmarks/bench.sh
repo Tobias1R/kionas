@@ -1,7 +1,7 @@
 set -euo pipefail
 cd /workspace
 
-out="roadmaps/SILK_ROAD/DATAFUSION/plans/execution-ep3-postchange-capture.csv"
+out="roadmaps/SILK_ROAD/DATAFUSION/plans/execution-ep32-postchange-capture.csv"
 batch_sizes_csv="8192"
 
 while [[ $# -gt 0 ]]; do
