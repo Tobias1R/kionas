@@ -1,6 +1,6 @@
 use crate::parser::datafusion_sql::sqlparser::ast::{
     BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query as SqlQuery, Select, SetExpr,
-    TableFactor,
+    SetOperator, SetQuantifier, TableFactor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -128,7 +128,23 @@ pub struct SelectQueryModel {
     pub order_by: Vec<SortSpec>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    #[serde(default)]
+    pub union: Option<QueryUnionSpec>,
     pub sql: String,
+}
+
+/// What: UNION query semantics captured in the canonical query model.
+///
+/// Inputs:
+/// - `operands`: Flattened operand SELECT models in SQL evaluation order.
+/// - `distinct`: `true` for UNION DISTINCT semantics, `false` for UNION ALL.
+///
+/// Output:
+/// - Serializable UNION metadata consumed by planner and worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryUnionSpec {
+    pub operands: Vec<SelectQueryModel>,
+    pub distinct: bool,
 }
 
 /// What: Dispatch envelope containing serialized payload and normalized namespace parts.
@@ -177,6 +193,7 @@ pub struct SelectQueryDispatchModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryModelError {
     UnsupportedSetOperation,
+    UnionOperandSchemaMismatch(String),
     UnsupportedMultiTableFrom,
     UnsupportedJoin,
     UnsupportedJoinType(String),
@@ -201,6 +218,9 @@ impl std::fmt::Display for QueryModelError {
                 f,
                 "only SELECT queries are supported in this phase (set operations are not supported)"
             ),
+            QueryModelError::UnionOperandSchemaMismatch(message) => {
+                write!(f, "UNION operand schema mismatch: {}", message)
+            }
             QueryModelError::UnsupportedMultiTableFrom => {
                 write!(f, "query must reference exactly one table in FROM")
             }
@@ -460,18 +480,90 @@ fn parse_limit_offset_from_sql(sql: &str) -> Result<(Option<u64>, Option<u64>), 
     Ok((limit, offset))
 }
 
-fn extract_minimal_select(query: &SqlQuery) -> Result<&Select, QueryModelError> {
-    let select = match query.body.as_ref() {
-        SetExpr::Select(select) => select.as_ref(),
-        _ => return Err(QueryModelError::UnsupportedSetOperation),
-    };
+fn extract_union_select_operands(
+    expr: &SetExpr,
+    union_distinct_flags: &mut Vec<bool>,
+    operands: &mut Vec<Select>,
+) -> Result<(), QueryModelError> {
+    match expr {
+        SetExpr::Select(select) => {
+            operands.push(select.as_ref().clone());
+            Ok(())
+        }
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+            ..
+        } if *op == SetOperator::Union => {
+            let is_distinct = !matches!(
+                set_quantifier,
+                SetQuantifier::All | SetQuantifier::AllByName
+            );
+            union_distinct_flags.push(is_distinct);
+            extract_union_select_operands(left.as_ref(), union_distinct_flags, operands)?;
+            extract_union_select_operands(right.as_ref(), union_distinct_flags, operands)
+        }
+        _ => Err(QueryModelError::UnsupportedSetOperation),
+    }
+}
 
+fn build_select_query_dispatch_model_from_select(
+    select: &Select,
+    canonical_sql: String,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<SelectQueryDispatchModel, QueryModelError> {
     if select.from.len() != 1 {
         return Err(QueryModelError::UnsupportedMultiTableFrom);
     }
 
-    // Removed unused variable
-    Ok(select)
+    let from = &select.from[0];
+    let table_name = match &from.relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => return Err(QueryModelError::UnsupportedTableFactor),
+    };
+
+    let (database, schema, table) =
+        canonicalize_table_namespace(&table_name, default_database, default_schema);
+
+    let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
+    let model = SelectQueryModel {
+        version: QUERY_PAYLOAD_VERSION,
+        statement: "Select".to_string(),
+        session_id: session_id.to_string(),
+        namespace: QueryNamespace {
+            database: database.clone(),
+            schema: schema.clone(),
+            table: table.clone(),
+            raw: table_name,
+        },
+        projection: select
+            .projection
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+        selection: select
+            .selection
+            .as_ref()
+            .map(std::string::ToString::to_string),
+        joins: parse_join_specs(&from.joins, default_database, default_schema)?,
+        group_by: parse_group_by_from_sql(canonical_sql.as_str()),
+        order_by: parse_order_by_from_sql(canonical_sql.as_str()),
+        limit,
+        offset,
+        union: None,
+        sql: canonical_sql,
+    };
+
+    Ok(SelectQueryDispatchModel {
+        model,
+        database,
+        schema,
+        table,
+    })
 }
 
 fn parse_join_column_ref(expr: &Expr) -> Result<String, QueryModelError> {
@@ -600,6 +692,7 @@ pub async fn build_select_query_dispatch_envelope(
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,
+        "union": model.union,
         "sql": model.sql,
     })
     .to_string();
@@ -628,52 +721,85 @@ pub fn build_select_query_model(
     default_database: &str,
     default_schema: &str,
 ) -> Result<SelectQueryDispatchModel, QueryModelError> {
-    let select = extract_minimal_select(query)?;
-
-    let from = &select.from[0];
-    let table_name = match &from.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
-        _ => return Err(QueryModelError::UnsupportedTableFactor),
-    };
-
-    let (database, schema, table) =
-        canonicalize_table_namespace(&table_name, default_database, default_schema);
-
     let canonical_sql = query.to_string();
-    let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
-    let model = SelectQueryModel {
-        version: QUERY_PAYLOAD_VERSION,
-        statement: "Select".to_string(),
-        session_id: session_id.to_string(),
-        namespace: QueryNamespace {
-            database: database.clone(),
-            schema: schema.clone(),
-            table: table.clone(),
-            raw: table_name,
-        },
-        projection: select
-            .projection
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>(),
-        selection: select
-            .selection
-            .as_ref()
-            .map(std::string::ToString::to_string),
-        joins: parse_join_specs(&from.joins, default_database, default_schema)?,
-        group_by: parse_group_by_from_sql(canonical_sql.as_str()),
-        order_by: parse_order_by_from_sql(canonical_sql.as_str()),
-        limit,
-        offset,
-        sql: canonical_sql,
-    };
+    match query.body.as_ref() {
+        SetExpr::Select(select) => build_select_query_dispatch_model_from_select(
+            select.as_ref(),
+            canonical_sql,
+            session_id,
+            default_database,
+            default_schema,
+        ),
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            ..
+        } => {
+            let mut union_distinct_flags = Vec::<bool>::new();
+            let mut operand_selects = Vec::<Select>::new();
+            extract_union_select_operands(
+                query.body.as_ref(),
+                &mut union_distinct_flags,
+                &mut operand_selects,
+            )?;
 
-    Ok(SelectQueryDispatchModel {
-        model,
-        database,
-        schema,
-        table,
-    })
+            if operand_selects.len() < 2 {
+                return Err(QueryModelError::UnsupportedSetOperation);
+            }
+
+            let mut operand_models = Vec::<SelectQueryModel>::with_capacity(operand_selects.len());
+            for operand_select in &operand_selects {
+                let operand_dispatch = build_select_query_dispatch_model_from_select(
+                    operand_select,
+                    operand_select.to_string(),
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?;
+                operand_models.push(operand_dispatch.model);
+            }
+
+            let first_projection = operand_models
+                .first()
+                .map(|model| model.projection.len())
+                .unwrap_or_default();
+            for (index, operand) in operand_models.iter().enumerate().skip(1) {
+                if operand.projection.len() != first_projection {
+                    return Err(QueryModelError::UnionOperandSchemaMismatch(format!(
+                        "operand {} has {} projection expressions, expected {}",
+                        index,
+                        operand.projection.len(),
+                        first_projection
+                    )));
+                }
+            }
+
+            let mut root_dispatch = build_select_query_dispatch_model_from_select(
+                operand_selects
+                    .first()
+                    .ok_or(QueryModelError::UnsupportedSetOperation)?,
+                canonical_sql.clone(),
+                session_id,
+                default_database,
+                default_schema,
+            )?;
+
+            let (root_limit, root_offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
+            root_dispatch.model.selection = None;
+            root_dispatch.model.joins.clear();
+            root_dispatch.model.group_by = parse_group_by_from_sql(canonical_sql.as_str());
+            root_dispatch.model.order_by = parse_order_by_from_sql(canonical_sql.as_str());
+            root_dispatch.model.limit = root_limit;
+            root_dispatch.model.offset = root_offset;
+            root_dispatch.model.union = Some(QueryUnionSpec {
+                operands: operand_models,
+                distinct: union_distinct_flags.iter().any(|flag| *flag),
+            });
+            root_dispatch.model.sql = canonical_sql;
+
+            Ok(root_dispatch)
+        }
+        _ => Err(QueryModelError::UnsupportedSetOperation),
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +1048,10 @@ mod tests {
                 VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
             ),
             (
+                QueryModelError::UnionOperandSchemaMismatch("x".to_string()),
+                VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
+            ),
+            (
                 QueryModelError::UnsupportedMultiTableFrom,
                 VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE,
             ),
@@ -974,5 +1104,76 @@ mod tests {
                 "unexpected validation code for error variant: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn builds_union_query_model_with_flattened_operands() {
+        let statements = parse_query(
+            "SELECT id FROM sales.public.users UNION ALL SELECT id FROM sales.public.users_ca UNION ALL SELECT id FROM sales.public.users_mx",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("union query model should build")
+            .model;
+
+        let union = model.union.expect("union spec should be present");
+        assert_eq!(union.operands.len(), 3);
+        assert!(!union.distinct);
+        assert_eq!(union.operands[0].namespace.table, "users");
+        assert_eq!(union.operands[1].namespace.table, "users_ca");
+        assert_eq!(union.operands[2].namespace.table, "users_mx");
+    }
+
+    #[test]
+    fn preserves_union_operand_where_clauses() {
+        let statements = parse_query(
+            "SELECT id, name FROM bench.seed1.customers WHERE id <= 5 UNION ALL SELECT id, name FROM bench.seed1.customers WHERE id > 5 AND id <= 10 ORDER BY id",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "bench", "seed1")
+            .expect("union query model should build")
+            .model;
+
+        let union = model.union.expect("union spec should be present");
+        assert_eq!(union.operands.len(), 2);
+        assert_eq!(union.operands[0].selection.as_deref(), Some("id <= 5"));
+        assert_eq!(
+            union.operands[1].selection.as_deref(),
+            Some("id > 5 AND id <= 10")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_union_with_projection_mismatch() {
+        let statements = parse_query(
+            "SELECT id FROM sales.public.users UNION SELECT id, name FROM sales.public.users_ca",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let err = build_select_query_dispatch_envelope(query, "s1", "sales", "public")
+            .await
+            .expect_err("union operands with mismatched projection size must be rejected");
+
+        assert!(matches!(
+            err,
+            QueryModelError::UnionOperandSchemaMismatch(_)
+        ));
     }
 }

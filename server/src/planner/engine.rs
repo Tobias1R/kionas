@@ -6,7 +6,7 @@ use kionas::planner::PlannerError;
 use kionas::planner::{
     AggregateFunction, JoinKeyPair, JoinType, LogicalRelation, PhysicalAggregateExpr,
     PhysicalAggregateSpec, PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
-    PhysicalSortExpr, parse_predicate_sql, validate_physical_plan,
+    PhysicalSortExpr, PhysicalUnionOperand, parse_predicate_sql, validate_physical_plan,
 };
 use kionas::sql::query_model::SelectQueryModel;
 use std::sync::Arc;
@@ -81,6 +81,8 @@ struct PlannerIntentFlags {
     has_sort_merge_join: bool,
     has_nested_loop_join: bool,
     has_aggregate: bool,
+    has_union: bool,
+    union_child_count: usize,
 }
 
 /// What: DataFusion planning artifacts generated from one SQL statement.
@@ -329,6 +331,16 @@ fn collect_exec_node_names(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>)
     }
 }
 
+fn collect_union_child_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
+    if plan.name().to_ascii_lowercase().contains("unionexec") {
+        out.push(plan.children().len());
+    }
+
+    for child in plan.children() {
+        collect_union_child_counts(child, out);
+    }
+}
+
 fn normalize_identifier(raw: &str) -> String {
     raw.trim()
         .trim_matches('"')
@@ -555,6 +567,10 @@ fn derive_intent_from_exec_plan(plan: &Arc<dyn ExecutionPlan>) -> PlannerIntentF
     let has_aggregate = node_names
         .iter()
         .any(|name| name.to_ascii_lowercase().contains("aggregate"));
+    let mut union_child_counts = Vec::<usize>::new();
+    collect_union_child_counts(plan, &mut union_child_counts);
+    let has_union = !union_child_counts.is_empty();
+    let union_child_count = union_child_counts.into_iter().max().unwrap_or(0);
 
     PlannerIntentFlags {
         has_scan,
@@ -566,6 +582,8 @@ fn derive_intent_from_exec_plan(plan: &Arc<dyn ExecutionPlan>) -> PlannerIntentF
         has_sort_merge_join,
         has_nested_loop_join,
         has_aggregate,
+        has_union,
+        union_child_count,
     }
 }
 
@@ -679,6 +697,7 @@ fn derive_intent_from_sql_text(sql: &str) -> PlannerIntentFlags {
         || normalized.contains("min(")
         || normalized.contains("max(")
         || normalized.contains("avg(");
+    let has_union = normalized.contains(" union ");
 
     PlannerIntentFlags {
         has_scan: true,
@@ -690,6 +709,8 @@ fn derive_intent_from_sql_text(sql: &str) -> PlannerIntentFlags {
         has_sort_merge_join: false,
         has_nested_loop_join: false,
         has_aggregate,
+        has_union,
+        union_child_count: 0,
     }
 }
 
@@ -707,6 +728,106 @@ fn build_kionas_plan_from_intent(
     let has_nested_loop_join = intent.has_nested_loop_join;
     let has_join = has_hash_join || has_sort_merge_join || has_nested_loop_join;
     let has_aggregate = intent.has_aggregate;
+    let has_union = intent.has_union;
+
+    if has_union {
+        let union_spec = model.union.as_ref().ok_or_else(|| {
+            PlannerError::InvalidPhysicalPipeline(
+                "DataFusion union node detected but query model contains no union spec".to_string(),
+            )
+        })?;
+
+        if union_spec.operands.len() < 2 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "union requires at least two operands".to_string(),
+            ));
+        }
+
+        if intent.union_child_count > 0 && intent.union_child_count != union_spec.operands.len() {
+            return Err(PlannerError::InvalidPhysicalPipeline(format!(
+                "union translation mismatch: datafusion_union_child_count={} model_union_operand_count={}",
+                intent.union_child_count,
+                union_spec.operands.len()
+            )));
+        }
+
+        let mut operators = Vec::<PhysicalOperator>::new();
+        operators.push(PhysicalOperator::TableScan {
+            relation: LogicalRelation {
+                database: model.namespace.database.clone(),
+                schema: model.namespace.schema.clone(),
+                table: model.namespace.table.clone(),
+            },
+        });
+        operators.push(PhysicalOperator::Union {
+            operands: union_spec
+                .operands
+                .iter()
+                .map(|operand| {
+                    let filter = operand
+                        .selection
+                        .as_ref()
+                        .map(|selection| parse_predicate_sql(selection))
+                        .transpose()
+                        .map_err(PlannerError::UnsupportedPredicate)?;
+
+                    Ok(PhysicalUnionOperand {
+                        relation: LogicalRelation {
+                            database: operand.namespace.database.clone(),
+                            schema: operand.namespace.schema.clone(),
+                            table: operand.namespace.table.clone(),
+                        },
+                        filter,
+                    })
+                })
+                .collect::<Result<Vec<_>, PlannerError>>()?,
+            distinct: union_spec.distinct,
+        });
+
+        if has_projection {
+            operators.push(PhysicalOperator::Projection {
+                expressions: model
+                    .projection
+                    .iter()
+                    .map(|sql| PhysicalExpr::Raw { sql: sql.clone() })
+                    .collect::<Vec<_>>(),
+            });
+        }
+
+        if has_sort && !model.order_by.is_empty() {
+            let keys = model
+                .order_by
+                .iter()
+                .map(|spec| PhysicalSortExpr {
+                    expression: PhysicalExpr::Raw {
+                        sql: spec.expression.clone(),
+                    },
+                    ascending: spec.ascending,
+                })
+                .collect::<Vec<_>>();
+            operators.push(PhysicalOperator::Sort { keys });
+        }
+
+        if has_limit && let Some(count) = model.limit {
+            operators.push(PhysicalOperator::Limit {
+                spec: PhysicalLimitSpec {
+                    count,
+                    offset: model.offset.unwrap_or(0),
+                },
+            });
+        }
+
+        operators.push(PhysicalOperator::Materialize);
+
+        let translated = PhysicalPlan {
+            operators,
+            sql: model.sql.clone(),
+            schema_metadata: None,
+        };
+
+        validate_physical_plan(&translated)?;
+        return Ok(translated);
+    }
 
     let model_has_join = !model.joins.is_empty();
     if has_join != model_has_join {
@@ -887,3 +1008,7 @@ fn build_kionas_plan_from_intent(
 #[cfg(test)]
 #[path = "../tests/planner_engine_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/spike_union_exec.rs"]
+mod spike_union_exec;

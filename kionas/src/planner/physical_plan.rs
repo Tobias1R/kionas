@@ -48,6 +48,20 @@ pub struct PhysicalLimitSpec {
     pub offset: u64,
 }
 
+/// What: One UNION operand relation in the physical execution contract.
+///
+/// Inputs:
+/// - `relation`: Canonical relation namespace for one UNION input.
+///
+/// Output:
+/// - Serializable UNION operand descriptor consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalUnionOperand {
+    pub relation: LogicalRelation,
+    #[serde(default)]
+    pub filter: Option<PredicateExpr>,
+}
+
 /// What: Supported and cataloged physical operators for query execution planning.
 ///
 /// Inputs:
@@ -61,21 +75,42 @@ pub struct PhysicalLimitSpec {
 /// - Remaining operators are cataloged for future phases and must be rejected by capability checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PhysicalOperator {
-    TableScan { relation: LogicalRelation },
-    Filter { predicate: PhysicalExpr },
-    Projection { expressions: Vec<PhysicalExpr> },
+    TableScan {
+        relation: LogicalRelation,
+    },
+    Filter {
+        predicate: PhysicalExpr,
+    },
+    Projection {
+        expressions: Vec<PhysicalExpr>,
+    },
     Materialize,
 
-    HashJoin { spec: PhysicalJoinSpec },
+    HashJoin {
+        spec: PhysicalJoinSpec,
+    },
     NestedLoopJoin,
-    AggregatePartial { spec: PhysicalAggregateSpec },
-    AggregateFinal { spec: PhysicalAggregateSpec },
-    Sort { keys: Vec<PhysicalSortExpr> },
-    Limit { spec: PhysicalLimitSpec },
-    ExchangeShuffle { keys: Vec<String> },
+    AggregatePartial {
+        spec: PhysicalAggregateSpec,
+    },
+    AggregateFinal {
+        spec: PhysicalAggregateSpec,
+    },
+    Sort {
+        keys: Vec<PhysicalSortExpr>,
+    },
+    Limit {
+        spec: PhysicalLimitSpec,
+    },
+    ExchangeShuffle {
+        keys: Vec<String>,
+    },
     ExchangeBroadcast,
     Repartition,
-    Union,
+    Union {
+        operands: Vec<PhysicalUnionOperand>,
+        distinct: bool,
+    },
     Values,
 }
 
@@ -102,7 +137,7 @@ impl PhysicalOperator {
             PhysicalOperator::ExchangeShuffle { .. } => "ExchangeShuffle",
             PhysicalOperator::ExchangeBroadcast => "ExchangeBroadcast",
             PhysicalOperator::Repartition => "Repartition",
-            PhysicalOperator::Union => "Union",
+            PhysicalOperator::Union { .. } => "Union",
             PhysicalOperator::Values => "Values",
         }
     }

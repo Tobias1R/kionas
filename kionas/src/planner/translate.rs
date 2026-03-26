@@ -255,6 +255,7 @@ mod tests {
             }],
             limit: Some(5),
             offset: Some(2),
+            union: None,
             sql: "SELECT id, name FROM sales.public.users WHERE active = true".to_string(),
         };
 

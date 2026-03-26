@@ -1388,6 +1388,24 @@ fn collect_planning_relation_set(
         ));
     }
 
+    if let Some(union) = model.union.as_ref() {
+        for operand in &union.operands {
+            planning_relation_set.insert((
+                operand.namespace.database.clone(),
+                operand.namespace.schema.clone(),
+                operand.namespace.table.clone(),
+            ));
+
+            for join in &operand.joins {
+                planning_relation_set.insert((
+                    join.right.database.clone(),
+                    join.right.schema.clone(),
+                    join.right.table.clone(),
+                ));
+            }
+        }
+    }
+
     planning_relation_set
 }
 
@@ -1420,6 +1438,16 @@ fn collect_runtime_relation_set(
                 spec.right_relation.schema.clone(),
                 spec.right_relation.table.clone(),
             ));
+        }
+
+        if let PhysicalOperator::Union { operands, .. } = operator {
+            for operand in operands {
+                relation_set.insert((
+                    operand.relation.database.clone(),
+                    operand.relation.schema.clone(),
+                    operand.relation.table.clone(),
+                ));
+            }
         }
     }
 
@@ -1582,6 +1610,7 @@ fn build_canonical_query_payload_json(
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,
+        "union": model.union,
         "sql": model.sql,
         "logical_plan": {
             "engine": SELECT_PLAN_ENGINE_DATAFUSION,

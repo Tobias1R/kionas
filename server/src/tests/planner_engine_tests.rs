@@ -206,3 +206,87 @@ async fn planner_wrapper_translate_to_kionas_plan_matches_direct_function() {
 
     assert_eq!(wrapped, direct);
 }
+
+#[tokio::test]
+async fn translates_union_all_query_to_union_operator() {
+    let users = relation_metadata("sales", "public", "users");
+    let users_ca = relation_metadata("sales", "public", "users_ca");
+    let users_mx = relation_metadata("sales", "public", "users_mx");
+
+    let statements = parse_query(
+        "SELECT id FROM sales.public.users UNION ALL SELECT id FROM sales.public.users_ca UNION ALL SELECT id FROM sales.public.users_mx",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "sales", "public")
+        .expect("query model should build")
+        .model;
+
+    let plan = translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        &[users, users_ca, users_mx],
+    )
+    .await
+    .expect("union translation should succeed");
+
+    let union = plan
+        .operators
+        .iter()
+        .find_map(|op| match op {
+            kionas::planner::PhysicalOperator::Union { operands, distinct } => {
+                Some((operands, distinct))
+            }
+            _ => None,
+        })
+        .expect("translated plan should include union operator");
+
+    assert_eq!(union.0.len(), 3);
+    assert!(!(*union.1));
+    assert!(union.0[0].filter.is_none());
+    assert!(union.0[1].filter.is_none());
+    assert!(union.0[2].filter.is_none());
+}
+
+#[tokio::test]
+async fn translates_union_with_operand_where_filters() {
+    let customers = relation_metadata("bench", "seed1", "customers");
+
+    let statements = parse_query(
+        "SELECT id FROM bench.seed1.customers WHERE id <= 5 UNION ALL SELECT id FROM bench.seed1.customers WHERE id > 5 AND id <= 10 ORDER BY id",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let plan = translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        std::slice::from_ref(&customers),
+    )
+    .await
+    .expect("union translation should succeed");
+
+    let operands = plan
+        .operators
+        .iter()
+        .find_map(|op| match op {
+            kionas::planner::PhysicalOperator::Union { operands, .. } => Some(operands),
+            _ => None,
+        })
+        .expect("translated plan should include union operator");
+
+    assert_eq!(operands.len(), 2);
+    assert!(operands[0].filter.is_some());
+    assert!(operands[1].filter.is_some());
+}

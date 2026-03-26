@@ -1,0 +1,19 @@
+// Library re-exports for server crate - enables testing
+pub mod auth;
+pub mod auth_setup;
+pub mod consul;
+pub mod handlers;
+pub mod janitor;
+pub mod parser;
+pub mod planner;
+pub mod providers;
+pub mod server;
+pub mod services;
+pub mod session;
+pub mod statement_handler;
+pub mod tasks;
+pub mod tls;
+pub mod transactions;
+pub mod warehouse;
+pub mod workers;
+pub mod workers_pool;

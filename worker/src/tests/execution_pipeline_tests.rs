@@ -1,6 +1,6 @@
 use super::{
     ScanDecisionContext, ScanPruningDecisionFields, StageRuntimeTelemetryFields, StorageErrorClass,
-    build_empty_batch_from_relation_columns, classify_storage_error,
+    build_empty_batch_from_relation_columns, classify_storage_error, deduplicate_union_batches,
     format_exchange_io_decision_event, format_exchange_retry_decision_event,
     format_materialization_decision_event, format_scan_fallback_reason_event,
     format_scan_mode_chosen_event, format_scan_pruning_decision_event, format_stage_runtime_event,
@@ -88,6 +88,42 @@ fn single_value_batch(value: i64) -> RecordBatch {
         vec![Arc::new(Int64Array::from(vec![value])) as ArrayRef],
     )
     .expect("single-row batch should build")
+}
+
+#[test]
+fn deduplicate_union_batches_keeps_first_occurrence() {
+    let input = vec![
+        single_value_batch(1),
+        single_value_batch(1),
+        single_value_batch(2),
+    ];
+
+    let deduplicated =
+        deduplicate_union_batches(&input).expect("union distinct deduplication should succeed");
+    let row_count = deduplicated
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+
+    assert_eq!(row_count, 2);
+}
+
+#[test]
+fn deduplicate_union_batches_preserves_unique_rows() {
+    let input = vec![
+        single_value_batch(10),
+        single_value_batch(11),
+        single_value_batch(12),
+    ];
+
+    let deduplicated =
+        deduplicate_union_batches(&input).expect("union deduplication should succeed");
+    let row_count = deduplicated
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+
+    assert_eq!(row_count, 3);
 }
 
 #[derive(Debug, Clone)]

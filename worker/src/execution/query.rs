@@ -14,7 +14,7 @@ use url::Url;
 ///
 /// Output:
 /// - Structured namespace values used to compose deterministic result locations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct QueryNamespace {
     pub(crate) database: String,
     pub(crate) schema: String,

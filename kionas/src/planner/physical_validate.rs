@@ -220,6 +220,57 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         }
     }
 
+    let union_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::Union { .. }))
+        .count();
+    if union_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one union".to_string(),
+        ));
+    }
+
+    if let Some(union_index) = plan
+        .operators
+        .iter()
+        .position(|op| matches!(op, PhysicalOperator::Union { .. }))
+    {
+        if union_index == 0 {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "union must appear after table scan".to_string(),
+            ));
+        }
+
+        if union_index > projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "union must appear before projection".to_string(),
+            ));
+        }
+
+        if let Some(join_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+            && union_index > join_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "union must appear before hash join".to_string(),
+            ));
+        }
+
+        if let Some(aggregate_partial_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::AggregatePartial { .. }))
+            && union_index > aggregate_partial_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "union must appear before aggregate operators".to_string(),
+            ));
+        }
+    }
+
     if let Some(sort_index) = plan
         .operators
         .iter()
@@ -341,10 +392,29 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
                     "Repartition".to_string(),
                 ));
             }
-            PhysicalOperator::Union => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "Union".to_string(),
-                ));
+            PhysicalOperator::Union { operands, .. } => {
+                if operands.len() < 2 {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "union must include at least two operands".to_string(),
+                    ));
+                }
+
+                for operand in operands {
+                    if operand.relation.database.trim().is_empty()
+                        || operand.relation.schema.trim().is_empty()
+                        || operand.relation.table.trim().is_empty()
+                    {
+                        return Err(PlannerError::InvalidPhysicalPipeline(
+                            "union operand relation must be non-empty".to_string(),
+                        ));
+                    }
+
+                    if let Some(filter) = operand.filter.as_ref() {
+                        ensure_supported_predicate(&PhysicalExpr::Predicate {
+                            predicate: filter.clone(),
+                        })?;
+                    }
+                }
             }
             PhysicalOperator::Values => {
                 return Err(PlannerError::UnsupportedPhysicalOperator(
@@ -410,7 +480,6 @@ mod tests {
                 "ExchangeBroadcast".to_string(),
             ),
             (PhysicalOperator::Repartition, "Repartition".to_string()),
-            (PhysicalOperator::Union, "Union".to_string()),
             (PhysicalOperator::Values, "Values".to_string()),
         ];
 
@@ -565,6 +634,57 @@ mod tests {
             .insert(2, PhysicalOperator::AggregateFinal { spec });
 
         validate_physical_plan(&plan).expect("aggregate operators should be accepted");
+    }
+
+    #[test]
+    fn accepts_union_with_two_operands_before_projection() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Union {
+                operands: vec![
+                    crate::planner::PhysicalUnionOperand {
+                        relation: base_relation(),
+                        filter: None,
+                    },
+                    crate::planner::PhysicalUnionOperand {
+                        relation: LogicalRelation {
+                            database: "sales".to_string(),
+                            schema: "public".to_string(),
+                            table: "users_archive".to_string(),
+                        },
+                        filter: None,
+                    },
+                ],
+                distinct: false,
+            },
+        );
+
+        validate_physical_plan(&plan).expect("union operator should be accepted");
+    }
+
+    #[test]
+    fn rejects_union_with_less_than_two_operands() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::Union {
+                operands: vec![crate::planner::PhysicalUnionOperand {
+                    relation: base_relation(),
+                    filter: None,
+                }],
+                distinct: false,
+            },
+        );
+
+        let err =
+            validate_physical_plan(&plan).expect_err("union with single operand must be rejected");
+        assert_eq!(
+            err,
+            PlannerError::InvalidPhysicalPipeline(
+                "union must include at least two operands".to_string()
+            )
+        );
     }
 
     #[test]

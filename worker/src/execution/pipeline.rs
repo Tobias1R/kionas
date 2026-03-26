@@ -5,12 +5,12 @@ use crate::execution::artifacts::{persist_query_artifacts, persist_stage_exchang
 use crate::execution::join::apply_hash_join_pipeline;
 use crate::execution::planner::StageExecutionContext;
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
-use crate::execution::planner::{extract_runtime_plan, stage_execution_context};
+use crate::execution::planner::{RuntimeUnionSpec, extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
 use crate::execution::router::route_batch_from_output_partitioning;
 use crate::services::query_execution::{
     apply_filter_predicate_pipeline, apply_limit_pipeline, apply_projection_pipeline,
-    apply_sort_pipeline, normalize_batches_for_sort,
+    apply_sort_pipeline, normalize_batches_for_sort, resolve_schema_column_index,
 };
 use crate::services::worker_service_server::worker_service;
 use crate::state::SharedData;
@@ -24,10 +24,13 @@ use arrow::array::StringArray;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
 use bytes::Bytes;
+use kionas::planner::render_predicate_expr;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1390,6 +1393,18 @@ pub(crate) async fn execute_query_task(
         batches = apply_hash_join_pipeline(&batches, &right_batches, join_spec)?;
     }
 
+    if let Some(union_spec) = runtime_plan.union_spec.as_ref() {
+        batches = apply_union_pipeline(
+            shared,
+            &batches,
+            union_spec,
+            &decision_ctx,
+            &relation_columns_by_key,
+        )
+        .await
+        .map_err(|e| format!("{} [{}]", e, context_tag))?;
+    }
+
     if let Some(aggregate_partial_spec) = runtime_plan.aggregate_partial_spec.as_ref() {
         if stage_memory_metrics.enabled {
             log::info!(
@@ -1693,6 +1708,146 @@ fn build_empty_batch_from_relation_columns(
     let schema = std::sync::Arc::new(Schema::new(fields));
     RecordBatch::try_new(schema, arrays)
         .map_err(|e| format!("failed to build empty fallback record batch: {}", e))
+}
+
+async fn apply_union_pipeline(
+    shared: &SharedData,
+    primary_batches: &[RecordBatch],
+    union_spec: &RuntimeUnionSpec,
+    decision_ctx: &ScanDecisionContext<'_>,
+    relation_columns_by_key: &HashMap<String, Vec<String>>,
+) -> Result<Vec<RecordBatch>, String> {
+    if union_spec.operands.len() < 2 {
+        return Err("union requires at least two relations".to_string());
+    }
+
+    let mut all_batches = Vec::<RecordBatch>::new();
+    for (index, operand) in union_spec.operands.iter().enumerate() {
+        let mut batches = if index == 0 {
+            primary_batches.to_vec()
+        } else {
+            let prefix = source_table_staging_prefix(&operand.relation);
+            let mut loaded = load_scan_batches(
+                shared,
+                &prefix,
+                &RuntimeScanHints::full_scan(),
+                decision_ctx,
+            )
+            .await?;
+
+            let relation_key = relation_key(&operand.relation);
+            if let Some(columns) = relation_columns_by_key.get(relation_key.as_str()) {
+                loaded = apply_relation_column_names(&loaded, columns)?;
+            }
+
+            loaded
+        };
+
+        let rows_before = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+        if let Some(filter) = operand.filter.as_ref() {
+            log::info!(
+                "UNION operand {} applying filter: {}",
+                index,
+                render_predicate_expr(filter)
+            );
+            batches = apply_filter_predicate_pipeline(&batches, filter, None)?;
+            let rows_after = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            log::info!(
+                "UNION operand {} rows_before={} rows_after={}",
+                index,
+                rows_before,
+                rows_after
+            );
+            if let Some(summary) = summarize_union_operand_values(&batches) {
+                log::info!("UNION operand {} value summary: {}", index, summary);
+            }
+        } else {
+            log::info!(
+                "UNION operand {} has no filter rows_before={}",
+                index,
+                rows_before
+            );
+        }
+
+        all_batches.extend(batches);
+    }
+
+    if union_spec.distinct {
+        return deduplicate_union_batches(&all_batches);
+    }
+
+    Ok(all_batches)
+}
+
+fn summarize_union_operand_values(batches: &[RecordBatch]) -> Option<String> {
+    let mut unique_values = HashSet::<String>::new();
+    let mut sample_values = Vec::<String>::new();
+    let mut total_rows = 0usize;
+    let mut selected_column_name: Option<String> = None;
+
+    for batch in batches {
+        let Some(column_idx) = resolve_schema_column_index(batch.schema().as_ref(), "id")
+            .or_else(|| resolve_schema_column_index(batch.schema().as_ref(), "c1"))
+        else {
+            continue;
+        };
+
+        if selected_column_name.is_none() {
+            selected_column_name = Some(batch.schema().field(column_idx).name().to_string());
+        }
+
+        let column = batch.column(column_idx);
+        for row_idx in 0..batch.num_rows() {
+            total_rows += 1;
+            let rendered = array_value_to_string(column.as_ref(), row_idx)
+                .unwrap_or_else(|_| "<render-error>".to_string());
+            if unique_values.insert(rendered.clone()) && sample_values.len() < 8 {
+                sample_values.push(rendered);
+            }
+        }
+    }
+
+    selected_column_name.map(|name| {
+        format!(
+            "column={} total_rows={} unique_values={} sample={:?}",
+            name,
+            total_rows,
+            unique_values.len(),
+            sample_values
+        )
+    })
+}
+
+fn deduplicate_union_batches(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, String> {
+    let mut seen = HashSet::<String>::new();
+    let mut output = Vec::<RecordBatch>::new();
+
+    for batch in batches {
+        let mut keep_mask = Vec::<bool>::with_capacity(batch.num_rows());
+        for row_index in 0..batch.num_rows() {
+            let mut key = String::new();
+            for (col_index, column) in batch.columns().iter().enumerate() {
+                if col_index > 0 {
+                    key.push('|');
+                }
+                let rendered = array_value_to_string(column.as_ref(), row_index)
+                    .map_err(|e| format!("failed to stringify union row value: {}", e))?;
+                key.push_str(rendered.as_str());
+            }
+            let is_new = seen.insert(key);
+            keep_mask.push(is_new);
+        }
+
+        if keep_mask.iter().any(|keep| *keep) {
+            let mask = BooleanArray::from(keep_mask);
+            let filtered = filter_record_batch(batch, &mask)
+                .map_err(|e| format!("failed to filter deduplicated union rows: {}", e))?;
+            output.push(filtered);
+        }
+    }
+
+    Ok(output)
 }
 
 /// What: Parse exchange partition index from a stage artifact key.

@@ -14,6 +14,7 @@
 - Work through each checklist item systematically.
 - Keep communication concise and focused.
 - Follow development best practices.
+- Add $env:CARGO_TERM_PROGRESS_WHEN='never'; to powershell profile to disable cargo progress bars.
 
 # Rust Development Rules for AI Agents
 

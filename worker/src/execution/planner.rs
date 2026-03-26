@@ -289,12 +289,25 @@ pub(crate) struct RuntimePlan {
     pub(crate) filter_predicate: Option<PredicateExpr>,
     pub(crate) schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
     pub(crate) join_spec: Option<PhysicalJoinSpec>,
+    pub(crate) union_spec: Option<RuntimeUnionSpec>,
     pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
     pub(crate) aggregate_final_spec: Option<PhysicalAggregateSpec>,
     pub(crate) projection_exprs: Vec<PhysicalExpr>,
     pub(crate) sort_exprs: Vec<PhysicalSortExpr>,
     pub(crate) limit_spec: Option<PhysicalLimitSpec>,
     pub(crate) has_materialize: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeUnionSpec {
+    pub(crate) operands: Vec<RuntimeUnionOperand>,
+    pub(crate) distinct: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeUnionOperand {
+    pub(crate) relation: crate::execution::query::QueryNamespace,
+    pub(crate) filter: Option<PredicateExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +451,7 @@ pub(crate) fn extract_runtime_plan(
 
     let mut plan_filter_predicate = None;
     let mut join_spec = None;
+    let mut union_spec = None;
     let mut aggregate_partial_spec = None;
     let mut aggregate_final_spec = None;
     let mut projection_exprs = Vec::new();
@@ -463,6 +477,32 @@ pub(crate) fn extract_runtime_plan(
             }
             PhysicalOperator::HashJoin { spec } => {
                 join_spec = Some(spec);
+            }
+            PhysicalOperator::Union { operands, distinct } => {
+                let operand_filter_count = operands
+                    .iter()
+                    .filter(|operand| operand.filter.is_some())
+                    .count();
+                log::info!(
+                    "Detected UNION runtime operator: operands={} filtered_operands={} distinct={}",
+                    operands.len(),
+                    operand_filter_count,
+                    distinct
+                );
+                union_spec = Some(RuntimeUnionSpec {
+                    operands: operands
+                        .iter()
+                        .map(|operand| RuntimeUnionOperand {
+                            relation: crate::execution::query::QueryNamespace {
+                                database: operand.relation.database.clone(),
+                                schema: operand.relation.schema.clone(),
+                                table: operand.relation.table.clone(),
+                            },
+                            filter: operand.filter.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                    distinct,
+                });
             }
             PhysicalOperator::AggregatePartial { spec } => {
                 aggregate_partial_spec = Some(spec);
@@ -522,6 +562,7 @@ pub(crate) fn extract_runtime_plan(
         filter_predicate,
         schema_metadata,
         join_spec,
+        union_spec,
         aggregate_partial_spec,
         aggregate_final_spec,
         projection_exprs,

@@ -95,3 +95,67 @@ fn extract_runtime_plan_rejects_invalid_execution_plan_bytes() {
         .expect_err("invalid execution_plan bytes must be rejected with actionable error");
     assert!(err.contains("invalid execution_plan payload"));
 }
+
+#[test]
+fn extract_runtime_plan_decodes_union_operator() {
+    let mut task = build_query_task();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "sales", "schema": "public", "table": "users"}}},
+        {"Union": {
+            "operands": [
+                {"relation": {"database": "sales", "schema": "public", "table": "users"}},
+                {"relation": {"database": "sales", "schema": "public", "table": "users_archive"}}
+            ],
+            "distinct": true
+        }},
+        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan = extract_runtime_plan(&task)
+        .expect("runtime planner should decode union operator from execution_plan bytes");
+    let union = plan.union_spec.expect("union metadata should be present");
+    assert_eq!(union.operands.len(), 2);
+    assert!(union.distinct);
+    assert_eq!(union.operands[1].relation.table, "users_archive");
+}
+
+#[test]
+fn extract_runtime_plan_decodes_union_operand_filters() {
+    let mut task = build_query_task();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "bench", "schema": "seed1", "table": "customers"}}},
+        {"Union": {
+            "operands": [
+                {
+                    "relation": {"database": "bench", "schema": "seed1", "table": "customers"},
+                    "filter": {"Comparison": {"column": "id", "op": "Le", "value": {"Int": 5}}}
+                },
+                {
+                    "relation": {"database": "bench", "schema": "seed1", "table": "customers"},
+                    "filter": {
+                        "Conjunction": {
+                            "clauses": [
+                                {"Comparison": {"column": "id", "op": "Gt", "value": {"Int": 5}}},
+                                {"Comparison": {"column": "id", "op": "Le", "value": {"Int": 10}}}
+                            ]
+                        }
+                    }
+                }
+            ],
+            "distinct": false
+        }},
+        {"Projection": {"expressions": [{"Raw": {"sql": "id"}}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan =
+        extract_runtime_plan(&task).expect("runtime planner should decode union operand filters");
+    let union = plan.union_spec.expect("union metadata should be present");
+
+    assert_eq!(union.operands.len(), 2);
+    assert!(union.operands[0].filter.is_some());
+    assert!(union.operands[1].filter.is_some());
+}
