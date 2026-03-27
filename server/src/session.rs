@@ -288,6 +288,12 @@ impl SessionManager {
     }
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Helper: find a Warehouse by its name in shared state
 // Returns a cloned `Warehouse` if found.
 pub async fn find_warehouse_by_name(

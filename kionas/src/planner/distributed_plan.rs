@@ -142,13 +142,19 @@ fn infer_partition_spec_for_boundary(
             .iter()
             .rev()
             .find_map(|operator| match operator {
-                PhysicalOperator::AggregatePartial { spec } => Some(PartitionSpec::Hash {
-                    keys: spec
-                        .grouping_exprs
-                        .iter()
-                        .map(partition_key_for_expr)
-                        .collect::<Vec<_>>(),
-                }),
+                PhysicalOperator::AggregatePartial { spec } => {
+                    if spec.grouping_exprs.is_empty() {
+                        Some(PartitionSpec::Single)
+                    } else {
+                        Some(PartitionSpec::Hash {
+                            keys: spec
+                                .grouping_exprs
+                                .iter()
+                                .map(partition_key_for_expr)
+                                .collect::<Vec<_>>(),
+                        })
+                    }
+                }
                 _ => None,
             })
             .unwrap_or(PartitionSpec::Single),

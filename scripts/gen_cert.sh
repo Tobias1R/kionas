@@ -1,6 +1,6 @@
 #!/bin/bash
 # gen_cert.sh - Generate a signed certificate for a service (server, worker, etc.)
-# Usage: ./gen_cert.sh /workspace/certs/Kionas-RootCA/Kionas-RootCA.crt /workspace/certs/Kionas-RootCA/Kionas-RootCA.key kionas certs/kionas
+# Usage: ./gen_cert.sh /workspace/certs/Kionas-RootCA/Kionas-RootCA.crt /workspace/certs/Kionas-RootCA/Kionas-RootCA.key kionas-worker3 certs/Kionas-RootCA
 
 set -e
 

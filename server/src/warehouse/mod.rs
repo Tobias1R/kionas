@@ -108,3 +108,9 @@ impl WarehouseManager {
         None
     }
 }
+
+impl Default for WarehouseManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -4,7 +4,7 @@ use crate::planner::logical_plan::{
     LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };
 use crate::planner::{AggregateFunction, LogicalAggregateExpr};
-use crate::sql::query_model::SelectQueryModel;
+use crate::sql::query_model::{SelectQueryModel, primary_relation_dependency};
 
 fn normalize_identifier(raw: &str) -> String {
     raw.trim()
@@ -159,6 +159,10 @@ fn parse_projection_aggregates(
 pub fn build_logical_plan_from_select_model(
     model: &SelectQueryModel,
 ) -> Result<LogicalPlan, PlannerError> {
+    let relation = primary_relation_dependency(model).ok_or_else(|| {
+        PlannerError::InvalidLogicalPlan("query model has no relation dependencies".to_string())
+    })?;
+
     let projection_exprs = model
         .projection
         .iter()
@@ -173,9 +177,9 @@ pub fn build_logical_plan_from_select_model(
 
     let plan = LogicalPlan {
         relation: LogicalRelation {
-            database: model.namespace.database.clone(),
-            schema: model.namespace.schema.clone(),
-            table: model.namespace.table.clone(),
+            database: relation.database.clone(),
+            schema: relation.schema.clone(),
+            table: relation.table.clone(),
         },
         projection: LogicalProjection {
             expressions: projection_exprs,
@@ -231,7 +235,7 @@ pub fn build_logical_plan_from_select_model(
 #[cfg(test)]
 mod tests {
     use super::build_logical_plan_from_select_model;
-    use crate::sql::query_model::{QueryNamespace, SelectQueryModel, SortSpec};
+    use crate::sql::query_model::{QueryFromSpec, QueryNamespace, SelectQueryModel, SortSpec};
 
     #[test]
     fn builds_plan_from_select_model() {
@@ -239,11 +243,13 @@ mod tests {
             version: 1,
             statement: "Select".to_string(),
             session_id: "s1".to_string(),
-            namespace: QueryNamespace {
-                database: "sales".to_string(),
-                schema: "public".to_string(),
-                table: "users".to_string(),
-                raw: "sales.public.users".to_string(),
+            from: QueryFromSpec::Table {
+                namespace: QueryNamespace {
+                    database: "sales".to_string(),
+                    schema: "public".to_string(),
+                    table: "users".to_string(),
+                    raw: "sales.public.users".to_string(),
+                },
             },
             projection: vec!["id".to_string(), "name".to_string()],
             selection: Some("active = true".to_string()),
@@ -255,6 +261,13 @@ mod tests {
             }],
             limit: Some(5),
             offset: Some(2),
+            ctes: Vec::new(),
+            relation_dependencies: vec![QueryNamespace {
+                database: "sales".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+                raw: "sales.public.users".to_string(),
+            }],
             union: None,
             sql: "SELECT id, name FROM sales.public.users WHERE active = true".to_string(),
         };

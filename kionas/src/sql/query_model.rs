@@ -100,6 +100,41 @@ pub struct QueryJoinSpec {
     pub keys: Vec<QueryJoinKey>,
 }
 
+/// What: Canonical FROM source shape for SELECT query-model payloads.
+///
+/// Inputs:
+/// - Variant selected during SQL AST extraction.
+///
+/// Output:
+/// - Stable source descriptor consumed by server planning and diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QueryFromSpec {
+    Table {
+        namespace: QueryNamespace,
+    },
+    Derived {
+        alias: Option<String>,
+        query: Box<SelectQueryModel>,
+    },
+    CteRef {
+        name: String,
+    },
+}
+
+/// What: Canonical CTE payload entry with nested query model.
+///
+/// Inputs:
+/// - `name`: CTE identifier as referenced by the outer query.
+/// - `query`: Nested canonical SELECT query model for the CTE body.
+///
+/// Output:
+/// - Serializable CTE model entry attached to top-level SELECT payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryCteSpec {
+    pub name: String,
+    pub query: Box<SelectQueryModel>,
+}
+
 /// What: Shared semantic model for a minimal SELECT query.
 ///
 /// Inputs:
@@ -120,7 +155,7 @@ pub struct SelectQueryModel {
     pub version: u8,
     pub statement: String,
     pub session_id: String,
-    pub namespace: QueryNamespace,
+    pub from: QueryFromSpec,
     pub projection: Vec<String>,
     pub selection: Option<String>,
     pub joins: Vec<QueryJoinSpec>,
@@ -128,6 +163,10 @@ pub struct SelectQueryModel {
     pub order_by: Vec<SortSpec>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    #[serde(default)]
+    pub ctes: Vec<QueryCteSpec>,
+    #[serde(default)]
+    pub relation_dependencies: Vec<QueryNamespace>,
     #[serde(default)]
     pub union: Option<QueryUnionSpec>,
     pub sql: String,
@@ -509,37 +548,270 @@ fn extract_union_select_operands(
     }
 }
 
-fn build_select_query_dispatch_model_from_select(
+fn merge_relation_dependencies(
+    current: &mut Vec<QueryNamespace>,
+    incoming: impl IntoIterator<Item = QueryNamespace>,
+) {
+    for dependency in incoming {
+        let exists = current.iter().any(|item| {
+            item.database == dependency.database
+                && item.schema == dependency.schema
+                && item.table == dependency.table
+        });
+        if !exists {
+            current.push(dependency);
+        }
+    }
+}
+
+fn collect_subquery_dependencies_from_expr(
+    expr: &Expr,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<Vec<QueryNamespace>, QueryModelError> {
+    let mut dependencies = Vec::<QueryNamespace>::new();
+
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    left,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    right,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    expr,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    expr,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    low,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    high,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+        }
+        Expr::InList { expr, list, .. } => {
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    expr,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+
+            for item in list {
+                merge_relation_dependencies(
+                    &mut dependencies,
+                    collect_subquery_dependencies_from_expr(
+                        item,
+                        session_id,
+                        default_database,
+                        default_schema,
+                    )?,
+                );
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            merge_relation_dependencies(
+                &mut dependencies,
+                collect_subquery_dependencies_from_expr(
+                    expr,
+                    session_id,
+                    default_database,
+                    default_schema,
+                )?,
+            );
+            let sub_model = build_select_query_model_from_query(
+                subquery,
+                session_id,
+                default_database,
+                default_schema,
+            )?;
+            merge_relation_dependencies(&mut dependencies, sub_model.relation_dependencies);
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            let sub_model = build_select_query_model_from_query(
+                subquery,
+                session_id,
+                default_database,
+                default_schema,
+            )?;
+            merge_relation_dependencies(&mut dependencies, sub_model.relation_dependencies);
+        }
+        _ => {}
+    }
+
+    Ok(dependencies)
+}
+
+fn build_from_spec_and_dependencies(
+    factor: &TableFactor,
+    cte_names: &std::collections::HashSet<String>,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<(QueryFromSpec, Vec<QueryNamespace>), QueryModelError> {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            let table_name = name.to_string();
+            let parts = parse_object_parts(table_name.as_str());
+            if parts.len() == 1 {
+                let candidate = parts[0].clone();
+                if cte_names.contains(candidate.as_str()) {
+                    return Ok((
+                        QueryFromSpec::CteRef { name: candidate },
+                        Vec::<QueryNamespace>::new(),
+                    ));
+                }
+            }
+
+            let (database, schema, table) =
+                canonicalize_table_namespace(&table_name, default_database, default_schema);
+            let namespace = QueryNamespace {
+                database,
+                schema,
+                table,
+                raw: table_name,
+            };
+            Ok((
+                QueryFromSpec::Table {
+                    namespace: namespace.clone(),
+                },
+                vec![namespace],
+            ))
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let sub_model = build_select_query_model_from_query(
+                subquery,
+                session_id,
+                default_database,
+                default_schema,
+            )?;
+            Ok((
+                QueryFromSpec::Derived {
+                    alias: alias
+                        .as_ref()
+                        .map(|table_alias| normalize_identifier(table_alias.name.value.as_str())),
+                    query: Box::new(sub_model.clone()),
+                },
+                sub_model.relation_dependencies,
+            ))
+        }
+        _ => Err(QueryModelError::UnsupportedTableFactor),
+    }
+}
+
+fn build_select_query_model_from_select(
     select: &Select,
     canonical_sql: String,
     session_id: &str,
     default_database: &str,
     default_schema: &str,
-) -> Result<SelectQueryDispatchModel, QueryModelError> {
+    ctes: Vec<QueryCteSpec>,
+    cte_names: &std::collections::HashSet<String>,
+) -> Result<SelectQueryModel, QueryModelError> {
     if select.from.len() != 1 {
         return Err(QueryModelError::UnsupportedMultiTableFrom);
     }
 
     let from = &select.from[0];
-    let table_name = match &from.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
-        _ => return Err(QueryModelError::UnsupportedTableFactor),
-    };
+    let (from_spec, mut relation_dependencies) = build_from_spec_and_dependencies(
+        &from.relation,
+        cte_names,
+        session_id,
+        default_database,
+        default_schema,
+    )?;
 
-    let (database, schema, table) =
-        canonicalize_table_namespace(&table_name, default_database, default_schema);
+    for join in &from.joins {
+        if let TableFactor::Table { name, .. } = &join.relation {
+            let table_name = name.to_string();
+            let (database, schema, table) =
+                canonicalize_table_namespace(&table_name, default_database, default_schema);
+            merge_relation_dependencies(
+                &mut relation_dependencies,
+                [QueryNamespace {
+                    database,
+                    schema,
+                    table,
+                    raw: table_name,
+                }],
+            );
+        }
+    }
+
+    if let Some(selection) = select.selection.as_ref() {
+        let subquery_dependencies = collect_subquery_dependencies_from_expr(
+            selection,
+            session_id,
+            default_database,
+            default_schema,
+        )?;
+        merge_relation_dependencies(&mut relation_dependencies, subquery_dependencies);
+    }
+
+    for cte in &ctes {
+        merge_relation_dependencies(
+            &mut relation_dependencies,
+            cte.query.relation_dependencies.iter().cloned(),
+        );
+    }
 
     let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
-    let model = SelectQueryModel {
+    Ok(SelectQueryModel {
         version: QUERY_PAYLOAD_VERSION,
         statement: "Select".to_string(),
         session_id: session_id.to_string(),
-        namespace: QueryNamespace {
-            database: database.clone(),
-            schema: schema.clone(),
-            table: table.clone(),
-            raw: table_name,
-        },
+        from: from_spec,
         projection: select
             .projection
             .iter()
@@ -554,16 +826,137 @@ fn build_select_query_dispatch_model_from_select(
         order_by: parse_order_by_from_sql(canonical_sql.as_str()),
         limit,
         offset,
+        ctes,
+        relation_dependencies,
         union: None,
         sql: canonical_sql,
-    };
-
-    Ok(SelectQueryDispatchModel {
-        model,
-        database,
-        schema,
-        table,
     })
+}
+
+fn build_select_query_model_from_query(
+    query: &SqlQuery,
+    session_id: &str,
+    default_database: &str,
+    default_schema: &str,
+) -> Result<SelectQueryModel, QueryModelError> {
+    let cte_names = query
+        .with
+        .as_ref()
+        .map(|with_clause| {
+            with_clause
+                .cte_tables
+                .iter()
+                .map(|cte| normalize_identifier(cte.alias.name.value.as_str()))
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut ctes = Vec::<QueryCteSpec>::new();
+    if let Some(with_clause) = query.with.as_ref() {
+        for cte in &with_clause.cte_tables {
+            let cte_model = build_select_query_model_from_query(
+                cte.query.as_ref(),
+                session_id,
+                default_database,
+                default_schema,
+            )?;
+            ctes.push(QueryCteSpec {
+                name: normalize_identifier(cte.alias.name.value.as_str()),
+                query: Box::new(cte_model),
+            });
+        }
+    }
+
+    match query.body.as_ref() {
+        SetExpr::Select(select) => build_select_query_model_from_select(
+            select.as_ref(),
+            query.to_string(),
+            session_id,
+            default_database,
+            default_schema,
+            ctes,
+            &cte_names,
+        ),
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            ..
+        } => {
+            let mut union_distinct_flags = Vec::<bool>::new();
+            let mut operand_selects = Vec::<Select>::new();
+            extract_union_select_operands(
+                query.body.as_ref(),
+                &mut union_distinct_flags,
+                &mut operand_selects,
+            )?;
+
+            if operand_selects.len() < 2 {
+                return Err(QueryModelError::UnsupportedSetOperation);
+            }
+
+            let mut operand_models = Vec::<SelectQueryModel>::with_capacity(operand_selects.len());
+            for operand_select in &operand_selects {
+                let operand_model = build_select_query_model_from_select(
+                    operand_select,
+                    operand_select.to_string(),
+                    session_id,
+                    default_database,
+                    default_schema,
+                    Vec::new(),
+                    &std::collections::HashSet::new(),
+                )?;
+                operand_models.push(operand_model);
+            }
+
+            let first_projection = operand_models
+                .first()
+                .map(|model| model.projection.len())
+                .unwrap_or_default();
+            for (index, operand) in operand_models.iter().enumerate().skip(1) {
+                if operand.projection.len() != first_projection {
+                    return Err(QueryModelError::UnionOperandSchemaMismatch(format!(
+                        "operand {} has {} projection expressions, expected {}",
+                        index,
+                        operand.projection.len(),
+                        first_projection
+                    )));
+                }
+            }
+
+            let mut root_model = build_select_query_model_from_select(
+                operand_selects
+                    .first()
+                    .ok_or(QueryModelError::UnsupportedSetOperation)?,
+                query.to_string(),
+                session_id,
+                default_database,
+                default_schema,
+                ctes,
+                &cte_names,
+            )?;
+
+            let (root_limit, root_offset) = parse_limit_offset_from_sql(root_model.sql.as_str())?;
+            root_model.selection = None;
+            root_model.joins.clear();
+            root_model.group_by = parse_group_by_from_sql(root_model.sql.as_str());
+            root_model.order_by = parse_order_by_from_sql(root_model.sql.as_str());
+            root_model.limit = root_limit;
+            root_model.offset = root_offset;
+            root_model.union = Some(QueryUnionSpec {
+                operands: operand_models,
+                distinct: union_distinct_flags.iter().any(|flag| *flag),
+            });
+
+            for cte in &root_model.ctes {
+                merge_relation_dependencies(
+                    &mut root_model.relation_dependencies,
+                    cte.query.relation_dependencies.iter().cloned(),
+                );
+            }
+
+            Ok(root_model)
+        }
+        _ => Err(QueryModelError::UnsupportedSetOperation),
+    }
 }
 
 fn parse_join_column_ref(expr: &Expr) -> Result<String, QueryModelError> {
@@ -684,7 +1077,7 @@ pub async fn build_select_query_dispatch_envelope(
         "version": model.version,
         "statement": model.statement,
         "session_id": model.session_id,
-        "namespace": model.namespace,
+        "from": model.from,
         "projection": model.projection,
         "selection": model.selection,
         "joins": model.joins,
@@ -692,6 +1085,8 @@ pub async fn build_select_query_dispatch_envelope(
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,
+        "ctes": model.ctes,
+        "relation_dependencies": model.relation_dependencies,
         "union": model.union,
         "sql": model.sql,
     })
@@ -721,91 +1116,38 @@ pub fn build_select_query_model(
     default_database: &str,
     default_schema: &str,
 ) -> Result<SelectQueryDispatchModel, QueryModelError> {
-    let canonical_sql = query.to_string();
-    match query.body.as_ref() {
-        SetExpr::Select(select) => build_select_query_dispatch_model_from_select(
-            select.as_ref(),
-            canonical_sql,
-            session_id,
-            default_database,
-            default_schema,
-        ),
-        SetExpr::SetOperation {
-            op: SetOperator::Union,
-            ..
-        } => {
-            let mut union_distinct_flags = Vec::<bool>::new();
-            let mut operand_selects = Vec::<Select>::new();
-            extract_union_select_operands(
-                query.body.as_ref(),
-                &mut union_distinct_flags,
-                &mut operand_selects,
-            )?;
+    let model =
+        build_select_query_model_from_query(query, session_id, default_database, default_schema)?;
 
-            if operand_selects.len() < 2 {
-                return Err(QueryModelError::UnsupportedSetOperation);
-            }
+    let primary = model
+        .relation_dependencies
+        .first()
+        .cloned()
+        .ok_or(QueryModelError::UnsupportedTableFactor)?;
 
-            let mut operand_models = Vec::<SelectQueryModel>::with_capacity(operand_selects.len());
-            for operand_select in &operand_selects {
-                let operand_dispatch = build_select_query_dispatch_model_from_select(
-                    operand_select,
-                    operand_select.to_string(),
-                    session_id,
-                    default_database,
-                    default_schema,
-                )?;
-                operand_models.push(operand_dispatch.model);
-            }
+    Ok(SelectQueryDispatchModel {
+        model,
+        database: primary.database,
+        schema: primary.schema,
+        table: primary.table,
+    })
+}
 
-            let first_projection = operand_models
-                .first()
-                .map(|model| model.projection.len())
-                .unwrap_or_default();
-            for (index, operand) in operand_models.iter().enumerate().skip(1) {
-                if operand.projection.len() != first_projection {
-                    return Err(QueryModelError::UnionOperandSchemaMismatch(format!(
-                        "operand {} has {} projection expressions, expected {}",
-                        index,
-                        operand.projection.len(),
-                        first_projection
-                    )));
-                }
-            }
-
-            let mut root_dispatch = build_select_query_dispatch_model_from_select(
-                operand_selects
-                    .first()
-                    .ok_or(QueryModelError::UnsupportedSetOperation)?,
-                canonical_sql.clone(),
-                session_id,
-                default_database,
-                default_schema,
-            )?;
-
-            let (root_limit, root_offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
-            root_dispatch.model.selection = None;
-            root_dispatch.model.joins.clear();
-            root_dispatch.model.group_by = parse_group_by_from_sql(canonical_sql.as_str());
-            root_dispatch.model.order_by = parse_order_by_from_sql(canonical_sql.as_str());
-            root_dispatch.model.limit = root_limit;
-            root_dispatch.model.offset = root_offset;
-            root_dispatch.model.union = Some(QueryUnionSpec {
-                operands: operand_models,
-                distinct: union_distinct_flags.iter().any(|flag| *flag),
-            });
-            root_dispatch.model.sql = canonical_sql;
-
-            Ok(root_dispatch)
-        }
-        _ => Err(QueryModelError::UnsupportedSetOperation),
-    }
+/// What: Resolve the primary physical relation dependency used by legacy planner surfaces.
+///
+/// Inputs:
+/// - `model`: Canonical SELECT query model.
+///
+/// Output:
+/// - First canonical physical table dependency when present.
+pub fn primary_relation_dependency(model: &SelectQueryModel) -> Option<&QueryNamespace> {
+    model.relation_dependencies.first()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+        QueryFromSpec, QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
         VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
         VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE, build_select_query_dispatch_envelope,
         build_select_query_model, validation_code_for_query_error,
@@ -1125,9 +1467,9 @@ mod tests {
         let union = model.union.expect("union spec should be present");
         assert_eq!(union.operands.len(), 3);
         assert!(!union.distinct);
-        assert_eq!(union.operands[0].namespace.table, "users");
-        assert_eq!(union.operands[1].namespace.table, "users_ca");
-        assert_eq!(union.operands[2].namespace.table, "users_mx");
+        assert_eq!(union.operands[0].relation_dependencies[0].table, "users");
+        assert_eq!(union.operands[1].relation_dependencies[0].table, "users_ca");
+        assert_eq!(union.operands[2].relation_dependencies[0].table, "users_mx");
     }
 
     #[test]
@@ -1175,5 +1517,85 @@ mod tests {
             err,
             QueryModelError::UnionOperandSchemaMismatch(_)
         ));
+    }
+
+    #[test]
+    fn builds_model_for_derived_table_source() {
+        let statements =
+            parse_query("SELECT id FROM (SELECT id, name FROM sales.public.users) t WHERE id > 10")
+                .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert!(matches!(model.from, QueryFromSpec::Derived { .. }));
+        assert!(
+            model
+                .relation_dependencies
+                .iter()
+                .any(|dep| dep.table == "users")
+        );
+    }
+
+    #[test]
+    fn builds_model_for_cte_source_and_dependencies() {
+        let statements = parse_query(
+            "WITH order_counts AS (SELECT customer_id FROM sales.public.orders) SELECT customer_id FROM order_counts",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.ctes.len(), 1);
+        assert!(matches!(model.from, QueryFromSpec::CteRef { .. }));
+        assert!(
+            model
+                .relation_dependencies
+                .iter()
+                .any(|dep| dep.table == "orders")
+        );
+    }
+
+    #[test]
+    fn collects_in_subquery_dependencies() {
+        let statements = parse_query(
+            "SELECT id FROM sales.public.users WHERE id IN (SELECT user_id FROM sales.public.orders)",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert!(
+            model
+                .relation_dependencies
+                .iter()
+                .any(|dep| dep.table == "users")
+        );
+        assert!(
+            model
+                .relation_dependencies
+                .iter()
+                .any(|dep| dep.table == "orders")
+        );
     }
 }

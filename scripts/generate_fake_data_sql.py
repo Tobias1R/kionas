@@ -110,7 +110,7 @@ def build_products(row_count: int, rng: random.Random) -> list[str]:
 
 def build_orders(row_count: int, rng: random.Random) -> list[str]:
     rows = []
-    for idx in range(1, row_count + 1):
+    for idx in range(1, row_count * 2 + 1):
         customer_id = rng.randint(1, row_count)
         product_id = rng.randint(1, row_count)
         quantity = rng.randint(1, 8)
@@ -286,3 +286,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# sample usage:
+# python scripts/generate_fake_data_sql.py --output scripts/generated_fake_data_v2.sql --warehouse compute_small --database bench2 --schema seed1 --rows 1000000 --batch-size 2000 --seed 42

@@ -8,7 +8,7 @@ use kionas::planner::{
     PhysicalAggregateSpec, PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
     PhysicalSortExpr, PhysicalUnionOperand, parse_predicate_sql, validate_physical_plan,
 };
-use kionas::sql::query_model::SelectQueryModel;
+use kionas::sql::query_model::{QueryFromSpec, SelectQueryModel, primary_relation_dependency};
 use std::sync::Arc;
 
 /// What: Thin server-side wrapper for DataFusion planning operations.
@@ -282,6 +282,14 @@ pub async fn translate_datafusion_to_kionas_physical_plan_with_providers(
         Err(err) => {
             let message = err.to_string();
             if is_fallback_eligible_datafusion_error(&message) {
+                if requires_strict_datafusion_planning(model)
+                    && !is_object_store_registration_error(&message)
+                {
+                    return Err(PlannerError::InvalidLogicalPlan(format!(
+                        "subquery/CTE query requires DataFusion planning and cannot use SQL-text fallback: {}",
+                        message
+                    )));
+                }
                 let intent = derive_intent_from_sql_text(&model.sql);
                 return build_kionas_plan_from_intent(model, intent);
             }
@@ -300,6 +308,14 @@ pub async fn translate_datafusion_to_kionas_physical_plan_with_providers(
         Err(err) => {
             let message = err.to_string();
             if is_fallback_eligible_datafusion_error(&message) {
+                if requires_strict_datafusion_planning(model)
+                    && !is_object_store_registration_error(&message)
+                {
+                    return Err(PlannerError::InvalidPhysicalPipeline(format!(
+                        "subquery/CTE query requires DataFusion physical planning and cannot use SQL-text fallback: {}",
+                        message
+                    )));
+                }
                 let intent = derive_intent_from_sql_text(&model.sql);
                 return build_kionas_plan_from_intent(model, intent);
             }
@@ -322,6 +338,28 @@ fn is_fallback_eligible_datafusion_error(message: &str) -> bool {
     (lower.contains("table") && lower.contains("not found"))
         || (lower.contains("no suitable object store found")
             || lower.contains("register_object_store"))
+}
+
+fn is_object_store_registration_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no suitable object store found") || lower.contains("register_object_store")
+}
+
+fn requires_strict_datafusion_planning(model: &SelectQueryModel) -> bool {
+    !matches!(model.from, QueryFromSpec::Table { .. }) || !model.ctes.is_empty()
+}
+
+fn translation_source_model(model: &SelectQueryModel) -> &SelectQueryModel {
+    if let QueryFromSpec::CteRef { name } = &model.from
+        && let Some(cte) = model
+            .ctes
+            .iter()
+            .find(|cte| cte.name.eq_ignore_ascii_case(name))
+    {
+        return cte.query.as_ref();
+    }
+
+    model
 }
 
 fn collect_exec_node_names(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
@@ -718,6 +756,13 @@ fn build_kionas_plan_from_intent(
     model: &SelectQueryModel,
     intent: PlannerIntentFlags,
 ) -> Result<PhysicalPlan, PlannerError> {
+    let source_model = translation_source_model(model);
+    let primary_relation = primary_relation_dependency(source_model).ok_or_else(|| {
+        PlannerError::InvalidPhysicalPipeline(
+            "query model has no relation dependencies for table scan translation".to_string(),
+        )
+    })?;
+
     let has_scan = intent.has_scan;
     let has_filter = intent.has_filter;
     let has_projection = intent.has_projection || !model.projection.is_empty();
@@ -754,9 +799,9 @@ fn build_kionas_plan_from_intent(
         let mut operators = Vec::<PhysicalOperator>::new();
         operators.push(PhysicalOperator::TableScan {
             relation: LogicalRelation {
-                database: model.namespace.database.clone(),
-                schema: model.namespace.schema.clone(),
-                table: model.namespace.table.clone(),
+                database: primary_relation.database.clone(),
+                schema: primary_relation.schema.clone(),
+                table: primary_relation.table.clone(),
             },
         });
         operators.push(PhysicalOperator::Union {
@@ -764,6 +809,13 @@ fn build_kionas_plan_from_intent(
                 .operands
                 .iter()
                 .map(|operand| {
+                    let operand_relation =
+                        primary_relation_dependency(operand).ok_or_else(|| {
+                            PlannerError::InvalidPhysicalPipeline(
+                                "union operand has no relation dependencies".to_string(),
+                            )
+                        })?;
+
                     let filter = operand
                         .selection
                         .as_ref()
@@ -773,9 +825,9 @@ fn build_kionas_plan_from_intent(
 
                     Ok(PhysicalUnionOperand {
                         relation: LogicalRelation {
-                            database: operand.namespace.database.clone(),
-                            schema: operand.namespace.schema.clone(),
-                            table: operand.namespace.table.clone(),
+                            database: operand_relation.database.clone(),
+                            schema: operand_relation.schema.clone(),
+                            table: operand_relation.table.clone(),
                         },
                         filter,
                     })
@@ -829,7 +881,7 @@ fn build_kionas_plan_from_intent(
         return Ok(translated);
     }
 
-    let model_has_join = !model.joins.is_empty();
+    let model_has_join = !source_model.joins.is_empty();
     if has_join != model_has_join {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "join translation mismatch: datafusion_has_join={} model_has_join={}",
@@ -845,7 +897,7 @@ fn build_kionas_plan_from_intent(
         )));
     }
 
-    let model_has_filter = model.selection.is_some();
+    let model_has_filter = source_model.selection.is_some();
     if has_filter != model_has_filter {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "filter translation mismatch: datafusion_has_filter={} model_has_filter={}",
@@ -890,13 +942,13 @@ fn build_kionas_plan_from_intent(
     let mut operators = Vec::<PhysicalOperator>::new();
     operators.push(PhysicalOperator::TableScan {
         relation: LogicalRelation {
-            database: model.namespace.database.clone(),
-            schema: model.namespace.schema.clone(),
-            table: model.namespace.table.clone(),
+            database: primary_relation.database.clone(),
+            schema: primary_relation.schema.clone(),
+            table: primary_relation.table.clone(),
         },
     });
 
-    if has_filter && let Some(selection_sql) = model.selection.as_ref() {
+    if has_filter && let Some(selection_sql) = source_model.selection.as_ref() {
         let predicate =
             parse_predicate_sql(selection_sql).map_err(PlannerError::UnsupportedPredicate)?;
         operators.push(PhysicalOperator::Filter {
@@ -905,13 +957,13 @@ fn build_kionas_plan_from_intent(
     }
 
     if has_hash_join {
-        if model.joins.is_empty() {
+        if source_model.joins.is_empty() {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "DataFusion join node detected but query model contains no join spec".to_string(),
             ));
         }
 
-        for join in &model.joins {
+        for join in &source_model.joins {
             operators.push(PhysicalOperator::HashJoin {
                 spec: kionas::planner::PhysicalJoinSpec {
                     join_type: match join.join_type {

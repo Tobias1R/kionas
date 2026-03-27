@@ -1854,8 +1854,12 @@ fn evaluate_between_at_row(
             Ok(lhs >= *lower_val && lhs <= *upper_val)
         }
         (FilterValue::Str(lower_str), FilterValue::Str(upper_str), DataType::Utf8) => {
-            let lhs = downcast_required::<StringArray>(array, "Utf8")?.value(row_idx);
-            Ok(lhs >= lower_str.as_str() && lhs <= upper_str.as_str())
+            let lhs = normalize_string_for_comparison(
+                downcast_required::<StringArray>(array, "Utf8")?.value(row_idx),
+            );
+            let lower_norm = normalize_string_for_comparison(lower_str);
+            let upper_norm = normalize_string_for_comparison(upper_str);
+            Ok(lhs >= lower_norm && lhs <= upper_norm)
         }
         (FilterValue::Str(lower_str), FilterValue::Str(upper_str), DataType::Date32) => {
             let lower_parsed = parse_date32_filter_literal(lower_str).ok_or_else(|| {
@@ -1911,8 +1915,12 @@ fn evaluate_in_at_row(
             Ok(list.contains(&lhs))
         }
         (FilterValue::StrList(list), DataType::Utf8) => {
-            let lhs = downcast_required::<StringArray>(array, "Utf8")?.value(row_idx);
-            Ok(list.iter().any(|s| s.as_str() == lhs))
+            let lhs = normalize_string_for_comparison(
+                downcast_required::<StringArray>(array, "Utf8")?.value(row_idx),
+            );
+            Ok(list
+                .iter()
+                .any(|s| normalize_string_for_comparison(s.as_str()) == lhs))
         }
         (FilterValue::BoolList(list), DataType::Boolean) => {
             let lhs = downcast_required::<BooleanArray>(array, "Boolean")?.value(row_idx);
@@ -1959,6 +1967,9 @@ fn compare_bool(lhs: bool, rhs: bool, op: FilterOp) -> bool {
 }
 
 fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
+    let lhs = normalize_string_for_comparison(lhs);
+    let rhs = normalize_string_for_comparison(rhs);
+
     match op {
         FilterOp::Eq => lhs == rhs,
         FilterOp::Ne => lhs != rhs,
@@ -1972,6 +1983,20 @@ fn compare_str(lhs: &str, rhs: &str, op: FilterOp) -> bool {
         | FilterOp::IsNull
         | FilterOp::IsNotNull => false, // Should not reach here
     }
+}
+
+fn normalize_string_for_comparison(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"')
+        {
+            return trimmed[1..trimmed.len() - 1].trim();
+        }
+    }
+
+    trimmed
 }
 
 #[cfg(test)]

@@ -731,8 +731,14 @@ struct IngestBackpressureLimits {
 /// Details:
 /// - Limits are intentionally conservative for now and can be made configurable later.
 fn ingest_backpressure_limits() -> IngestBackpressureLimits {
+    let max_batches = std::env::var("WORKER_FLIGHT_INGEST_MAX_BATCHES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2048);
+
     IngestBackpressureLimits {
-        max_batches: 128,
+        max_batches,
         max_rows: 1_000_000,
         max_wire_bytes: 32 * 1024 * 1024,
     }

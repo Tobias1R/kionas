@@ -1378,7 +1378,18 @@ fn collect_planning_relation_set(
     model: &SelectQueryModel,
 ) -> BTreeSet<(String, String, String)> {
     let mut planning_relation_set = BTreeSet::<(String, String, String)>::new();
-    planning_relation_set.insert((database.to_string(), schema.to_string(), table.to_string()));
+
+    for dependency in &model.relation_dependencies {
+        planning_relation_set.insert((
+            dependency.database.clone(),
+            dependency.schema.clone(),
+            dependency.table.clone(),
+        ));
+    }
+
+    if planning_relation_set.is_empty() {
+        planning_relation_set.insert((database.to_string(), schema.to_string(), table.to_string()));
+    }
 
     for join in &model.joins {
         planning_relation_set.insert((
@@ -1390,11 +1401,13 @@ fn collect_planning_relation_set(
 
     if let Some(union) = model.union.as_ref() {
         for operand in &union.operands {
-            planning_relation_set.insert((
-                operand.namespace.database.clone(),
-                operand.namespace.schema.clone(),
-                operand.namespace.table.clone(),
-            ));
+            for dependency in &operand.relation_dependencies {
+                planning_relation_set.insert((
+                    dependency.database.clone(),
+                    dependency.schema.clone(),
+                    dependency.table.clone(),
+                ));
+            }
 
             for join in &operand.joins {
                 planning_relation_set.insert((
@@ -1602,7 +1615,7 @@ fn build_canonical_query_payload_json(
         "version": model.version,
         "statement": model.statement,
         "session_id": model.session_id,
-        "namespace": model.namespace,
+        "from": model.from,
         "projection": model.projection,
         "selection": model.selection,
         "joins": model.joins,
@@ -1610,6 +1623,8 @@ fn build_canonical_query_payload_json(
         "order_by": model.order_by,
         "limit": model.limit,
         "offset": model.offset,
+        "ctes": model.ctes,
+        "relation_dependencies": model.relation_dependencies,
         "union": model.union,
         "sql": model.sql,
         "logical_plan": {

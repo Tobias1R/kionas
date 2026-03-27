@@ -367,6 +367,12 @@ impl TaskManager {
     }
 }
 
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/tasks_mod_tests.rs"]
 mod tests;

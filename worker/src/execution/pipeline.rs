@@ -19,7 +19,7 @@ use crate::storage::exchange::{list_stage_exchange_data_keys, stage_exchange_met
 use crate::telemetry::{
     StageExecutionTelemetry, StageLatencyMetrics, StageMemoryMetrics, StageNetworkMetrics,
 };
-use arrow::array::BooleanArray;
+use arrow::array::{BooleanArray, new_empty_array};
 use arrow::array::StringArray;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -2152,10 +2152,11 @@ async fn load_upstream_exchange_batches(
     }
 
     if all_batches.is_empty() {
-        return Err(format!(
-            "upstream exchange artifacts for stage {} contain no batches",
+        log::info!(
+            "upstream exchange artifacts for stage {} contain no batches; continuing with empty input",
             stage_context.stage_id
-        ));
+        );
+        return Ok(Vec::new());
     }
 
     log::info!(
@@ -2325,9 +2326,12 @@ pub(crate) async fn load_scan_batches(
 /// - Arrow record batches decoded from the input payload.
 pub(crate) fn decode_parquet_batches(parquet_bytes: Vec<u8>) -> Result<Vec<RecordBatch>, String> {
     let reader_source = Bytes::from(parquet_bytes);
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(reader_source)
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader_source)
         .map_err(|e| format!("failed to open parquet reader: {}", e))?
-        .with_batch_size(1024)
+        .with_batch_size(1024);
+    let schema = builder.schema().clone();
+
+    let mut reader = builder
         .build()
         .map_err(|e| format!("failed to build parquet reader: {}", e))?;
 
@@ -2335,6 +2339,17 @@ pub(crate) fn decode_parquet_batches(parquet_bytes: Vec<u8>) -> Result<Vec<Recor
     for maybe_batch in &mut reader {
         let batch = maybe_batch.map_err(|e| format!("failed reading parquet batch: {}", e))?;
         batches.push(batch);
+    }
+
+    if batches.is_empty() {
+        let empty_columns = schema
+            .fields()
+            .iter()
+            .map(|field| new_empty_array(field.data_type()))
+            .collect::<Vec<_>>();
+        let empty_batch = RecordBatch::try_new(schema, empty_columns)
+            .map_err(|e| format!("failed to build empty parquet batch: {}", e))?;
+        batches.push(empty_batch);
     }
 
     Ok(batches)

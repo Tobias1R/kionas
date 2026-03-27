@@ -128,6 +128,27 @@ fn applies_structured_conjunction_filter_pipeline() {
 }
 
 #[test]
+fn applies_string_filter_when_row_values_are_quoted() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![700_i64])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["'Charlie Miller'"])) as ArrayRef,
+        ],
+    )
+    .expect("test batch must build");
+
+    let filtered =
+        apply_filter_pipeline(&[batch], "name = 'Charlie Miller'", None).expect("filter must run");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].num_rows(), 1);
+}
+
+#[test]
 fn applies_projection_raw_identifier() {
     let projected = apply_projection_pipeline(
         &[batch_two_rows()],
