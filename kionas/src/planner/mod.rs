@@ -3,6 +3,7 @@ pub mod distributed_plan;
 pub mod distributed_validate;
 pub mod error;
 pub mod explain;
+pub mod expr_evaluator;
 pub mod filter_type_checker;
 pub mod join_spec;
 pub mod logical_plan;
@@ -25,6 +26,11 @@ pub use distributed_plan::{
 };
 pub use distributed_validate::validate_distributed_physical_plan;
 pub use error::PlannerError;
+pub use expr_evaluator::{
+    BinaryOperator, DefaultExpressionEvaluator, ExprType, ExpressionEvaluator,
+    PhysicalExpr as ExprPhysicalExpr, Value as ExprValue, evaluate_binary_op,
+    evaluate_builtin_function, evaluate_expression,
+};
 pub use join_spec::{JoinKeyPair, JoinType, LogicalJoinSpec, PhysicalJoinSpec};
 pub use logical_plan::{
     LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,

@@ -1530,3 +1530,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/spike_union_exec.rs"]
 mod spike_union_exec;
+
+#[cfg(test)]
+#[path = "../tests/phase4d_sprint1_integration_tests.rs"]
+mod phase4d_sprint1_integration_tests;

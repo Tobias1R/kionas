@@ -796,3 +796,86 @@ async fn translates_cte_join_query_via_object_store_fallback_without_join_mismat
         kionas::planner::PhysicalOperator::AggregatePartial { .. }
     )));
 }
+
+#[tokio::test]
+async fn translates_or_where_predicate_to_structured_disjunction() {
+    let relation = relation_metadata("sales", "public", "users");
+
+    let statements = parse_query("SELECT id FROM sales.public.users WHERE id = 1 OR id = 2")
+        .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "sales", "public")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("or predicate query translation should succeed");
+
+    let filter_predicate = translated
+        .operators
+        .iter()
+        .find_map(|op| match op {
+            kionas::planner::PhysicalOperator::Filter { predicate } => Some(predicate),
+            _ => None,
+        })
+        .expect("translated plan should include filter operator");
+
+    match filter_predicate {
+        kionas::planner::PhysicalExpr::Predicate { predicate } => {
+            assert!(matches!(
+                predicate,
+                kionas::planner::PredicateExpr::Or { .. }
+            ));
+        }
+        _ => panic!("filter must carry structured predicate"),
+    }
+}
+
+#[tokio::test]
+async fn translates_not_where_predicate_to_structured_negation() {
+    let relation = relation_metadata("sales", "public", "users");
+
+    let statements =
+        parse_query("SELECT id FROM sales.public.users WHERE NOT (id = 1 AND customer_id = 2)")
+            .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "sales", "public")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("not predicate query translation should succeed");
+
+    let filter_predicate = translated
+        .operators
+        .iter()
+        .find_map(|op| match op {
+            kionas::planner::PhysicalOperator::Filter { predicate } => Some(predicate),
+            _ => None,
+        })
+        .expect("translated plan should include filter operator");
+
+    match filter_predicate {
+        kionas::planner::PhysicalExpr::Predicate { predicate } => {
+            assert!(matches!(
+                predicate,
+                kionas::planner::PredicateExpr::Not { .. }
+            ));
+        }
+        _ => panic!("filter must carry structured predicate"),
+    }
+}

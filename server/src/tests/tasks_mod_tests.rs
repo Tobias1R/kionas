@@ -216,6 +216,92 @@ fn task_to_request_preserves_all_conjunction_clauses() {
 }
 
 #[test]
+fn task_to_request_serializes_disjunction_predicate_variant() {
+    let predicate = PredicateExpr::Or {
+        clauses: vec![
+            PredicateExpr::Comparison {
+                column: "id".to_string(),
+                op: PredicateComparisonOp::Eq,
+                value: PredicateValue::Int(1),
+            },
+            PredicateExpr::Comparison {
+                column: "id".to_string(),
+                op: PredicateComparisonOp::Eq,
+                value: PredicateValue::Int(2),
+            },
+        ],
+    };
+    let operators = vec![PhysicalOperator::Filter {
+        predicate: PhysicalExpr::Predicate { predicate },
+    }];
+    let payload = serde_json::to_string(&operators).expect("operators payload must serialize");
+
+    let task = Task::new(
+        "query-3b".to_string(),
+        "session-3b".to_string(),
+        "query".to_string(),
+        payload,
+        HashMap::new(),
+    );
+
+    let req = task_to_request(&task);
+    let proto = req.tasks[0]
+        .filter_predicate
+        .clone()
+        .expect("filter predicate must be serialized");
+
+    match proto.variant {
+        Some(worker_service::filter_predicate::Variant::Disjunction(node)) => {
+            assert_eq!(node.clauses.len(), 2);
+        }
+        _ => panic!("expected disjunction filter predicate variant"),
+    }
+}
+
+#[test]
+fn task_to_request_serializes_not_predicate_variant() {
+    let predicate = PredicateExpr::Not {
+        expr: Box::new(PredicateExpr::Comparison {
+            column: "id".to_string(),
+            op: PredicateComparisonOp::Eq,
+            value: PredicateValue::Int(1),
+        }),
+    };
+    let operators = vec![PhysicalOperator::Filter {
+        predicate: PhysicalExpr::Predicate { predicate },
+    }];
+    let payload = serde_json::to_string(&operators).expect("operators payload must serialize");
+
+    let task = Task::new(
+        "query-3c".to_string(),
+        "session-3c".to_string(),
+        "query".to_string(),
+        payload,
+        HashMap::new(),
+    );
+
+    let req = task_to_request(&task);
+    let proto = req.tasks[0]
+        .filter_predicate
+        .clone()
+        .expect("filter predicate must be serialized");
+
+    match proto.variant {
+        Some(worker_service::filter_predicate::Variant::Not(node)) => {
+            let inner = node
+                .predicate
+                .as_ref()
+                .expect("NOT variant must include inner predicate");
+            assert!(matches!(
+                inner.variant,
+                Some(worker_service::filter_predicate::Variant::Comparison(_))
+            ));
+        }
+        _ => panic!("expected NOT filter predicate variant"),
+    }
+}
+
+#[test]
 fn task_to_request_populates_stage_metadata_fields() {
     let mut params = HashMap::new();
     params.insert("database_name".to_string(), "analytics".to_string());
