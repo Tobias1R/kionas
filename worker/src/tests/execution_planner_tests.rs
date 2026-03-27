@@ -191,3 +191,37 @@ fn extract_runtime_plan_decodes_window_operator() {
     assert_eq!(window_spec.functions.len(), 1);
     assert_eq!(window_spec.functions[0].output_name, "rn");
 }
+
+#[test]
+fn extract_runtime_plan_marks_sort_before_projection_when_ordered_that_way() {
+    let mut task = build_query_task();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "sales", "schema": "public", "table": "orders"}}},
+        {"Sort": {"keys": [{"expression": {"Raw": {"sql": "o.quantity"}}, "ascending": false}]}},
+        {"Projection": {"expressions": [{"Raw": {"sql": "c.name"}}, {"Raw": {"sql": "p.name AS product_name"}}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan =
+        extract_runtime_plan(&task).expect("runtime planner should decode sort/projection order");
+
+    assert!(plan.sort_before_projection);
+}
+
+#[test]
+fn extract_runtime_plan_marks_projection_before_sort_when_ordered_that_way() {
+    let mut task = build_query_task();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "sales", "schema": "public", "table": "orders"}}},
+        {"Projection": {"expressions": [{"Raw": {"sql": "name"}}]}},
+        {"Sort": {"keys": [{"expression": {"Raw": {"sql": "name"}}, "ascending": true}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan =
+        extract_runtime_plan(&task).expect("runtime planner should decode projection/sort order");
+
+    assert!(!plan.sort_before_projection);
+}

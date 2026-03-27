@@ -95,6 +95,7 @@ fn is_stage_boundary_operator(operator: &PhysicalOperator) -> bool {
             | PhysicalOperator::AggregateFinal { .. }
             | PhysicalOperator::WindowAggr { .. }
             | PhysicalOperator::HashJoin { .. }
+            | PhysicalOperator::NestedLoopJoin { .. }
     )
 }
 
@@ -361,6 +362,7 @@ mod tests {
                             schema: "public".to_string(),
                             table: "orders".to_string(),
                         },
+                        predicates: Vec::new(),
                         keys: vec![crate::planner::JoinKeyPair {
                             left: "users.id".to_string(),
                             right: "orders.user_id".to_string(),
@@ -457,6 +459,7 @@ mod tests {
                             schema: "public".to_string(),
                             table: "orders".to_string(),
                         },
+                        predicates: Vec::new(),
                         keys: vec![crate::planner::JoinKeyPair {
                             left: "users.id".to_string(),
                             right: "orders.user_id".to_string(),

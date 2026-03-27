@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JoinType {
     Inner,
+    Left,
 }
 
 /// What: One join key pair used by equi-join operators.
@@ -43,6 +44,29 @@ pub struct LogicalJoinSpec {
     pub keys: Vec<JoinKeyPair>,
 }
 
+/// What: Structured join predicate expression carried by physical nested-loop joins.
+///
+/// Inputs:
+/// - Variant payload captures equality/theta/composite join predicate shape.
+///
+/// Output:
+/// - Serializable predicate contract consumed by worker join execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PhysicalJoinPredicate {
+    Equality {
+        left: String,
+        right: String,
+    },
+    Theta {
+        left: String,
+        op: String,
+        right: String,
+    },
+    Composite {
+        predicates: Vec<PhysicalJoinPredicate>,
+    },
+}
+
 /// What: Physical-level join specification carried by hash join operators.
 ///
 /// Inputs:
@@ -56,5 +80,8 @@ pub struct LogicalJoinSpec {
 pub struct PhysicalJoinSpec {
     pub join_type: JoinType,
     pub right_relation: LogicalRelation,
+    #[serde(default)]
+    pub predicates: Vec<PhysicalJoinPredicate>,
+    #[serde(default)]
     pub keys: Vec<JoinKeyPair>,
 }

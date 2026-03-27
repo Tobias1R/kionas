@@ -1,3 +1,4 @@
+use crate::planner::join_planning::{JoinAlgorithm, detect_join_algorithm};
 use crate::planner::stage_extractor::{StagePartitioningKind, extract_stages};
 use crate::providers::{KionasRelationMetadata, build_session_context_with_kionas_providers};
 use datafusion::execution::context::SessionContext;
@@ -5,10 +6,10 @@ use datafusion::physical_plan::{ExecutionPlan, displayable};
 use kionas::planner::PlannerError;
 use kionas::planner::{
     AggregateFunction, JoinKeyPair, JoinType, LogicalRelation, PhysicalAggregateExpr,
-    PhysicalAggregateSpec, PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
-    PhysicalSortExpr, PhysicalUnionOperand, PhysicalWindowFrameBound, PhysicalWindowFrameSpec,
-    PhysicalWindowFrameUnit, PhysicalWindowFunctionSpec, PhysicalWindowSpec, parse_predicate_sql,
-    validate_physical_plan,
+    PhysicalAggregateSpec, PhysicalExpr, PhysicalJoinPredicate, PhysicalLimitSpec,
+    PhysicalOperator, PhysicalPlan, PhysicalSortExpr, PhysicalUnionOperand,
+    PhysicalWindowFrameBound, PhysicalWindowFrameSpec, PhysicalWindowFrameUnit,
+    PhysicalWindowFunctionSpec, PhysicalWindowSpec, parse_predicate_sql, validate_physical_plan,
 };
 use kionas::sql::query_model::{QueryFromSpec, SelectQueryModel, primary_relation_dependency};
 use std::collections::HashMap;
@@ -422,6 +423,13 @@ fn joins_equivalent(
     left: &kionas::sql::query_model::QueryJoinSpec,
     right: &kionas::sql::query_model::QueryJoinSpec,
 ) -> bool {
+    fn predicates_equivalent(
+        left: &[kionas::sql::query_model::QueryJoinPredicate],
+        right: &[kionas::sql::query_model::QueryJoinPredicate],
+    ) -> bool {
+        left.len() == right.len() && left.iter().zip(right.iter()).all(|(lhs, rhs)| lhs == rhs)
+    }
+
     left.join_type == right.join_type
         && left
             .right
@@ -440,6 +448,7 @@ fn joins_equivalent(
             lhs.left.eq_ignore_ascii_case(rhs.left.as_str())
                 && lhs.right.eq_ignore_ascii_case(rhs.right.as_str())
         })
+        && predicates_equivalent(&left.predicates, &right.predicates)
 }
 
 fn collect_translation_joins<'a>(
@@ -860,6 +869,53 @@ fn remap_join_key_with_cte_alias(raw: &str, aliases: &HashMap<String, String>) -
     normalized
 }
 
+fn remap_join_operand_with_cte_alias(raw: &str, aliases: &HashMap<String, String>) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let is_quoted_string =
+        trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2;
+    let is_integer_literal = trimmed.parse::<i64>().is_ok();
+    let is_boolean_literal =
+        trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false");
+    if is_quoted_string || is_integer_literal || is_boolean_literal {
+        return trimmed.to_string();
+    }
+
+    remap_join_key_with_cte_alias(trimmed, aliases)
+}
+
+fn map_query_join_predicate_to_physical(
+    predicate: &kionas::sql::query_model::QueryJoinPredicate,
+    cte_aliases: &HashMap<String, String>,
+) -> PhysicalJoinPredicate {
+    match predicate {
+        kionas::sql::query_model::QueryJoinPredicate::Equality { left, right } => {
+            PhysicalJoinPredicate::Equality {
+                left: remap_join_operand_with_cte_alias(left.as_str(), cte_aliases),
+                right: remap_join_operand_with_cte_alias(right.as_str(), cte_aliases),
+            }
+        }
+        kionas::sql::query_model::QueryJoinPredicate::Theta { left, op, right } => {
+            PhysicalJoinPredicate::Theta {
+                left: remap_join_operand_with_cte_alias(left.as_str(), cte_aliases),
+                op: op.clone(),
+                right: remap_join_operand_with_cte_alias(right.as_str(), cte_aliases),
+            }
+        }
+        kionas::sql::query_model::QueryJoinPredicate::Composite { predicates } => {
+            PhysicalJoinPredicate::Composite {
+                predicates: predicates
+                    .iter()
+                    .map(|inner| map_query_join_predicate_to_physical(inner, cte_aliases))
+                    .collect::<Vec<_>>(),
+            }
+        }
+    }
+}
+
 fn build_aggregate_spec_from_model(
     model: &SelectQueryModel,
 ) -> Result<Option<PhysicalAggregateSpec>, PlannerError> {
@@ -926,9 +982,10 @@ fn detect_join_families(node_names: &[String]) -> (bool, bool, bool) {
     let has_sort_merge_join = node_names
         .iter()
         .any(|name| name.to_ascii_lowercase().contains("sortmergejoin"));
-    let has_nested_loop_join = node_names
-        .iter()
-        .any(|name| name.to_ascii_lowercase().contains("nestedloopjoin"));
+    let has_nested_loop_join = node_names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("nestedloopjoin") || lower.contains("crossjoin")
+    });
 
     (has_hash_join, has_sort_merge_join, has_nested_loop_join)
 }
@@ -1332,9 +1389,9 @@ fn build_kionas_plan_from_intent(
     }
 
     if has_nested_loop_join {
-        return Err(PlannerError::UnsupportedPhysicalOperator(
-            "NestedLoopJoin".to_string(),
-        ));
+        log::warn!(
+            "DataFusion selected nested-loop join family; planner will route via join algorithm detection"
+        );
     }
 
     let mut operators = Vec::<PhysicalOperator>::new();
@@ -1347,6 +1404,7 @@ fn build_kionas_plan_from_intent(
     });
 
     let is_cte_source_translation = matches!(model.from, QueryFromSpec::CteRef { .. });
+    let mut deferred_join_filter_predicate: Option<kionas::planner::PredicateExpr> = None;
 
     if has_filter {
         let selection_sql = source_model.selection.as_ref().or(model.selection.as_ref());
@@ -1363,9 +1421,13 @@ fn build_kionas_plan_from_intent(
             } else {
                 match parse_predicate_sql(selection_sql) {
                     Ok(predicate) => {
-                        operators.push(PhysicalOperator::Filter {
-                            predicate: PhysicalExpr::Predicate { predicate },
-                        });
+                        if has_join {
+                            deferred_join_filter_predicate = Some(predicate);
+                        } else {
+                            operators.push(PhysicalOperator::Filter {
+                                predicate: PhysicalExpr::Predicate { predicate },
+                            });
+                        }
                     }
                     Err(err) if is_subquery_predicate_sql(selection_sql) && has_filter => {
                         log::warn!(
@@ -1379,7 +1441,7 @@ fn build_kionas_plan_from_intent(
         }
     }
 
-    if has_hash_join {
+    if has_join {
         if translation_joins.is_empty() {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "DataFusion join node detected but query model contains no join spec".to_string(),
@@ -1387,27 +1449,93 @@ fn build_kionas_plan_from_intent(
         }
 
         for join in translation_joins {
-            operators.push(PhysicalOperator::HashJoin {
-                spec: kionas::planner::PhysicalJoinSpec {
-                    join_type: match join.join_type {
-                        kionas::sql::query_model::QueryJoinType::Inner => JoinType::Inner,
-                    },
-                    right_relation: LogicalRelation {
-                        database: join.right.database.clone(),
-                        schema: join.right.schema.clone(),
-                        table: join.right.table.clone(),
-                    },
-                    keys: join
-                        .keys
-                        .iter()
-                        .map(|key| JoinKeyPair {
-                            left: remap_join_key_with_cte_alias(key.left.as_str(), &cte_aliases),
-                            right: remap_join_key_with_cte_alias(key.right.as_str(), &cte_aliases),
-                        })
-                        .collect::<Vec<_>>(),
-                },
-            });
+            let join_predicates = join
+                .predicates
+                .iter()
+                .map(|predicate| map_query_join_predicate_to_physical(predicate, &cte_aliases))
+                .collect::<Vec<_>>();
+
+            let join_algorithm = detect_join_algorithm(join, 0, 0);
+            match join_algorithm {
+                JoinAlgorithm::Hash => {
+                    operators.push(PhysicalOperator::HashJoin {
+                        spec: kionas::planner::PhysicalJoinSpec {
+                            join_type: match join.join_type {
+                                kionas::sql::query_model::QueryJoinType::Inner
+                                | kionas::sql::query_model::QueryJoinType::InnerTheta
+                                | kionas::sql::query_model::QueryJoinType::InnerCross => {
+                                    JoinType::Inner
+                                }
+                                kionas::sql::query_model::QueryJoinType::Left => JoinType::Left,
+                            },
+                            right_relation: LogicalRelation {
+                                database: join.right.database.clone(),
+                                schema: join.right.schema.clone(),
+                                table: join.right.table.clone(),
+                            },
+                            predicates: join_predicates,
+                            keys: join
+                                .keys
+                                .iter()
+                                .map(|key| JoinKeyPair {
+                                    left: remap_join_key_with_cte_alias(
+                                        key.left.as_str(),
+                                        &cte_aliases,
+                                    ),
+                                    right: remap_join_key_with_cte_alias(
+                                        key.right.as_str(),
+                                        &cte_aliases,
+                                    ),
+                                })
+                                .collect::<Vec<_>>(),
+                        },
+                    });
+                }
+                JoinAlgorithm::NestedLoop
+                | JoinAlgorithm::BroadcastCross
+                | JoinAlgorithm::PartitionedCross => {
+                    operators.push(PhysicalOperator::NestedLoopJoin {
+                        spec: kionas::planner::PhysicalJoinSpec {
+                            join_type: match join.join_type {
+                                kionas::sql::query_model::QueryJoinType::Left => JoinType::Left,
+                                _ => JoinType::Inner,
+                            },
+                            right_relation: LogicalRelation {
+                                database: join.right.database.clone(),
+                                schema: join.right.schema.clone(),
+                                table: join.right.table.clone(),
+                            },
+                            predicates: join_predicates,
+                            keys: join
+                                .keys
+                                .iter()
+                                .map(|key| JoinKeyPair {
+                                    left: remap_join_key_with_cte_alias(
+                                        key.left.as_str(),
+                                        &cte_aliases,
+                                    ),
+                                    right: remap_join_key_with_cte_alias(
+                                        key.right.as_str(),
+                                        &cte_aliases,
+                                    ),
+                                })
+                                .collect::<Vec<_>>(),
+                        },
+                    });
+                }
+                JoinAlgorithm::SortMerge => {
+                    return Err(PlannerError::UnsupportedPhysicalOperator(
+                        "SortMergeJoin".to_string(),
+                    ));
+                }
+            }
         }
+    }
+
+    if let Some(predicate) = deferred_join_filter_predicate.take() {
+        operators.push(PhysicalOperator::Filter {
+            predicate: PhysicalExpr::Predicate { predicate },
+        });
     }
 
     if has_aggregate || has_chain_aggregate {
@@ -1453,6 +1581,22 @@ fn build_kionas_plan_from_intent(
         operators.push(PhysicalOperator::WindowAggr { spec: window_spec });
     }
 
+    let should_sort_before_projection = has_sort && !has_aggregate && !has_window;
+
+    if should_sort_before_projection && !model.order_by.is_empty() {
+        let keys = model
+            .order_by
+            .iter()
+            .map(|spec| PhysicalSortExpr {
+                expression: PhysicalExpr::Raw {
+                    sql: spec.expression.clone(),
+                },
+                ascending: spec.ascending,
+            })
+            .collect::<Vec<_>>();
+        operators.push(PhysicalOperator::Sort { keys });
+    }
+
     if has_projection {
         let expressions = if has_aggregate || has_window {
             model
@@ -1488,7 +1632,7 @@ fn build_kionas_plan_from_intent(
         operators.push(PhysicalOperator::Projection { expressions });
     }
 
-    if has_sort && !model.order_by.is_empty() {
+    if has_sort && !should_sort_before_projection && !model.order_by.is_empty() {
         let keys = model
             .order_by
             .iter()

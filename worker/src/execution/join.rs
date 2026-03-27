@@ -4,12 +4,12 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Int16Array, Int32Array, Int64Array,
     StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt32Array,
+    TimestampSecondArray, UInt32Array, new_null_array,
 };
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use kionas::planner::PhysicalJoinSpec;
+use kionas::planner::{JoinType, PhysicalJoinPredicate, PhysicalJoinSpec};
 
 const JOIN_MATCH_CHUNK_SIZE: usize = 65_536;
 
@@ -116,6 +116,286 @@ pub(crate) fn apply_hash_join_pipeline(
     Ok(joined_batches)
 }
 
+/// What: Execute nested-loop join between left and right batches with optional structured predicates.
+///
+/// Inputs:
+/// - `left_batches`: Left-side input batches.
+/// - `right_batches`: Right-side input batches.
+/// - `spec`: Physical join specification with optional join predicates.
+///
+/// Output:
+/// - Joined record batches preserving deterministic row expansion order.
+///
+/// Details:
+/// - Empty predicate list executes a CROSS JOIN.
+/// - When predicates are present, each pair is retained only when predicates evaluate to true.
+pub(crate) fn apply_nested_loop_join_pipeline(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    spec: &PhysicalJoinSpec,
+) -> Result<Vec<RecordBatch>, String> {
+    validate_nested_loop_join_spec(spec)?;
+
+    if !spec.keys.is_empty() {
+        return apply_keyed_nested_loop_join_pipeline(left_batches, right_batches, spec);
+    }
+
+    if left_batches.is_empty() {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    if right_batches.is_empty() {
+        if spec.join_type == JoinType::Left {
+            return build_left_join_with_empty_right(left_batches, right_batches, spec);
+        }
+
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    let left_schema = left_batches[0].schema();
+    let right_schema = right_batches[0].schema();
+
+    let left_all = arrow::compute::concat_batches(&left_schema, left_batches)
+        .map_err(|e| format!("failed to concat left nested-loop batches: {}", e))?;
+    let right_all = arrow::compute::concat_batches(&right_schema, right_batches)
+        .map_err(|e| format!("failed to concat right nested-loop batches: {}", e))?;
+
+    if left_all.num_rows() == 0 {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    if right_all.num_rows() == 0 {
+        if spec.join_type == JoinType::Left {
+            return build_left_join_with_empty_right(left_batches, right_batches, spec);
+        }
+
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    let joined_schema = build_join_output_schema(
+        left_all.schema().as_ref(),
+        right_all.schema().as_ref(),
+        spec,
+    );
+    let mut joined_batches = Vec::<RecordBatch>::new();
+    let mut left_indices = Vec::<u32>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
+    let mut right_indices = Vec::<Option<u32>>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
+
+    for left_row in 0..left_all.num_rows() {
+        let mut matched_left_row = false;
+        for right_row in 0..right_all.num_rows() {
+            if !join_predicates_match(&left_all, &right_all, left_row, right_row, spec)? {
+                continue;
+            }
+
+            matched_left_row = true;
+            left_indices.push(left_row as u32);
+            right_indices.push(Some(right_row as u32));
+
+            if left_indices.len() >= JOIN_MATCH_CHUNK_SIZE {
+                flush_join_chunk_with_optional_right(
+                    &left_all,
+                    &right_all,
+                    joined_schema.clone(),
+                    &mut left_indices,
+                    &mut right_indices,
+                    &mut joined_batches,
+                )?;
+            }
+        }
+
+        if !matched_left_row && spec.join_type == JoinType::Left {
+            left_indices.push(left_row as u32);
+            right_indices.push(None);
+
+            if left_indices.len() >= JOIN_MATCH_CHUNK_SIZE {
+                flush_join_chunk_with_optional_right(
+                    &left_all,
+                    &right_all,
+                    joined_schema.clone(),
+                    &mut left_indices,
+                    &mut right_indices,
+                    &mut joined_batches,
+                )?;
+            }
+        }
+    }
+
+    flush_join_chunk_with_optional_right(
+        &left_all,
+        &right_all,
+        joined_schema,
+        &mut left_indices,
+        &mut right_indices,
+        &mut joined_batches,
+    )?;
+
+    if joined_batches.is_empty() {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    Ok(joined_batches)
+}
+
+fn apply_keyed_nested_loop_join_pipeline(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    spec: &PhysicalJoinSpec,
+) -> Result<Vec<RecordBatch>, String> {
+    if left_batches.is_empty() {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    if right_batches.is_empty() {
+        if spec.join_type == JoinType::Left {
+            return build_left_join_with_empty_right(left_batches, right_batches, spec);
+        }
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    let left_schema = left_batches[0].schema();
+    let right_schema = right_batches[0].schema();
+
+    let left_all = arrow::compute::concat_batches(&left_schema, left_batches)
+        .map_err(|e| format!("failed to concat left keyed nested-loop batches: {}", e))?;
+    let right_all = arrow::compute::concat_batches(&right_schema, right_batches)
+        .map_err(|e| format!("failed to concat right keyed nested-loop batches: {}", e))?;
+
+    if left_all.num_rows() == 0 {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+    if right_all.num_rows() == 0 {
+        if spec.join_type == JoinType::Left {
+            return build_left_join_with_empty_right(left_batches, right_batches, spec);
+        }
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    let left_key_columns = resolve_join_key_indices(left_all.schema().as_ref(), &spec.keys, true)?;
+    let right_key_columns =
+        resolve_join_key_indices(right_all.schema().as_ref(), &spec.keys, false)?;
+
+    let mut right_index = HashMap::<String, Vec<u32>>::with_capacity(right_all.num_rows());
+    for row in 0..right_all.num_rows() {
+        let key = row_join_key(&right_all, row, &right_key_columns)?;
+        right_index.entry(key).or_default().push(row as u32);
+    }
+
+    let joined_schema = build_join_output_schema(
+        left_all.schema().as_ref(),
+        right_all.schema().as_ref(),
+        spec,
+    );
+    let mut joined_batches = Vec::<RecordBatch>::new();
+    let mut left_indices = Vec::<u32>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
+    let mut right_indices = Vec::<Option<u32>>::with_capacity(JOIN_MATCH_CHUNK_SIZE);
+
+    for left_row in 0..left_all.num_rows() {
+        let key = row_join_key(&left_all, left_row, &left_key_columns)?;
+        let mut matched_left_row = false;
+
+        if let Some(matches) = right_index.get(&key) {
+            for right_row in matches {
+                if !join_predicates_match(
+                    &left_all,
+                    &right_all,
+                    left_row,
+                    *right_row as usize,
+                    spec,
+                )? {
+                    continue;
+                }
+
+                matched_left_row = true;
+                left_indices.push(left_row as u32);
+                right_indices.push(Some(*right_row));
+
+                if left_indices.len() >= JOIN_MATCH_CHUNK_SIZE {
+                    flush_join_chunk_with_optional_right(
+                        &left_all,
+                        &right_all,
+                        joined_schema.clone(),
+                        &mut left_indices,
+                        &mut right_indices,
+                        &mut joined_batches,
+                    )?;
+                }
+            }
+        }
+
+        if !matched_left_row && spec.join_type == JoinType::Left {
+            left_indices.push(left_row as u32);
+            right_indices.push(None);
+
+            if left_indices.len() >= JOIN_MATCH_CHUNK_SIZE {
+                flush_join_chunk_with_optional_right(
+                    &left_all,
+                    &right_all,
+                    joined_schema.clone(),
+                    &mut left_indices,
+                    &mut right_indices,
+                    &mut joined_batches,
+                )?;
+            }
+        }
+    }
+
+    flush_join_chunk_with_optional_right(
+        &left_all,
+        &right_all,
+        joined_schema,
+        &mut left_indices,
+        &mut right_indices,
+        &mut joined_batches,
+    )?;
+
+    if joined_batches.is_empty() {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    Ok(joined_batches)
+}
+
 /// What: Validate runtime hash join specification invariants.
 ///
 /// Inputs:
@@ -125,6 +405,10 @@ pub(crate) fn apply_hash_join_pipeline(
 /// - `Ok(())` when required join metadata is valid for execution.
 /// - `Err(message)` when mandatory join invariants are missing.
 fn validate_hash_join_spec(spec: &PhysicalJoinSpec) -> Result<(), String> {
+    if spec.join_type != JoinType::Inner {
+        return Err("hash join supports only INNER join type in this phase".to_string());
+    }
+
     if spec.keys.is_empty() {
         return Err("hash join requires at least one join key".to_string());
     }
@@ -137,6 +421,272 @@ fn validate_hash_join_spec(spec: &PhysicalJoinSpec) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn validate_nested_loop_join_spec(spec: &PhysicalJoinSpec) -> Result<(), String> {
+    if spec.right_relation.database.trim().is_empty()
+        || spec.right_relation.schema.trim().is_empty()
+        || spec.right_relation.table.trim().is_empty()
+    {
+        return Err("nested-loop join right relation must be non-empty".to_string());
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JoinOperandValue {
+    Null,
+    Int(i64),
+    Bool(bool),
+    Str(String),
+}
+
+fn join_predicates_match(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_row: usize,
+    right_row: usize,
+    spec: &PhysicalJoinSpec,
+) -> Result<bool, String> {
+    if spec.predicates.is_empty() {
+        return Ok(true);
+    }
+
+    spec.predicates.iter().try_fold(true, |acc, predicate| {
+        if !acc {
+            return Ok(false);
+        }
+        evaluate_join_predicate(predicate, left, right, left_row, right_row)
+    })
+}
+
+fn evaluate_join_predicate(
+    predicate: &PhysicalJoinPredicate,
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_row: usize,
+    right_row: usize,
+) -> Result<bool, String> {
+    match predicate {
+        PhysicalJoinPredicate::Equality {
+            left: lhs,
+            right: rhs,
+        } => {
+            let left_value = resolve_join_operand(left, right, left_row, right_row, lhs, true)?;
+            let right_value = resolve_join_operand(left, right, left_row, right_row, rhs, false)?;
+            Ok(compare_join_operands(&left_value, &right_value, "="))
+        }
+        PhysicalJoinPredicate::Theta {
+            left: lhs,
+            op,
+            right: rhs,
+        } => {
+            let left_value = resolve_join_operand(left, right, left_row, right_row, lhs, true)?;
+            let right_value = resolve_join_operand(left, right, left_row, right_row, rhs, false)?;
+            Ok(compare_join_operands(
+                &left_value,
+                &right_value,
+                op.as_str(),
+            ))
+        }
+        PhysicalJoinPredicate::Composite { predicates } => {
+            for nested in predicates {
+                if !evaluate_join_predicate(nested, left, right, left_row, right_row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn resolve_join_operand(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_row: usize,
+    right_row: usize,
+    raw: &str,
+    prefer_left: bool,
+) -> Result<JoinOperandValue, String> {
+    if let Some(value) = parse_join_literal(raw) {
+        return Ok(value);
+    }
+
+    let trimmed = raw.trim();
+    if prefer_left {
+        if let Some(value) = resolve_join_column_value(left, left_row, trimmed)? {
+            return Ok(value);
+        }
+        if let Some(value) = resolve_join_column_value(right, right_row, trimmed)? {
+            return Ok(value);
+        }
+    } else {
+        if let Some(value) = resolve_join_column_value(right, right_row, trimmed)? {
+            return Ok(value);
+        }
+        if let Some(value) = resolve_join_column_value(left, left_row, trimmed)? {
+            return Ok(value);
+        }
+    }
+
+    Err(format!(
+        "nested-loop join predicate operand '{}' is not resolvable as literal or column",
+        raw
+    ))
+}
+
+fn parse_join_literal(raw: &str) -> Option<JoinOperandValue> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Some(JoinOperandValue::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Some(JoinOperandValue::Bool(false));
+    }
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return Some(JoinOperandValue::Int(value));
+    }
+    if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        return Some(JoinOperandValue::Str(
+            trimmed[1..trimmed.len() - 1].to_string(),
+        ));
+    }
+    None
+}
+
+fn resolve_join_column_value(
+    batch: &RecordBatch,
+    row: usize,
+    requested: &str,
+) -> Result<Option<JoinOperandValue>, String> {
+    let schema = batch.schema();
+    let resolved = resolve_join_column_index(schema.as_ref(), requested);
+    let Some(index) = resolved else {
+        return Ok(None);
+    };
+
+    let array = batch.column(index);
+    scalar_to_join_operand(array.as_ref(), row).map(Some)
+}
+
+fn resolve_join_column_index(schema: &Schema, requested: &str) -> Option<usize> {
+    let trimmed = requested.trim();
+    let fallback = trimmed.rsplit('.').next().unwrap_or(trimmed).trim();
+
+    schema.fields().iter().position(|field| {
+        let name = field.name();
+        name.eq_ignore_ascii_case(trimmed) || name.eq_ignore_ascii_case(fallback)
+    })
+}
+
+fn scalar_to_join_operand(array: &dyn Array, row: usize) -> Result<JoinOperandValue, String> {
+    if array.is_null(row) {
+        return Ok(JoinOperandValue::Null);
+    }
+
+    match array.data_type() {
+        DataType::Int16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to cast Int16 join predicate array".to_string())?;
+            Ok(JoinOperandValue::Int(i64::from(arr.value(row))))
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to cast Int32 join predicate array".to_string())?;
+            Ok(JoinOperandValue::Int(i64::from(arr.value(row))))
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to cast Int64 join predicate array".to_string())?;
+            Ok(JoinOperandValue::Int(arr.value(row)))
+        }
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to cast Boolean join predicate array".to_string())?;
+            Ok(JoinOperandValue::Bool(arr.value(row)))
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to cast Utf8 join predicate array".to_string())?;
+            Ok(JoinOperandValue::Str(arr.value(row).to_string()))
+        }
+        _ => Ok(JoinOperandValue::Str(scalar_to_string(array, row)?)),
+    }
+}
+
+fn compare_join_operands(left: &JoinOperandValue, right: &JoinOperandValue, op: &str) -> bool {
+    if matches!(left, JoinOperandValue::Null) || matches!(right, JoinOperandValue::Null) {
+        return false;
+    }
+
+    match (left, right) {
+        (JoinOperandValue::Int(lhs), JoinOperandValue::Int(rhs)) => {
+            compare_int_operands(*lhs, *rhs, op)
+        }
+        (JoinOperandValue::Bool(lhs), JoinOperandValue::Bool(rhs)) => {
+            compare_bool_operands(*lhs, *rhs, op)
+        }
+        (JoinOperandValue::Str(lhs), JoinOperandValue::Str(rhs)) => {
+            compare_string_operands(lhs.as_str(), rhs.as_str(), op)
+        }
+        _ => compare_string_operands(
+            normalize_join_operand_for_compare(left).as_str(),
+            normalize_join_operand_for_compare(right).as_str(),
+            op,
+        ),
+    }
+}
+
+fn normalize_join_operand_for_compare(value: &JoinOperandValue) -> String {
+    match value {
+        JoinOperandValue::Null => "<NULL>".to_string(),
+        JoinOperandValue::Int(inner) => inner.to_string(),
+        JoinOperandValue::Bool(inner) => inner.to_string(),
+        JoinOperandValue::Str(inner) => inner.clone(),
+    }
+}
+
+fn compare_int_operands(left: i64, right: i64, op: &str) -> bool {
+    match op {
+        "=" => left == right,
+        "!=" | "<>" => left != right,
+        ">" => left > right,
+        ">=" => left >= right,
+        "<" => left < right,
+        "<=" => left <= right,
+        _ => false,
+    }
+}
+
+fn compare_bool_operands(left: bool, right: bool, op: &str) -> bool {
+    match op {
+        "=" => left == right,
+        "!=" | "<>" => left != right,
+        _ => false,
+    }
+}
+
+fn compare_string_operands(left: &str, right: &str, op: &str) -> bool {
+    match op {
+        "=" => left == right,
+        "!=" | "<>" => left != right,
+        ">" => left > right,
+        ">=" => left >= right,
+        "<" => left < right,
+        "<=" => left <= right,
+        _ => false,
+    }
 }
 
 /// What: Build the deterministic output schema for join batches.
@@ -161,7 +711,15 @@ fn build_join_output_schema(
     }
 
     for field in right_schema.fields() {
-        let mut right_field = field.as_ref().clone();
+        let mut right_field = Field::new(
+            field.name(),
+            field.data_type().clone(),
+            if spec.join_type == JoinType::Left {
+                true
+            } else {
+                field.is_nullable()
+            },
+        );
         if left_schema
             .fields()
             .iter()
@@ -201,6 +759,45 @@ fn flush_join_chunk(
     joined_schema: Arc<Schema>,
     left_indices: &mut Vec<u32>,
     right_indices: &mut Vec<u32>,
+    joined_batches: &mut Vec<RecordBatch>,
+) -> Result<(), String> {
+    if left_indices.is_empty() {
+        return Ok(());
+    }
+
+    let left_take = UInt32Array::from(std::mem::take(left_indices));
+    let right_take = UInt32Array::from(std::mem::take(right_indices));
+
+    let total_columns = left_all.num_columns() + right_all.num_columns();
+    let mut arrays = Vec::<ArrayRef>::with_capacity(total_columns);
+
+    for col in left_all.columns() {
+        let taken = take(col.as_ref(), &left_take, None)
+            .map_err(|e| format!("failed to take left join rows: {}", e))?;
+        arrays.push(taken);
+    }
+
+    for col in right_all.columns() {
+        let taken = take(col.as_ref(), &right_take, None)
+            .map_err(|e| format!("failed to take right join rows: {}", e))?;
+        arrays.push(taken);
+    }
+
+    let joined = RecordBatch::try_new(joined_schema, arrays)
+        .map_err(|e| format!("failed to build joined batch: {}", e))?;
+    joined_batches.push(joined);
+
+    left_indices.reserve(JOIN_MATCH_CHUNK_SIZE);
+    right_indices.reserve(JOIN_MATCH_CHUNK_SIZE);
+    Ok(())
+}
+
+fn flush_join_chunk_with_optional_right(
+    left_all: &RecordBatch,
+    right_all: &RecordBatch,
+    joined_schema: Arc<Schema>,
+    left_indices: &mut Vec<u32>,
+    right_indices: &mut Vec<Option<u32>>,
     joined_batches: &mut Vec<RecordBatch>,
 ) -> Result<(), String> {
     if left_indices.is_empty() {
@@ -277,6 +874,51 @@ fn build_empty_join_batch(
 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|e| format!("failed to build empty join batch: {}", e))
+}
+
+fn build_left_join_with_empty_right(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    spec: &PhysicalJoinSpec,
+) -> Result<Vec<RecordBatch>, String> {
+    let left_schema = left_batches
+        .first()
+        .map(|b| b.schema())
+        .ok_or_else(|| "left join input is empty".to_string())?;
+    let right_schema = right_batches
+        .first()
+        .map(|b| b.schema())
+        .ok_or_else(|| "right join input is empty".to_string())?;
+
+    let left_all = arrow::compute::concat_batches(&left_schema, left_batches)
+        .map_err(|e| format!("failed to concat left nested-loop batches: {}", e))?;
+    if left_all.num_rows() == 0 {
+        return Ok(vec![build_empty_join_batch(
+            left_batches,
+            right_batches,
+            spec,
+        )?]);
+    }
+
+    let joined_schema =
+        build_join_output_schema(left_all.schema().as_ref(), right_schema.as_ref(), spec);
+    let mut arrays = Vec::<ArrayRef>::with_capacity(joined_schema.fields().len());
+
+    for column in left_all.columns() {
+        arrays.push(column.clone());
+    }
+
+    for field in right_schema.fields() {
+        arrays.push(new_null_array(field.data_type(), left_all.num_rows()));
+    }
+
+    let batch = RecordBatch::try_new(joined_schema, arrays).map_err(|e| {
+        format!(
+            "failed to build left-join batch with null right columns: {}",
+            e
+        )
+    })?;
+    Ok(vec![batch])
 }
 
 fn resolve_join_key_indices(

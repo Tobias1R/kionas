@@ -1335,12 +1335,36 @@ fn parse_projection_binding(raw_sql: &str) -> Result<(String, String), String> {
                 rhs.trim()
             )
         })?;
-        return Ok((normalize_projection_identifier(lhs), alias));
+        return Ok((normalize_projection_source_identifier(lhs), alias));
     }
 
     let source = parse_projection_identifier(trimmed)?;
     let output = normalize_projection_identifier(trimmed);
     Ok((source, output))
+}
+
+fn normalize_projection_source_identifier(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((lhs, rhs)) = trimmed.rsplit_once('.') {
+        let qualifier = lhs
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches('[')
+            .trim_matches(']');
+        let column = rhs
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim_matches('[')
+            .trim_matches(']');
+
+        if !qualifier.is_empty() && !column.is_empty() {
+            return format!("{}.{}", qualifier, column);
+        }
+    }
+
+    normalize_projection_identifier(trimmed)
 }
 
 fn split_projection_alias(raw: &str) -> Option<(&str, &str)> {
@@ -1394,6 +1418,10 @@ pub(crate) fn resolve_schema_column_index(schema: &Schema, requested: &str) -> O
         return None;
     }
 
+    if let Some(idx) = resolve_qualified_schema_column_index(schema, requested) {
+        return Some(idx);
+    }
+
     if let Ok(idx) = schema.index_of(requested) {
         return Some(idx);
     }
@@ -1410,6 +1438,75 @@ pub(crate) fn resolve_schema_column_index(schema: &Schema, requested: &str) -> O
     }
 
     None
+}
+
+/// What: Resolve a qualified column reference against a joined output schema.
+///
+/// Inputs:
+/// - `schema`: Candidate output schema.
+/// - `requested`: Requested column name, potentially in `qualifier.column` form.
+///
+/// Output:
+/// - The resolved schema column index when a qualified reference can be mapped.
+///
+/// Details:
+/// - Supports direct `qualifier_column` lookup used by joined output schemas.
+/// - Supports fuzzy alias prefixes (for example `p.name` -> `products_name`).
+/// - Avoids ambiguous fallback when multiple prefixed columns match.
+fn resolve_qualified_schema_column_index(schema: &Schema, requested: &str) -> Option<usize> {
+    let (qualifier_raw, column_raw) = requested.rsplit_once('.')?;
+    let qualifier = normalize_projection_identifier(qualifier_raw).to_ascii_lowercase();
+    let column = normalize_projection_identifier(column_raw).to_ascii_lowercase();
+
+    if qualifier.is_empty() || column.is_empty() {
+        return None;
+    }
+
+    let prefixed_name = format!("{}_{}", qualifier, column);
+    if let Ok(idx) = schema.index_of(prefixed_name.as_str()) {
+        return Some(idx);
+    }
+
+    let suffix = format!("_{}", column);
+    let prefixed_matches = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name().to_ascii_lowercase().ends_with(suffix.as_str()))
+        .collect::<Vec<_>>();
+
+    let prefix_matches = prefixed_matches
+        .iter()
+        .copied()
+        .filter(|(_, field)| qualified_prefix_matches(field.name(), qualifier.as_str()))
+        .collect::<Vec<_>>();
+
+    if prefix_matches.len() == 1 {
+        return Some(prefix_matches[0].0);
+    }
+
+    if prefix_matches.len() > 1 {
+        return None;
+    }
+
+    if let Ok(idx) = schema.index_of(column.as_str()) {
+        return Some(idx);
+    }
+
+    if prefixed_matches.len() == 1 {
+        return Some(prefixed_matches[0].0);
+    }
+
+    None
+}
+
+fn qualified_prefix_matches(field_name: &str, qualifier: &str) -> bool {
+    let lower = field_name.to_ascii_lowercase();
+    if let Some((prefix, _)) = lower.rsplit_once('_') {
+        return prefix.starts_with(qualifier);
+    }
+
+    false
 }
 
 fn fallback_semantic_to_physical_column_index(schema: &Schema, normalized: &str) -> Option<usize> {
@@ -1470,7 +1567,7 @@ fn parse_projection_identifier(raw_sql: &str) -> Result<String, String> {
                 raw_sql.trim()
             ));
         }
-        return Ok(normalize_projection_identifier(lhs));
+        return Ok(normalize_projection_source_identifier(lhs));
     }
 
     if !is_simple_identifier_reference(trimmed) {
@@ -1479,7 +1576,7 @@ fn parse_projection_identifier(raw_sql: &str) -> Result<String, String> {
             raw_sql.trim()
         ));
     }
-    Ok(normalize_projection_identifier(trimmed))
+    Ok(normalize_projection_source_identifier(trimmed))
 }
 
 /// What: Validate whether an expression is a simple identifier reference.

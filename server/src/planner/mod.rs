@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod join_planning;
 pub mod stage_extractor;
 
 pub use engine::{

@@ -298,16 +298,23 @@ fn decode_proto_predicate(
 /// Output:
 /// - Runtime projection/filter directives for the local worker pipeline.
 #[derive(Debug, Clone)]
+pub(crate) enum RuntimeJoinPlan {
+    Hash(PhysicalJoinSpec),
+    NestedLoop(PhysicalJoinSpec),
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct RuntimePlan {
     pub(crate) filter_predicate: Option<PredicateExpr>,
     pub(crate) schema_metadata: Option<HashMap<String, ColumnDatatypeSpec>>,
-    pub(crate) join_spec: Option<PhysicalJoinSpec>,
+    pub(crate) join_plan: Option<RuntimeJoinPlan>,
     pub(crate) union_spec: Option<RuntimeUnionSpec>,
     pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
     pub(crate) aggregate_final_spec: Option<PhysicalAggregateSpec>,
     pub(crate) window_spec: Option<PhysicalWindowSpec>,
     pub(crate) projection_exprs: Vec<PhysicalExpr>,
     pub(crate) sort_exprs: Vec<PhysicalSortExpr>,
+    pub(crate) sort_before_projection: bool,
     pub(crate) limit_spec: Option<PhysicalLimitSpec>,
     pub(crate) has_materialize: bool,
 }
@@ -464,17 +471,19 @@ pub(crate) fn extract_runtime_plan(
     };
 
     let mut plan_filter_predicate = None;
-    let mut join_spec = None;
+    let mut join_plan = None;
     let mut union_spec = None;
     let mut aggregate_partial_spec = None;
     let mut aggregate_final_spec = None;
     let mut window_spec = None;
     let mut projection_exprs = Vec::new();
     let mut sort_exprs = Vec::new();
+    let mut projection_index = None::<usize>;
+    let mut sort_index = None::<usize>;
     let mut limit_spec = None;
     let mut has_materialize = false;
 
-    for op in operators {
+    for (index, op) in operators.into_iter().enumerate() {
         match op {
             PhysicalOperator::TableScan { .. } => {}
             PhysicalOperator::Filter { predicate } => {
@@ -491,7 +500,10 @@ pub(crate) fn extract_runtime_plan(
                 }
             }
             PhysicalOperator::HashJoin { spec } => {
-                join_spec = Some(spec);
+                join_plan = Some(RuntimeJoinPlan::Hash(spec));
+            }
+            PhysicalOperator::NestedLoopJoin { spec } => {
+                join_plan = Some(RuntimeJoinPlan::NestedLoop(spec));
             }
             PhysicalOperator::Union { operands, distinct } => {
                 let operand_filter_count = operands
@@ -530,9 +542,11 @@ pub(crate) fn extract_runtime_plan(
             }
             PhysicalOperator::Projection { expressions } => {
                 projection_exprs = expressions;
+                projection_index = Some(index);
             }
             PhysicalOperator::Sort { keys } => {
                 sort_exprs = keys;
+                sort_index = Some(index);
             }
             PhysicalOperator::Limit { spec } => {
                 limit_spec = Some(spec);
@@ -548,6 +562,9 @@ pub(crate) fn extract_runtime_plan(
             }
         }
     }
+
+    let sort_before_projection =
+        matches!((sort_index, projection_index), (Some(s), Some(p)) if s < p);
 
     let filter_predicate = match (task_filter_predicate, plan_filter_predicate) {
         (Some(task_predicate), Some(plan_predicate)) => {
@@ -579,13 +596,14 @@ pub(crate) fn extract_runtime_plan(
     Ok(RuntimePlan {
         filter_predicate,
         schema_metadata,
-        join_spec,
+        join_plan,
         union_spec,
         aggregate_partial_spec,
         aggregate_final_spec,
         window_spec,
         projection_exprs,
         sort_exprs,
+        sort_before_projection,
         limit_spec,
         has_materialize,
     })

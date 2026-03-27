@@ -31,7 +31,9 @@ pub use expr_evaluator::{
     PhysicalExpr as ExprPhysicalExpr, Value as ExprValue, evaluate_binary_op,
     evaluate_builtin_function, evaluate_expression,
 };
-pub use join_spec::{JoinKeyPair, JoinType, LogicalJoinSpec, PhysicalJoinSpec};
+pub use join_spec::{
+    JoinKeyPair, JoinType, LogicalJoinSpec, PhysicalJoinPredicate, PhysicalJoinSpec,
+};
 pub use logical_plan::{
     LogicalExpr, LogicalPlan, LogicalProjection, LogicalRelation, LogicalSelection, LogicalSortExpr,
 };

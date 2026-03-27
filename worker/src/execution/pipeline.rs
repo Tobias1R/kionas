@@ -2,12 +2,14 @@ use crate::execution::aggregate::{
     apply_aggregate_final_pipeline, apply_aggregate_partial_pipeline,
 };
 use crate::execution::artifacts::{persist_query_artifacts, persist_stage_exchange_artifacts};
-use crate::execution::join::apply_hash_join_pipeline;
+use crate::execution::join::{apply_hash_join_pipeline, apply_nested_loop_join_pipeline};
 use crate::execution::planner::StageExecutionContext;
+use crate::execution::planner::{
+    RuntimeJoinPlan, RuntimeUnionSpec, extract_runtime_plan, stage_execution_context,
+};
 use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
-use crate::execution::planner::{RuntimeUnionSpec, extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
-use crate::execution::router::route_batch_from_output_partitioning;
+use crate::execution::router::{route_batch_from_output_partitioning, route_batch_roundrobin};
 use crate::execution::window::apply_window_pipeline;
 use crate::services::query_execution::{
     apply_filter_predicate_pipeline, apply_limit_pipeline, apply_projection_pipeline,
@@ -1372,7 +1374,11 @@ pub(crate) async fn execute_query_task(
         )?;
     }
 
-    if let Some(join_spec) = runtime_plan.join_spec.as_ref() {
+    if let Some(join_plan) = runtime_plan.join_plan.as_ref() {
+        let join_spec = match join_plan {
+            RuntimeJoinPlan::Hash(spec) | RuntimeJoinPlan::NestedLoop(spec) => spec,
+        };
+
         let right_namespace = QueryNamespace {
             database: join_spec.right_relation.database.clone(),
             schema: join_spec.right_relation.schema.clone(),
@@ -1391,7 +1397,12 @@ pub(crate) async fn execute_query_task(
         if let Some(columns) = relation_columns_by_key.get(right_relation_key.as_str()) {
             right_batches = apply_relation_column_names(&right_batches, columns)?;
         }
-        batches = apply_hash_join_pipeline(&batches, &right_batches, join_spec)?;
+        batches = match join_plan {
+            RuntimeJoinPlan::Hash(spec) => apply_hash_join_pipeline(&batches, &right_batches, spec),
+            RuntimeJoinPlan::NestedLoop(spec) => {
+                apply_nested_loop_join_pipeline(&batches, &right_batches, spec)
+            }
+        }?;
     }
 
     if let Some(union_spec) = runtime_plan.union_spec.as_ref() {
@@ -1439,12 +1450,22 @@ pub(crate) async fn execute_query_task(
         batches = apply_window_pipeline(&batches, window_spec)?;
     }
 
-    if !runtime_plan.projection_exprs.is_empty() {
-        batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
-    }
+    if runtime_plan.sort_before_projection {
+        if !runtime_plan.sort_exprs.is_empty() {
+            batches = apply_sort_pipeline(&batches, &runtime_plan.sort_exprs)?;
+        }
 
-    if !runtime_plan.sort_exprs.is_empty() {
-        batches = apply_sort_pipeline(&batches, &runtime_plan.sort_exprs)?;
+        if !runtime_plan.projection_exprs.is_empty() {
+            batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
+        }
+    } else {
+        if !runtime_plan.projection_exprs.is_empty() {
+            batches = apply_projection_pipeline(&batches, &runtime_plan.projection_exprs)?;
+        }
+
+        if !runtime_plan.sort_exprs.is_empty() {
+            batches = apply_sort_pipeline(&batches, &runtime_plan.sort_exprs)?;
+        }
     }
 
     if let Some(limit_spec) = runtime_plan.limit_spec.as_ref() {
@@ -1477,15 +1498,33 @@ pub(crate) async fn execute_query_task(
             } else {
                 destination.downstream_partition_count
             };
+            let partitioning_lower = destination.partitioning.to_ascii_lowercase();
+            let is_hash_partitioning = partitioning_lower.trim() == "hash"
+                || partitioning_lower.trim_start().starts_with("hash:")
+                || partitioning_lower.contains("\"hash\"")
+                || partitioning_lower.contains("{hash");
 
             let mut destination_batches = Vec::<RecordBatch>::new();
             for batch in &normalized_batches {
-                let mut split = route_batch_from_output_partitioning(
+                let mut split = match route_batch_from_output_partitioning(
                     batch,
                     &destination.partitioning,
                     destination_partition_count,
                     Some(&rr_counter),
-                )?;
+                ) {
+                    Ok(split) => split,
+                    Err(err)
+                        if is_hash_partitioning && err.contains("hash partition key column") =>
+                    {
+                        log::warn!(
+                            "Falling back to round-robin routing because hash keys are missing in output schema (partitioning={}): {}",
+                            destination.partitioning,
+                            err,
+                        );
+                        route_batch_roundrobin(batch, destination_partition_count, &rr_counter)?
+                    }
+                    Err(err) => return Err(err),
+                };
                 destination_batches.append(&mut split);
             }
 

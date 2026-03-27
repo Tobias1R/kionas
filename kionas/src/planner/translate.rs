@@ -194,7 +194,10 @@ pub fn build_logical_plan_from_select_model(
             .iter()
             .map(|join| LogicalJoinSpec {
                 join_type: match join.join_type {
-                    crate::sql::query_model::QueryJoinType::Inner => JoinType::Inner,
+                    crate::sql::query_model::QueryJoinType::Inner
+                    | crate::sql::query_model::QueryJoinType::InnerTheta
+                    | crate::sql::query_model::QueryJoinType::InnerCross => JoinType::Inner,
+                    crate::sql::query_model::QueryJoinType::Left => JoinType::Left,
                 },
                 right_relation: LogicalRelation {
                     database: join.right.database.clone(),

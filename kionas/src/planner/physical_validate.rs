@@ -313,9 +313,11 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         .iter()
         .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
         && sort_index < projection_index
+        && (aggregate_partial_count > 0 || window_count > 0)
     {
         return Err(PlannerError::InvalidPhysicalPipeline(
-            "sort must appear after projection".to_string(),
+            "sort must appear after projection when aggregate or window operators are present"
+                .to_string(),
         ));
     }
 
@@ -392,10 +394,15 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
                     ));
                 }
             }
-            PhysicalOperator::NestedLoopJoin => {
-                return Err(PlannerError::UnsupportedPhysicalOperator(
-                    "NestedLoopJoin".to_string(),
-                ));
+            PhysicalOperator::NestedLoopJoin { spec } => {
+                if spec.right_relation.database.trim().is_empty()
+                    || spec.right_relation.schema.trim().is_empty()
+                    || spec.right_relation.table.trim().is_empty()
+                {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "nested-loop join right relation must be non-empty".to_string(),
+                    ));
+                }
             }
             PhysicalOperator::AggregatePartial { spec }
             | PhysicalOperator::AggregateFinal { spec } => {
@@ -488,6 +495,7 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
 mod tests {
     use super::validate_physical_plan;
     use crate::planner::error::PlannerError;
+    use crate::planner::join_spec::{JoinType, PhysicalJoinSpec};
     use crate::planner::logical_plan::LogicalRelation;
     use crate::planner::physical_plan::{
         PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
@@ -522,10 +530,6 @@ mod tests {
     #[test]
     fn rejects_each_deferred_operator() {
         let cases = vec![
-            (
-                PhysicalOperator::NestedLoopJoin,
-                "NestedLoopJoin".to_string(),
-            ),
             (
                 PhysicalOperator::ExchangeShuffle {
                     keys: vec!["id".to_string()],
@@ -589,6 +593,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_nested_loop_join_with_valid_relation() {
+        let mut plan = base_valid_plan();
+        plan.operators.insert(
+            1,
+            PhysicalOperator::NestedLoopJoin {
+                spec: PhysicalJoinSpec {
+                    join_type: JoinType::Inner,
+                    right_relation: LogicalRelation {
+                        database: "sales".to_string(),
+                        schema: "public".to_string(),
+                        table: "orders".to_string(),
+                    },
+                    predicates: Vec::new(),
+                    keys: Vec::new(),
+                },
+            },
+        );
+
+        validate_physical_plan(&plan).expect("nested-loop join should be allowed");
+    }
+
+    #[test]
     fn accepts_supported_filter_predicate() {
         let mut plan = base_valid_plan();
         plan.operators.insert(
@@ -616,6 +642,7 @@ mod tests {
                         schema: "public".to_string(),
                         table: "orders".to_string(),
                     },
+                    predicates: Vec::new(),
                     keys: vec![crate::planner::JoinKeyPair {
                         left: "users.id".to_string(),
                         right: "orders.user_id".to_string(),
@@ -866,6 +893,7 @@ mod tests {
                         schema: "public".to_string(),
                         table: "orders".to_string(),
                     },
+                    predicates: Vec::new(),
                     keys: vec![crate::planner::JoinKeyPair {
                         left: "users.id".to_string(),
                         right: "orders.user_id".to_string(),

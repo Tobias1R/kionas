@@ -172,7 +172,9 @@ pub enum PhysicalOperator {
     HashJoin {
         spec: PhysicalJoinSpec,
     },
-    NestedLoopJoin,
+    NestedLoopJoin {
+        spec: PhysicalJoinSpec,
+    },
     AggregatePartial {
         spec: PhysicalAggregateSpec,
     },
@@ -215,7 +217,7 @@ impl PhysicalOperator {
             PhysicalOperator::Projection { .. } => "Projection",
             PhysicalOperator::Materialize => "Materialize",
             PhysicalOperator::HashJoin { .. } => "HashJoin",
-            PhysicalOperator::NestedLoopJoin => "NestedLoopJoin",
+            PhysicalOperator::NestedLoopJoin { .. } => "NestedLoopJoin",
             PhysicalOperator::AggregatePartial { .. } => "AggregatePartial",
             PhysicalOperator::AggregateFinal { .. } => "AggregateFinal",
             PhysicalOperator::WindowAggr { .. } => "WindowAggr",

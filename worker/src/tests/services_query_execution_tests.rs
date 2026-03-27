@@ -1,6 +1,7 @@
 use super::{
     apply_filter_pipeline, apply_filter_predicate_pipeline, apply_limit_pipeline,
-    apply_projection_pipeline, parse_projection_identifier, split_case_insensitive,
+    apply_projection_pipeline, parse_projection_identifier, resolve_schema_column_index,
+    split_case_insensitive,
 };
 use crate::execution::artifacts::{QueryArtifactMetadata, encode_result_metadata};
 use crate::execution::pipeline::{
@@ -261,7 +262,69 @@ fn rejects_unsupported_projection_expression() {
 fn parses_projection_identifier_with_alias() {
     let parsed = parse_projection_identifier("users.name AS customer_name")
         .expect("aliased projection should parse");
-    assert_eq!(parsed, "name");
+    assert_eq!(parsed, "users.name");
+}
+
+#[test]
+fn applies_projection_from_qualified_join_side_alias() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("products_name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["left_name"])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["right_product_name"])) as ArrayRef,
+        ],
+    )
+    .expect("joined test batch must build");
+
+    let projected = apply_projection_pipeline(
+        &[batch],
+        &[PhysicalExpr::Raw {
+            sql: "p.name AS product_name".to_string(),
+        }],
+    )
+    .expect("qualified projection should resolve to right-side prefixed column");
+
+    assert_eq!(projected[0].schema().field(0).name(), "product_name");
+    let values = projected[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("product_name column must be utf8");
+    assert_eq!(values.value(0), "right_product_name");
+}
+
+#[test]
+fn resolves_qualified_projection_to_prefixed_join_column() {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("products_name", DataType::Utf8, false),
+    ]);
+
+    let idx = resolve_schema_column_index(&schema, "p.name")
+        .expect("qualified projection should resolve to prefixed join column");
+    assert_eq!(schema.field(idx).name(), "products_name");
+}
+
+#[test]
+fn does_not_guess_ambiguous_qualified_projection() {
+    let schema = Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("products_name", DataType::Utf8, false),
+        Field::new("profiles_name", DataType::Utf8, false),
+    ]);
+
+    let idx = resolve_schema_column_index(&schema, "p.name")
+        .expect("alias prefix match should resolve when exactly one prefixed column matches");
+    assert_eq!(schema.field(idx).name(), "products_name");
+
+    let fallback = resolve_schema_column_index(&schema, "x.name")
+        .expect("unknown qualifier should fall back to unqualified base column when available");
+    assert_eq!(schema.field(fallback).name(), "name");
 }
 
 #[test]

@@ -56,6 +56,17 @@ fn render_operator_diagnostic(operator: &PhysicalOperator) -> String {
                 keys
             )
         }
+        PhysicalOperator::NestedLoopJoin { spec } => {
+            format!(
+                "NestedLoopJoin(type={:?}, right={}.{}.{}, predicates={}, keys={})",
+                spec.join_type,
+                spec.right_relation.database,
+                spec.right_relation.schema,
+                spec.right_relation.table,
+                spec.predicates.len(),
+                spec.keys.len()
+            )
+        }
         PhysicalOperator::AggregatePartial { spec } => {
             let keys = spec
                 .grouping_exprs

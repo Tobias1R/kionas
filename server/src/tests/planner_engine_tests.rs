@@ -669,6 +669,71 @@ async fn remaps_outer_join_key_from_cte_alias_to_source_column() {
 }
 
 #[tokio::test]
+async fn routes_theta_join_to_nested_loop_operator() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements =
+        parse_query("SELECT c.id FROM bench4.seed1.customers c JOIN bench4.seed1.orders o ON c.id < o.customer_id")
+            .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[customers, orders])
+            .await
+            .expect("theta join translation should succeed");
+
+    let nested_loop = translated.operators.iter().find_map(|op| match op {
+        kionas::planner::PhysicalOperator::NestedLoopJoin { spec } => Some(spec),
+        _ => None,
+    });
+
+    let nested_loop = nested_loop.expect("translated plan should include NestedLoopJoin");
+    assert!(!nested_loop.predicates.is_empty());
+}
+
+#[tokio::test]
+async fn routes_cross_join_to_nested_loop_operator_without_predicates() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements =
+        parse_query("SELECT c.id FROM bench4.seed1.customers c CROSS JOIN bench4.seed1.orders o")
+            .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[customers, orders])
+            .await
+            .expect("cross join translation should succeed");
+
+    let nested_loop = translated.operators.iter().find_map(|op| match op {
+        kionas::planner::PhysicalOperator::NestedLoopJoin { spec } => Some(spec),
+        _ => None,
+    });
+
+    let nested_loop = nested_loop.expect("translated plan should include NestedLoopJoin");
+    assert!(nested_loop.predicates.is_empty());
+    assert!(nested_loop.keys.is_empty());
+}
+
+#[tokio::test]
 async fn translates_union_all_query_to_union_operator() {
     let users = relation_metadata("sales", "public", "users");
     let users_ca = relation_metadata("sales", "public", "users_ca");

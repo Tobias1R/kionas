@@ -68,6 +68,32 @@ pub struct SortSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryJoinType {
     Inner,
+    InnerTheta,
+    InnerCross,
+    Left,
+}
+
+/// What: One JOIN predicate clause extracted from a JOIN ON condition.
+///
+/// Inputs:
+/// - Variant payload captures equality or theta comparison shape.
+///
+/// Output:
+/// - Serializable predicate contract for join algorithm selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QueryJoinPredicate {
+    Equality {
+        left: String,
+        right: String,
+    },
+    Theta {
+        left: String,
+        op: String,
+        right: String,
+    },
+    Composite {
+        predicates: Vec<QueryJoinPredicate>,
+    },
 }
 
 /// What: One equi-join key pair from a JOIN ON clause.
@@ -97,6 +123,9 @@ pub struct QueryJoinKey {
 pub struct QueryJoinSpec {
     pub join_type: QueryJoinType,
     pub right: QueryNamespace,
+    #[serde(default)]
+    pub predicates: Vec<QueryJoinPredicate>,
+    #[serde(default)]
     pub keys: Vec<QueryJoinKey>,
 }
 
@@ -1114,27 +1143,110 @@ fn parse_join_column_ref(expr: &Expr) -> Result<String, QueryModelError> {
     }
 }
 
-fn parse_join_keys(expr: &Expr, out: &mut Vec<QueryJoinKey>) -> Result<(), QueryModelError> {
+fn parse_join_operand(expr: &Expr) -> String {
+    parse_join_column_ref(expr).unwrap_or_else(|_| expr.to_string())
+}
+
+fn parse_join_column_pair(left: &Expr, right: &Expr) -> Option<(String, String)> {
+    let left_col = parse_join_column_ref(left).ok()?;
+    let right_col = parse_join_column_ref(right).ok()?;
+    Some((left_col, right_col))
+}
+
+fn parse_join_predicates(
+    expr: &Expr,
+    out: &mut Vec<QueryJoinPredicate>,
+) -> Result<(), QueryModelError> {
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
-                parse_join_keys(left, out)?;
-                parse_join_keys(right, out)?;
+                parse_join_predicates(left, out)?;
+                parse_join_predicates(right, out)?;
                 Ok(())
             }
             BinaryOperator::Eq => {
-                let left_key = parse_join_column_ref(left)?;
-                let right_key = parse_join_column_ref(right)?;
-                out.push(QueryJoinKey {
-                    left: left_key,
-                    right: right_key,
+                if let Some((left_col, right_col)) = parse_join_column_pair(left, right) {
+                    out.push(QueryJoinPredicate::Equality {
+                        left: left_col,
+                        right: right_col,
+                    });
+                } else {
+                    out.push(QueryJoinPredicate::Theta {
+                        left: parse_join_operand(left),
+                        op: "=".to_string(),
+                        right: parse_join_operand(right),
+                    });
+                }
+                Ok(())
+            }
+            BinaryOperator::Gt
+            | BinaryOperator::GtEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::NotEq => {
+                out.push(QueryJoinPredicate::Theta {
+                    left: parse_join_operand(left),
+                    op: op.to_string(),
+                    right: parse_join_operand(right),
                 });
                 Ok(())
             }
             _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
         },
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            if *negated {
+                return Err(QueryModelError::UnsupportedJoinExpression(expr.to_string()));
+            }
+
+            out.push(QueryJoinPredicate::Composite {
+                predicates: vec![
+                    QueryJoinPredicate::Theta {
+                        left: parse_join_operand(expr),
+                        op: ">=".to_string(),
+                        right: parse_join_operand(low),
+                    },
+                    QueryJoinPredicate::Theta {
+                        left: parse_join_operand(expr),
+                        op: "<=".to_string(),
+                        right: parse_join_operand(high),
+                    },
+                ],
+            });
+            Ok(())
+        }
         _ => Err(QueryModelError::UnsupportedJoinExpression(expr.to_string())),
     }
+}
+
+fn collect_equality_keys_from_predicates(
+    predicates: &[QueryJoinPredicate],
+    out: &mut Vec<QueryJoinKey>,
+) {
+    for predicate in predicates {
+        match predicate {
+            QueryJoinPredicate::Equality { left, right } => out.push(QueryJoinKey {
+                left: left.clone(),
+                right: right.clone(),
+            }),
+            QueryJoinPredicate::Composite { predicates } => {
+                collect_equality_keys_from_predicates(predicates, out);
+            }
+            QueryJoinPredicate::Theta { .. } => {}
+        }
+    }
+}
+
+fn contains_theta_predicate(predicates: &[QueryJoinPredicate]) -> bool {
+    predicates.iter().any(|predicate| match predicate {
+        QueryJoinPredicate::Theta { .. } => true,
+        QueryJoinPredicate::Composite { predicates } => contains_theta_predicate(predicates),
+        QueryJoinPredicate::Equality { .. } => false,
+    })
 }
 
 fn parse_join_specs(
@@ -1150,9 +1262,12 @@ fn parse_join_specs(
             _ => return Err(QueryModelError::UnsupportedTableFactor),
         };
 
-        let (join_type, constraint) = match &join.join_operator {
-            JoinOperator::Inner(constraint) => (QueryJoinType::Inner, constraint),
-            JoinOperator::Join(constraint) => (QueryJoinType::Inner, constraint),
+        let (mut join_type, constraint) = match &join.join_operator {
+            JoinOperator::Inner(constraint) => (QueryJoinType::Inner, Some(constraint)),
+            JoinOperator::Join(constraint) => (QueryJoinType::Inner, Some(constraint)),
+            JoinOperator::CrossJoin(_) => (QueryJoinType::InnerCross, None),
+            JoinOperator::Left(constraint) => (QueryJoinType::Left, Some(constraint)),
+            JoinOperator::LeftOuter(constraint) => (QueryJoinType::Left, Some(constraint)),
             _ => {
                 return Err(QueryModelError::UnsupportedJoinType(
                     "non-inner".to_string(),
@@ -1160,15 +1275,25 @@ fn parse_join_specs(
             }
         };
 
-        let on = match constraint {
-            JoinConstraint::On(expr) => expr,
-            _ => return Err(QueryModelError::UnsupportedJoinConstraint),
-        };
+        let mut predicates = Vec::new();
+        if let Some(constraint) = constraint {
+            let on = match constraint {
+                JoinConstraint::On(expr) => expr,
+                _ => return Err(QueryModelError::UnsupportedJoinConstraint),
+            };
+
+            parse_join_predicates(on, &mut predicates)?;
+        }
 
         let mut keys = Vec::new();
-        parse_join_keys(on, &mut keys)?;
-        if keys.is_empty() {
+        collect_equality_keys_from_predicates(&predicates, &mut keys);
+
+        if join_type != QueryJoinType::InnerCross && predicates.is_empty() {
             return Err(QueryModelError::MissingJoinKeys);
+        }
+
+        if join_type == QueryJoinType::Inner && contains_theta_predicate(&predicates) {
+            join_type = QueryJoinType::InnerTheta;
         }
 
         let (database, schema, table) =
@@ -1182,6 +1307,7 @@ fn parse_join_specs(
                 table,
                 raw: right_table,
             },
+            predicates,
             keys,
         });
     }
@@ -1778,5 +1904,100 @@ mod tests {
                 .iter()
                 .any(|dep| dep.table == "orders")
         );
+    }
+
+    #[test]
+    fn parses_inner_theta_join_predicate() {
+        let statements = parse_query(
+            "SELECT * FROM sales.public.users u JOIN sales.public.orders o ON u.id < o.customer_id",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.joins.len(), 1);
+        assert_eq!(model.joins[0].join_type, super::QueryJoinType::InnerTheta);
+        assert!(model.joins[0].keys.is_empty());
+        assert!(!model.joins[0].predicates.is_empty());
+    }
+
+    #[test]
+    fn parses_cross_join_without_predicates() {
+        let statements =
+            parse_query("SELECT * FROM sales.public.users CROSS JOIN sales.public.orders")
+                .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.joins.len(), 1);
+        assert_eq!(model.joins[0].join_type, super::QueryJoinType::InnerCross);
+        assert!(model.joins[0].keys.is_empty());
+        assert!(model.joins[0].predicates.is_empty());
+    }
+
+    #[test]
+    fn parses_between_join_into_composite_predicate() {
+        let statements = parse_query(
+            "SELECT * FROM sales.public.users u JOIN sales.public.orders o ON u.id BETWEEN o.id AND o.customer_id",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.joins.len(), 1);
+        assert!(
+            model.joins[0]
+                .predicates
+                .iter()
+                .any(|predicate| matches!(predicate, super::QueryJoinPredicate::Composite { .. }))
+        );
+    }
+
+    #[test]
+    fn parses_column_literal_join_equality_as_theta_not_key() {
+        let statements = parse_query(
+            "SELECT * FROM sales.public.users u JOIN sales.public.orders o ON o.id = 8493",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.joins.len(), 1);
+        assert_eq!(model.joins[0].join_type, super::QueryJoinType::InnerTheta);
+        assert!(model.joins[0].keys.is_empty());
+        assert!(model.joins[0].predicates.iter().any(|predicate| {
+            matches!(
+                predicate,
+                super::QueryJoinPredicate::Theta { op, .. } if op == "="
+            )
+        }));
     }
 }

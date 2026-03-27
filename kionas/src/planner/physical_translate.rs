@@ -79,6 +79,7 @@ pub fn build_physical_plan_from_logical_plan(
             spec: PhysicalJoinSpec {
                 join_type: join.join_type.clone(),
                 right_relation: join.right_relation.clone(),
+                predicates: Vec::new(),
                 keys: join.keys.clone(),
             },
         });

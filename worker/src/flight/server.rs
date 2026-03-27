@@ -267,6 +267,14 @@ fn read_env_u64_with_min(var: &str, default: u64, min: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn flight_max_message_bytes() -> usize {
+    read_env_usize_with_min(
+        "WORKER_FLIGHT_MAX_MESSAGE_BYTES",
+        16 * 1024 * 1024,
+        1024 * 1024,
+    )
+}
+
 fn downstream_routing_limits() -> DownstreamRoutingLimits {
     DownstreamRoutingLimits {
         queue_capacity: read_env_usize_with_min("WORKER_FLIGHT_ROUTER_QUEUE_CAPACITY", 16, 1),
@@ -530,7 +538,10 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
                     &session_id_owned,
                 )?;
 
-                let mut client = FlightServiceClient::new(channel);
+                let max_message_bytes = flight_max_message_bytes();
+                let mut client = FlightServiceClient::new(channel)
+                    .max_decoding_message_size(max_message_bytes)
+                    .max_encoding_message_size(max_message_bytes);
                 let mut response =
                     tokio::time::timeout(limits.request_timeout, client.do_put(request))
                         .await
@@ -1846,9 +1857,13 @@ pub(crate) async fn serve_flight(
     addr: SocketAddr,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let service = WorkerFlightService::new(shared_data);
+    let max_message_bytes = flight_max_message_bytes();
+    let service = FlightServiceServer::new(service)
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes);
 
     tonic14::transport::Server::builder()
-        .add_service(FlightServiceServer::new(service))
+        .add_service(service)
         .serve(addr)
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
