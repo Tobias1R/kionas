@@ -48,6 +48,89 @@ pub struct PhysicalLimitSpec {
     pub offset: u64,
 }
 
+/// What: One concrete bound in a SQL window frame.
+///
+/// Inputs:
+/// - Variant payload carries optional offset for relative bounds.
+///
+/// Output:
+/// - Serializable frame bound consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PhysicalWindowFrameBound {
+    UnboundedPreceding,
+    Preceding { offset: u64 },
+    CurrentRow,
+    Following { offset: u64 },
+    UnboundedFollowing,
+}
+
+/// What: Supported SQL window frame unit.
+///
+/// Inputs:
+/// - Variant selects frame interpretation strategy.
+///
+/// Output:
+/// - Serializable frame unit consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PhysicalWindowFrameUnit {
+    Rows,
+    Range,
+}
+
+/// What: Window frame definition attached to one window function expression.
+///
+/// Inputs:
+/// - `unit`: Frame unit (`ROWS` or `RANGE`).
+/// - `start_bound`: Inclusive frame start bound.
+/// - `end_bound`: Inclusive frame end bound.
+///
+/// Output:
+/// - Serializable frame contract used during window execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalWindowFrameSpec {
+    pub unit: PhysicalWindowFrameUnit,
+    pub start_bound: PhysicalWindowFrameBound,
+    pub end_bound: PhysicalWindowFrameBound,
+}
+
+/// What: One window function expression in a physical operator.
+///
+/// Inputs:
+/// - `function_name`: Canonical function name (for example `ROW_NUMBER`, `SUM`).
+/// - `args`: Ordered function arguments.
+/// - `output_name`: Projected output column name.
+/// - `frame`: Optional frame definition for frame-aware functions.
+///
+/// Output:
+/// - Serializable function descriptor consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalWindowFunctionSpec {
+    pub function_name: String,
+    #[serde(default)]
+    pub args: Vec<PhysicalExpr>,
+    pub output_name: String,
+    #[serde(default)]
+    pub frame: Option<PhysicalWindowFrameSpec>,
+}
+
+/// What: Physical window aggregation operator contract.
+///
+/// Inputs:
+/// - `partition_by`: Expressions defining partition boundaries.
+/// - `order_by`: Expressions defining order inside partitions.
+/// - `functions`: Ordered window function descriptors.
+///
+/// Output:
+/// - Serializable window operator contract consumed by worker runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhysicalWindowSpec {
+    #[serde(default)]
+    pub partition_by: Vec<PhysicalExpr>,
+    #[serde(default)]
+    pub order_by: Vec<PhysicalSortExpr>,
+    pub functions: Vec<PhysicalWindowFunctionSpec>,
+}
+
 /// What: One UNION operand relation in the physical execution contract.
 ///
 /// Inputs:
@@ -96,6 +179,9 @@ pub enum PhysicalOperator {
     AggregateFinal {
         spec: PhysicalAggregateSpec,
     },
+    WindowAggr {
+        spec: PhysicalWindowSpec,
+    },
     Sort {
         keys: Vec<PhysicalSortExpr>,
     },
@@ -132,6 +218,7 @@ impl PhysicalOperator {
             PhysicalOperator::NestedLoopJoin => "NestedLoopJoin",
             PhysicalOperator::AggregatePartial { .. } => "AggregatePartial",
             PhysicalOperator::AggregateFinal { .. } => "AggregateFinal",
+            PhysicalOperator::WindowAggr { .. } => "WindowAggr",
             PhysicalOperator::Sort { .. } => "Sort",
             PhysicalOperator::Limit { .. } => "Limit",
             PhysicalOperator::ExchangeShuffle { .. } => "ExchangeShuffle",

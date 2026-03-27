@@ -82,6 +82,107 @@ fn relation_metadata_with_location(
     )
 }
 
+fn orders_relation_metadata(database: &str, schema: &str, table: &str) -> KionasRelationMetadata {
+    KionasRelationMetadata::from_metastore(
+        database,
+        schema,
+        table,
+        Some(ms::TableMetadata {
+            uuid: format!("{}-{}-{}", database, schema, table),
+            schema_name: schema.to_string(),
+            table_name: table.to_string(),
+            table_type: "delta".to_string(),
+            location: String::new(),
+            container: String::new(),
+            columns: vec![
+                ms::ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+                ms::ColumnSchema {
+                    name: "customer_id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+                ms::ColumnSchema {
+                    name: "product_id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+                ms::ColumnSchema {
+                    name: "quantity".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+            ],
+            database_name: database.to_string(),
+        }),
+    )
+}
+
+fn customers_relation_metadata(
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> KionasRelationMetadata {
+    KionasRelationMetadata::from_metastore(
+        database,
+        schema,
+        table,
+        Some(ms::TableMetadata {
+            uuid: format!("{}-{}-{}", database, schema, table),
+            schema_name: schema.to_string(),
+            table_name: table.to_string(),
+            table_type: "delta".to_string(),
+            location: String::new(),
+            container: String::new(),
+            columns: vec![
+                ms::ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+                ms::ColumnSchema {
+                    name: "name".to_string(),
+                    data_type: "varchar".to_string(),
+                    nullable: true,
+                },
+            ],
+            database_name: database.to_string(),
+        }),
+    )
+}
+
+fn products_relation_metadata(database: &str, schema: &str, table: &str) -> KionasRelationMetadata {
+    KionasRelationMetadata::from_metastore(
+        database,
+        schema,
+        table,
+        Some(ms::TableMetadata {
+            uuid: format!("{}-{}-{}", database, schema, table),
+            schema_name: schema.to_string(),
+            table_name: table.to_string(),
+            table_type: "delta".to_string(),
+            location: String::new(),
+            container: String::new(),
+            columns: vec![
+                ms::ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: "bigint".to_string(),
+                    nullable: false,
+                },
+                ms::ColumnSchema {
+                    name: "name".to_string(),
+                    data_type: "varchar".to_string(),
+                    nullable: true,
+                },
+            ],
+            database_name: database.to_string(),
+        }),
+    )
+}
+
 #[test]
 fn fallback_error_classifier_accepts_object_store_resolution_failures() {
     let object_store_error = "Internal error: No suitable object store found for s3://warehouse/path. See RuntimeEnv::register_object_store";
@@ -249,6 +350,322 @@ async fn planner_wrapper_translate_to_kionas_plan_matches_direct_function() {
         .expect("direct translation should succeed");
 
     assert_eq!(wrapped, direct);
+}
+
+#[tokio::test]
+async fn translates_window_query_to_window_operator() {
+    let relation = relation_metadata("sales", "public", "users");
+
+    let statements = parse_query(
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY id) AS rn FROM sales.public.users",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "sales", "public")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("window query translation should succeed");
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::WindowAggr { .. })),
+        "translated plan must include WindowAggr operator"
+    );
+}
+
+#[tokio::test]
+async fn translates_cte_row_number_query_without_global_sort_mismatch() {
+    let relation = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements = parse_query(
+        "WITH ranked_orders AS (SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY quantity DESC) AS rn FROM bench4.seed1.orders o) SELECT * FROM ranked_orders WHERE rn <= 3",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("cte row_number query translation should succeed");
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::WindowAggr { .. })),
+        "translated plan must include WindowAggr operator"
+    );
+}
+
+#[tokio::test]
+async fn translates_cte_rank_query_with_upstream_aggregate_for_window_sort_column() {
+    let relation = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements = parse_query(
+        "WITH product_totals AS (SELECT product_id, SUM(quantity) AS total_quantity FROM bench4.seed1.orders GROUP BY product_id), ranked_products AS (SELECT pt.*, RANK() OVER (ORDER BY total_quantity DESC) AS rnk FROM product_totals pt) SELECT * FROM ranked_products WHERE rnk <= 5",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("cte rank query translation should succeed");
+
+    let aggregate_count = translated
+        .operators
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                kionas::planner::PhysicalOperator::AggregatePartial { .. }
+                    | kionas::planner::PhysicalOperator::AggregateFinal { .. }
+            )
+        })
+        .count();
+    assert!(
+        aggregate_count >= 2,
+        "translated plan should include aggregate operators producing total_quantity before ranking"
+    );
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::WindowAggr { .. })),
+        "translated plan should include WindowAggr operator"
+    );
+}
+
+#[tokio::test]
+async fn translates_cte_window_aggregate_query_without_missing_aggregate_spec_failure() {
+    let relation = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements = parse_query(
+        "WITH order_stats AS (SELECT o.*, COUNT(*) OVER (PARTITION BY customer_id) AS order_count, AVG(quantity) OVER (PARTITION BY customer_id) AS avg_quantity, SUM(quantity) OVER (PARTITION BY customer_id) AS total_quantity, MIN(quantity) OVER (PARTITION BY customer_id) AS min_quantity, MAX(quantity) OVER (PARTITION BY customer_id) AS max_quantity FROM bench4.seed1.orders o) SELECT * FROM order_stats WHERE customer_id = 700",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("cte window aggregate query translation should succeed");
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::WindowAggr { .. })),
+        "translated plan must include WindowAggr operator"
+    );
+}
+
+#[tokio::test]
+async fn translates_cte_dense_rank_query_with_upstream_aggregate_for_window_sort_column() {
+    let relation = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements = parse_query(
+        "WITH customer_totals AS (SELECT customer_id, SUM(quantity) AS total_quantity FROM bench4.seed1.orders GROUP BY customer_id), ranked_customers AS (SELECT ct.*, DENSE_RANK() OVER (ORDER BY total_quantity DESC) AS drnk FROM customer_totals ct) SELECT * FROM ranked_customers WHERE drnk <= 5",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[relation])
+            .await
+            .expect("cte dense_rank query translation should succeed");
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::AggregateFinal { .. })),
+        "translated plan should include aggregate operators producing total_quantity before dense rank"
+    );
+
+    assert!(
+        translated
+            .operators
+            .iter()
+            .any(|op| matches!(op, kionas::planner::PhysicalOperator::WindowAggr { .. })),
+        "translated plan should include WindowAggr operator"
+    );
+}
+
+#[tokio::test]
+async fn translates_cte_with_outer_join_emits_both_join_operators() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+    let products = products_relation_metadata("bench4", "seed1", "products");
+
+    let statements = parse_query(
+        "WITH customer_orders AS (SELECT c.id, o.quantity, c.name, o.product_id FROM bench4.seed1.customers c JOIN bench4.seed1.orders o ON c.id = o.customer_id WHERE c.id = 700) SELECT co.*, p.name FROM customer_orders co JOIN bench4.seed1.products p ON co.product_id = p.id",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated = translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        &[customers, orders, products],
+    )
+    .await
+    .expect("cte plus outer join query translation should succeed");
+
+    let join_count = translated
+        .operators
+        .iter()
+        .filter(|op| matches!(op, kionas::planner::PhysicalOperator::HashJoin { .. }))
+        .count();
+
+    assert_eq!(
+        join_count, 2,
+        "translated plan should include both CTE-internal and outer join operators"
+    );
+}
+
+#[tokio::test]
+async fn translates_pure_cte_select_star_with_cte_projection_columns_only() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+
+    let statements = parse_query(
+        "WITH customer_orders1 AS (SELECT c.id, o.quantity, c.name, o.product_id FROM bench4.seed1.customers c JOIN bench4.seed1.orders o ON c.id = o.customer_id WHERE c.id = 700) SELECT * FROM customer_orders1 co",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated =
+        translate_datafusion_to_kionas_physical_plan_with_providers(&model, &[customers, orders])
+            .await
+            .expect("pure cte select-star query translation should succeed");
+
+    let projection_exprs = translated
+        .operators
+        .iter()
+        .find_map(|op| match op {
+            kionas::planner::PhysicalOperator::Projection { expressions } => Some(expressions),
+            _ => None,
+        })
+        .expect("translated plan should include projection operator");
+
+    assert_eq!(projection_exprs.len(), 4);
+    assert!(
+        projection_exprs.iter().all(|expr| {
+            !matches!(expr, kionas::planner::PhysicalExpr::Raw { sql } if sql.trim() == "*")
+        }),
+        "projection should expand to CTE-selected columns instead of raw '*'"
+    );
+}
+
+#[tokio::test]
+async fn remaps_outer_join_key_from_cte_alias_to_source_column() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+    let products = products_relation_metadata("bench4", "seed1", "products");
+
+    let statements = parse_query(
+        "WITH customer_orders AS (SELECT c.id, o.quantity, c.name, o.product_id AS ppid FROM bench4.seed1.customers c JOIN bench4.seed1.orders o ON c.id = o.customer_id WHERE c.id = 700) SELECT * FROM customer_orders co JOIN bench4.seed1.products p ON co.ppid = p.id",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated = translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        &[customers, orders, products],
+    )
+    .await
+    .expect("cte alias join query translation should succeed");
+
+    let join_keys = translated
+        .operators
+        .iter()
+        .filter_map(|op| match op {
+            kionas::planner::PhysicalOperator::HashJoin { spec } => Some(spec.keys.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        join_keys.len(),
+        2,
+        "translated plan should include both CTE-internal and outer hash joins"
+    );
+
+    assert!(
+        join_keys
+            .iter()
+            .flatten()
+            .any(|key| key.left == "ppid" && key.right == "id"),
+        "outer join key should resolve to CTE-exposed alias for routing compatibility"
+    );
 }
 
 #[tokio::test]

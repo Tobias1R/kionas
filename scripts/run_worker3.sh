@@ -1,5 +1,5 @@
 #!/bin/bash
-
+sleep 20 # wait for the warehouse to be ready
 ./scripts/configure_worker.sh ./configs/kionas-worker3.json
 
 CMD="./docker-target/debug/worker worker3"

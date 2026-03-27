@@ -6,9 +6,12 @@ use kionas::planner::PlannerError;
 use kionas::planner::{
     AggregateFunction, JoinKeyPair, JoinType, LogicalRelation, PhysicalAggregateExpr,
     PhysicalAggregateSpec, PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan,
-    PhysicalSortExpr, PhysicalUnionOperand, parse_predicate_sql, validate_physical_plan,
+    PhysicalSortExpr, PhysicalUnionOperand, PhysicalWindowFrameBound, PhysicalWindowFrameSpec,
+    PhysicalWindowFrameUnit, PhysicalWindowFunctionSpec, PhysicalWindowSpec, parse_predicate_sql,
+    validate_physical_plan,
 };
 use kionas::sql::query_model::{QueryFromSpec, SelectQueryModel, primary_relation_dependency};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// What: Thin server-side wrapper for DataFusion planning operations.
@@ -81,6 +84,7 @@ struct PlannerIntentFlags {
     has_sort_merge_join: bool,
     has_nested_loop_join: bool,
     has_aggregate: bool,
+    has_window: bool,
     has_union: bool,
     union_child_count: usize,
 }
@@ -362,6 +366,114 @@ fn translation_source_model(model: &SelectQueryModel) -> &SelectQueryModel {
     model
 }
 
+fn resolve_cte_model_from_root<'a>(
+    root: &'a SelectQueryModel,
+    cte_name: &str,
+) -> Option<&'a SelectQueryModel> {
+    root.ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case(cte_name))
+        .map(|cte| cte.query.as_ref())
+}
+
+fn cte_reference_name_for_model<'a>(
+    root: &'a SelectQueryModel,
+    current: &'a SelectQueryModel,
+) -> Option<&'a str> {
+    match &current.from {
+        QueryFromSpec::CteRef { name } => Some(name.as_str()),
+        QueryFromSpec::Table { namespace } => root
+            .ctes
+            .iter()
+            .find(|cte| cte.name.eq_ignore_ascii_case(namespace.table.as_str()))
+            .map(|cte| cte.name.as_str()),
+        QueryFromSpec::Derived { .. } => None,
+    }
+}
+
+fn collect_translation_source_chain(model: &SelectQueryModel) -> Vec<&SelectQueryModel> {
+    let mut chain = Vec::<&SelectQueryModel>::new();
+    let mut current = translation_source_model(model);
+    chain.push(current);
+
+    while let Some(cte_name) = cte_reference_name_for_model(model, current) {
+        let Some(next) = resolve_cte_model_from_root(model, cte_name) else {
+            break;
+        };
+
+        // Guard against malformed/self-referential CTE graphs.
+        if chain.iter().any(|existing| std::ptr::eq(*existing, next)) {
+            break;
+        }
+
+        chain.push(next);
+        current = next;
+    }
+
+    chain
+}
+
+fn deepest_translation_source_model(model: &SelectQueryModel) -> &SelectQueryModel {
+    let chain = collect_translation_source_chain(model);
+    chain.last().copied().unwrap_or(model)
+}
+
+fn joins_equivalent(
+    left: &kionas::sql::query_model::QueryJoinSpec,
+    right: &kionas::sql::query_model::QueryJoinSpec,
+) -> bool {
+    left.join_type == right.join_type
+        && left
+            .right
+            .database
+            .eq_ignore_ascii_case(right.right.database.as_str())
+        && left
+            .right
+            .schema
+            .eq_ignore_ascii_case(right.right.schema.as_str())
+        && left
+            .right
+            .table
+            .eq_ignore_ascii_case(right.right.table.as_str())
+        && left.keys.len() == right.keys.len()
+        && left.keys.iter().zip(right.keys.iter()).all(|(lhs, rhs)| {
+            lhs.left.eq_ignore_ascii_case(rhs.left.as_str())
+                && lhs.right.eq_ignore_ascii_case(rhs.right.as_str())
+        })
+}
+
+fn collect_translation_joins<'a>(
+    model: &'a SelectQueryModel,
+    source_chain: &[&'a SelectQueryModel],
+) -> Vec<&'a kionas::sql::query_model::QueryJoinSpec> {
+    let mut joins = Vec::<&kionas::sql::query_model::QueryJoinSpec>::new();
+
+    for candidate in source_chain.iter().copied().chain(std::iter::once(model)) {
+        for join in &candidate.joins {
+            if joins
+                .iter()
+                .any(|existing| joins_equivalent(existing, join))
+            {
+                continue;
+            }
+            joins.push(join);
+        }
+    }
+
+    joins
+}
+
+fn should_skip_strict_intent_mismatch(model: &SelectQueryModel) -> bool {
+    requires_strict_datafusion_planning(model)
+}
+
+fn is_subquery_predicate_sql(selection_sql: &str) -> bool {
+    let normalized = selection_sql.to_ascii_lowercase();
+    normalized.contains(" in (select")
+        || normalized.contains(" exists (")
+        || normalized.contains(" not exists (")
+}
+
 fn collect_exec_node_names(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
     out.push(plan.name().to_string());
     for child in plan.children() {
@@ -470,6 +582,200 @@ fn parse_aggregate_expr_from_projection(expr: &str) -> Option<(AggregateFunction
     None
 }
 
+fn parse_window_function_from_projection(expr: &str) -> Option<PhysicalWindowFunctionSpec> {
+    let (base_expr, alias) = parse_projection_alias(expr);
+    let lower = base_expr.to_ascii_lowercase();
+    let over_pos = lower.find(" over (")?;
+
+    let func_expr = base_expr[..over_pos].trim();
+    let open_paren = func_expr.find('(')?;
+    let close_paren = func_expr.rfind(')')?;
+    if close_paren <= open_paren {
+        return None;
+    }
+
+    let function_name = func_expr[..open_paren].trim();
+    if function_name.is_empty() {
+        return None;
+    }
+
+    let args_sql = func_expr[open_paren + 1..close_paren].trim();
+    let args = if args_sql == "*" || args_sql.is_empty() {
+        Vec::new()
+    } else {
+        args_sql
+            .split(',')
+            .map(|arg| PhysicalExpr::Raw {
+                sql: arg.trim().to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let output_name = alias.unwrap_or_else(|| projection_output_name(expr));
+
+    Some(PhysicalWindowFunctionSpec {
+        function_name: function_name.to_ascii_uppercase(),
+        args,
+        output_name,
+        frame: None,
+    })
+}
+
+fn parse_window_partition_and_order_from_projection(
+    expr: &str,
+) -> Option<(Vec<PhysicalExpr>, Vec<PhysicalSortExpr>)> {
+    let (base_expr, _) = parse_projection_alias(expr);
+    let lower = base_expr.to_ascii_lowercase();
+    let over_pos = lower.find(" over (")?;
+
+    let over_clause = base_expr[over_pos + 6..].trim();
+    if !(over_clause.starts_with('(') && over_clause.ends_with(')')) {
+        return None;
+    }
+
+    let inner = over_clause[1..over_clause.len() - 1].trim();
+    let lower_inner = inner.to_ascii_lowercase();
+
+    let partition_pos = lower_inner.find("partition by");
+    let order_pos = lower_inner.find("order by");
+
+    let mut partition_by = Vec::<PhysicalExpr>::new();
+    let mut order_by = Vec::<PhysicalSortExpr>::new();
+
+    if let Some(p_pos) = partition_pos {
+        let p_start = p_pos + "partition by".len();
+        let p_end = order_pos.unwrap_or(inner.len());
+        let partition_sql = inner[p_start..p_end].trim();
+        if !partition_sql.is_empty() {
+            partition_by = partition_sql
+                .split(',')
+                .map(|part| PhysicalExpr::Raw {
+                    sql: part.trim().to_string(),
+                })
+                .collect::<Vec<_>>();
+        }
+    }
+
+    if let Some(o_pos) = order_pos {
+        let o_start = o_pos + "order by".len();
+        let order_sql = inner[o_start..].trim();
+        if !order_sql.is_empty() {
+            order_by = order_sql
+                .split(',')
+                .map(|item| {
+                    let trimmed = item.trim();
+                    let lower_item = trimmed.to_ascii_lowercase();
+                    if lower_item.ends_with(" desc") {
+                        PhysicalSortExpr {
+                            expression: PhysicalExpr::Raw {
+                                sql: trimmed[..trimmed.len() - 5].trim().to_string(),
+                            },
+                            ascending: false,
+                        }
+                    } else if lower_item.ends_with(" asc") {
+                        PhysicalSortExpr {
+                            expression: PhysicalExpr::Raw {
+                                sql: trimmed[..trimmed.len() - 4].trim().to_string(),
+                            },
+                            ascending: true,
+                        }
+                    } else {
+                        PhysicalSortExpr {
+                            expression: PhysicalExpr::Raw {
+                                sql: trimmed.to_string(),
+                            },
+                            ascending: true,
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+        }
+    }
+
+    Some((partition_by, order_by))
+}
+
+fn build_window_spec_from_model(model: &SelectQueryModel) -> Option<PhysicalWindowSpec> {
+    let mut functions = model
+        .projection
+        .iter()
+        .filter_map(|expr| parse_window_function_from_projection(expr))
+        .collect::<Vec<_>>();
+
+    if functions.is_empty() {
+        return None;
+    }
+
+    let (partition_by, order_by) = model
+        .projection
+        .iter()
+        .find_map(|expr| parse_window_partition_and_order_from_projection(expr))
+        .unwrap_or_default();
+
+    // For partition-only windows, default aggregate window frame should cover the whole partition.
+    if order_by.is_empty() {
+        for function in &mut functions {
+            match function.function_name.as_str() {
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                    function.frame = Some(PhysicalWindowFrameSpec {
+                        unit: PhysicalWindowFrameUnit::Rows,
+                        start_bound: PhysicalWindowFrameBound::UnboundedPreceding,
+                        end_bound: PhysicalWindowFrameBound::UnboundedFollowing,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(PhysicalWindowSpec {
+        partition_by,
+        order_by,
+        functions,
+    })
+}
+
+fn model_contains_window(model: &SelectQueryModel) -> bool {
+    model
+        .projection
+        .iter()
+        .any(|expr| expr.to_ascii_lowercase().contains(" over ("))
+}
+
+fn is_simple_projection_reference(expr: &str) -> bool {
+    let (base_expr, _) = parse_projection_alias(expr);
+    is_simple_identifier_reference(base_expr.as_str())
+}
+
+fn should_project_cte_source_columns(
+    model: &SelectQueryModel,
+    source_model: &SelectQueryModel,
+    has_aggregate: bool,
+    has_window: bool,
+) -> bool {
+    if has_aggregate || has_window {
+        return false;
+    }
+
+    if !matches!(model.from, QueryFromSpec::CteRef { .. }) {
+        return false;
+    }
+
+    if !model.joins.is_empty() {
+        return false;
+    }
+
+    if model.projection.len() != 1 || model.projection[0].trim() != "*" {
+        return false;
+    }
+
+    !source_model.projection.is_empty()
+        && source_model
+            .projection
+            .iter()
+            .all(|expr| is_simple_projection_reference(expr))
+}
+
 fn projection_output_name(expr: &str) -> String {
     let lower = expr.to_ascii_lowercase();
     if let Some(index) = lower.rfind(" as ") {
@@ -494,6 +800,64 @@ fn projection_output_name(expr: &str) -> String {
     }
 
     normalize_identifier(expr)
+}
+
+fn normalize_join_key_identifier(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let no_prefix = if let Some((_, rhs)) = trimmed.rsplit_once('.') {
+        rhs
+    } else {
+        trimmed
+    };
+
+    no_prefix
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn cte_projection_alias_map(model: &SelectQueryModel) -> HashMap<String, String> {
+    let mut aliases = HashMap::<String, String>::new();
+
+    for projection in &model.projection {
+        let (base_expr, alias) = parse_projection_alias(projection);
+        let Some(alias) = alias else {
+            continue;
+        };
+
+        if !is_simple_identifier_reference(base_expr.as_str()) {
+            continue;
+        }
+
+        aliases.insert(
+            normalize_join_key_identifier(alias.as_str()),
+            normalize_join_key_identifier(base_expr.as_str()),
+        );
+    }
+
+    aliases
+}
+
+fn remap_join_key_with_cte_alias(raw: &str, aliases: &HashMap<String, String>) -> String {
+    let normalized = normalize_join_key_identifier(raw);
+
+    // If key already references an exposed alias, keep it.
+    if aliases.contains_key(normalized.as_str()) {
+        return normalized;
+    }
+
+    // If key references the source column for an aliased projection, rewrite it
+    // to the CTE-exposed alias so downstream stage routing uses visible columns.
+    if let Some((alias, _)) = aliases
+        .iter()
+        .find(|(_, source)| source.eq_ignore_ascii_case(normalized.as_str()))
+    {
+        return alias.clone();
+    }
+
+    normalized
 }
 
 fn build_aggregate_spec_from_model(
@@ -525,6 +889,10 @@ fn build_aggregate_spec_from_model(
                 output_name,
             });
         }
+    }
+
+    if aggregates.is_empty() {
+        return Ok(None);
     }
 
     Ok(Some(PhysicalAggregateSpec {
@@ -602,9 +970,14 @@ fn derive_intent_from_exec_plan(plan: &Arc<dyn ExecutionPlan>) -> PlannerIntentF
     });
     let (has_hash_join, has_sort_merge_join, has_nested_loop_join) =
         detect_join_families(&node_names);
-    let has_aggregate = node_names
-        .iter()
-        .any(|name| name.to_ascii_lowercase().contains("aggregate"));
+    let has_window = node_names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("window")
+    });
+    let has_aggregate = node_names.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        lower.contains("aggregateexec") && !lower.contains("window")
+    });
     let mut union_child_counts = Vec::<usize>::new();
     collect_union_child_counts(plan, &mut union_child_counts);
     let has_union = !union_child_counts.is_empty();
@@ -620,6 +993,7 @@ fn derive_intent_from_exec_plan(plan: &Arc<dyn ExecutionPlan>) -> PlannerIntentF
         has_sort_merge_join,
         has_nested_loop_join,
         has_aggregate,
+        has_window,
         has_union,
         union_child_count,
     }
@@ -735,6 +1109,7 @@ fn derive_intent_from_sql_text(sql: &str) -> PlannerIntentFlags {
         || normalized.contains("min(")
         || normalized.contains("max(")
         || normalized.contains("avg(");
+    let has_window = normalized.contains(" over (");
     let has_union = normalized.contains(" union ");
 
     PlannerIntentFlags {
@@ -747,6 +1122,7 @@ fn derive_intent_from_sql_text(sql: &str) -> PlannerIntentFlags {
         has_sort_merge_join: false,
         has_nested_loop_join: false,
         has_aggregate,
+        has_window,
         has_union,
         union_child_count: 0,
     }
@@ -757,7 +1133,11 @@ fn build_kionas_plan_from_intent(
     intent: PlannerIntentFlags,
 ) -> Result<PhysicalPlan, PlannerError> {
     let source_model = translation_source_model(model);
-    let primary_relation = primary_relation_dependency(source_model).ok_or_else(|| {
+    let source_chain = collect_translation_source_chain(model);
+    let translation_joins = collect_translation_joins(model, &source_chain);
+    let cte_aliases = cte_projection_alias_map(source_model);
+    let scan_source_model = deepest_translation_source_model(model);
+    let primary_relation = primary_relation_dependency(scan_source_model).ok_or_else(|| {
         PlannerError::InvalidPhysicalPipeline(
             "query model has no relation dependencies for table scan translation".to_string(),
         )
@@ -773,7 +1153,11 @@ fn build_kionas_plan_from_intent(
     let has_nested_loop_join = intent.has_nested_loop_join;
     let has_join = has_hash_join || has_sort_merge_join || has_nested_loop_join;
     let has_aggregate = intent.has_aggregate;
+    let has_window = intent.has_window;
     let has_union = intent.has_union;
+    let has_chain_aggregate = source_chain
+        .iter()
+        .any(|candidate| model_contains_aggregate(candidate));
 
     if has_union {
         let union_spec = model.union.as_ref().ok_or_else(|| {
@@ -881,8 +1265,10 @@ fn build_kionas_plan_from_intent(
         return Ok(translated);
     }
 
-    let model_has_join = !source_model.joins.is_empty();
-    if has_join != model_has_join {
+    let allow_mismatch = should_skip_strict_intent_mismatch(model);
+
+    let model_has_join = !translation_joins.is_empty();
+    if has_join != model_has_join && !allow_mismatch {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "join translation mismatch: datafusion_has_join={} model_has_join={}",
             has_join, model_has_join
@@ -890,23 +1276,35 @@ fn build_kionas_plan_from_intent(
     }
 
     let model_has_aggregate = model_contains_aggregate(model);
-    if has_aggregate != model_has_aggregate {
+    if has_aggregate != model_has_aggregate && !allow_mismatch {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "aggregate translation mismatch: datafusion_has_aggregate={} model_has_aggregate={}",
             has_aggregate, model_has_aggregate
         )));
     }
 
-    let model_has_filter = source_model.selection.is_some();
-    if has_filter != model_has_filter {
+    let model_has_window = model_contains_window(source_model) || model_contains_window(model);
+    if has_window != model_has_window && !allow_mismatch {
+        return Err(PlannerError::InvalidPhysicalPipeline(format!(
+            "window translation mismatch: datafusion_has_window={} model_has_window={}",
+            has_window, model_has_window
+        )));
+    }
+
+    let model_has_filter = source_model.selection.is_some() || model.selection.is_some();
+    if has_filter != model_has_filter && !allow_mismatch {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "filter translation mismatch: datafusion_has_filter={} model_has_filter={}",
             has_filter, model_has_filter
         )));
     }
 
-    let model_has_sort = !model.order_by.is_empty();
-    if has_sort != model_has_sort {
+    let model_has_sort = !model.order_by.is_empty()
+        || (has_window
+            && build_window_spec_from_model(source_model)
+                .map(|spec| !spec.order_by.is_empty())
+                .unwrap_or(false));
+    if has_sort != model_has_sort && !allow_mismatch {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "sort translation mismatch: datafusion_has_sort={} model_has_sort={}",
             has_sort, model_has_sort
@@ -914,7 +1312,7 @@ fn build_kionas_plan_from_intent(
     }
 
     let model_has_limit = model.limit.is_some();
-    if has_limit != model_has_limit {
+    if has_limit != model_has_limit && !allow_mismatch {
         return Err(PlannerError::InvalidPhysicalPipeline(format!(
             "limit translation mismatch: datafusion_has_limit={} model_has_limit={}",
             has_limit, model_has_limit
@@ -948,22 +1346,47 @@ fn build_kionas_plan_from_intent(
         },
     });
 
-    if has_filter && let Some(selection_sql) = source_model.selection.as_ref() {
-        let predicate =
-            parse_predicate_sql(selection_sql).map_err(PlannerError::UnsupportedPredicate)?;
-        operators.push(PhysicalOperator::Filter {
-            predicate: PhysicalExpr::Predicate { predicate },
-        });
+    let is_cte_source_translation = matches!(model.from, QueryFromSpec::CteRef { .. });
+
+    if has_filter {
+        let selection_sql = source_model.selection.as_ref().or(model.selection.as_ref());
+
+        if let Some(selection_sql) = selection_sql {
+            if is_cte_source_translation
+                && source_model.selection.is_none()
+                && model.selection.is_some()
+            {
+                log::warn!(
+                    "Skipping outer CTE filter pushdown during source-table translation: {}",
+                    selection_sql
+                );
+            } else {
+                match parse_predicate_sql(selection_sql) {
+                    Ok(predicate) => {
+                        operators.push(PhysicalOperator::Filter {
+                            predicate: PhysicalExpr::Predicate { predicate },
+                        });
+                    }
+                    Err(err) if is_subquery_predicate_sql(selection_sql) && has_filter => {
+                        log::warn!(
+                            "Skipping filter translation for subquery predicate; runtime filter parser cannot deserialize this predicate shape yet: {}",
+                            err
+                        );
+                    }
+                    Err(err) => return Err(PlannerError::UnsupportedPredicate(err)),
+                }
+            }
+        }
     }
 
     if has_hash_join {
-        if source_model.joins.is_empty() {
+        if translation_joins.is_empty() {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "DataFusion join node detected but query model contains no join spec".to_string(),
             ));
         }
 
-        for join in &source_model.joins {
+        for join in translation_joins {
             operators.push(PhysicalOperator::HashJoin {
                 spec: kionas::planner::PhysicalJoinSpec {
                     join_type: match join.join_type {
@@ -978,8 +1401,8 @@ fn build_kionas_plan_from_intent(
                         .keys
                         .iter()
                         .map(|key| JoinKeyPair {
-                            left: key.left.clone(),
-                            right: key.right.clone(),
+                            left: remap_join_key_with_cte_alias(key.left.as_str(), &cte_aliases),
+                            right: remap_join_key_with_cte_alias(key.right.as_str(), &cte_aliases),
                         })
                         .collect::<Vec<_>>(),
                 },
@@ -987,30 +1410,73 @@ fn build_kionas_plan_from_intent(
         }
     }
 
-    if has_aggregate {
-        let aggregate_spec = build_aggregate_spec_from_model(model)?.ok_or_else(|| {
-            PlannerError::InvalidPhysicalPipeline(
+    if has_aggregate || has_chain_aggregate {
+        let mut aggregate_spec = None;
+        for candidate in &source_chain {
+            aggregate_spec = build_aggregate_spec_from_model(candidate)?;
+            if aggregate_spec.is_some() {
+                break;
+            }
+        }
+
+        if aggregate_spec.is_none() {
+            aggregate_spec = build_aggregate_spec_from_model(model)?;
+        }
+
+        if let Some(aggregate_spec) = aggregate_spec {
+            operators.push(PhysicalOperator::AggregatePartial {
+                spec: aggregate_spec.clone(),
+            });
+            operators.push(PhysicalOperator::AggregateFinal {
+                spec: aggregate_spec,
+            });
+        } else if allow_mismatch {
+            log::warn!("Skipping aggregate translation for strict-intent-mismatch query shape");
+        } else {
+            return Err(PlannerError::InvalidPhysicalPipeline(
                 "DataFusion aggregate node detected but query model has no aggregate spec"
                     .to_string(),
-            )
-        })?;
+            ));
+        }
+    }
 
-        operators.push(PhysicalOperator::AggregatePartial {
-            spec: aggregate_spec.clone(),
-        });
-        operators.push(PhysicalOperator::AggregateFinal {
-            spec: aggregate_spec,
-        });
+    if has_window {
+        let window_spec = build_window_spec_from_model(source_model)
+            .or_else(|| build_window_spec_from_model(model))
+            .ok_or_else(|| {
+                PlannerError::InvalidPhysicalPipeline(
+                    "DataFusion window node detected but query model has no window spec"
+                        .to_string(),
+                )
+            })?;
+
+        operators.push(PhysicalOperator::WindowAggr { spec: window_spec });
     }
 
     if has_projection {
-        let expressions = if has_aggregate {
+        let expressions = if has_aggregate || has_window {
             model
                 .projection
                 .iter()
-                .map(|expr| PhysicalExpr::ColumnRef {
-                    name: projection_output_name(expr),
+                .map(|expr| {
+                    let trimmed = expr.trim();
+                    if trimmed == "*" {
+                        PhysicalExpr::Raw {
+                            sql: "*".to_string(),
+                        }
+                    } else {
+                        PhysicalExpr::ColumnRef {
+                            name: projection_output_name(expr),
+                        }
+                    }
                 })
+                .collect::<Vec<_>>()
+        } else if should_project_cte_source_columns(model, source_model, has_aggregate, has_window)
+        {
+            source_model
+                .projection
+                .iter()
+                .map(|sql| PhysicalExpr::Raw { sql: sql.clone() })
                 .collect::<Vec<_>>()
         } else {
             model

@@ -106,16 +106,18 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
             )
         })?;
 
-    let hash_join_count = plan
+    let hash_join_indices = plan
         .operators
         .iter()
-        .filter(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
-        .count();
-    if hash_join_count > 1 {
-        return Err(PlannerError::InvalidPhysicalPipeline(
-            "pipeline must contain at most one hash join".to_string(),
-        ));
-    }
+        .enumerate()
+        .filter_map(|(index, operator)| {
+            if matches!(operator, PhysicalOperator::HashJoin { .. }) {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     let aggregate_partial_count = plan
         .operators
@@ -142,6 +144,17 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
     if aggregate_partial_count != aggregate_final_count {
         return Err(PlannerError::InvalidPhysicalPipeline(
             "aggregate partial/final operators must appear together".to_string(),
+        ));
+    }
+
+    let window_count = plan
+        .operators
+        .iter()
+        .filter(|op| matches!(op, PhysicalOperator::WindowAggr { .. }))
+        .count();
+    if window_count > 1 {
+        return Err(PlannerError::InvalidPhysicalPipeline(
+            "pipeline must contain at most one window aggregate operator".to_string(),
         ));
     }
 
@@ -191,18 +204,40 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
         }
     }
 
-    if let Some(join_index) = plan
+    if let Some(window_index) = plan
         .operators
         .iter()
-        .position(|op| matches!(op, PhysicalOperator::HashJoin { .. }))
+        .position(|op| matches!(op, PhysicalOperator::WindowAggr { .. }))
     {
-        if join_index > projection_index {
+        if window_index >= projection_index {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "window aggregate must appear before projection".to_string(),
+            ));
+        }
+
+        if let Some(aggregate_final_index) = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOperator::AggregateFinal { .. }))
+            && window_index < aggregate_final_index
+        {
+            return Err(PlannerError::InvalidPhysicalPipeline(
+                "window aggregate must appear after aggregate final".to_string(),
+            ));
+        }
+    }
+
+    if let Some(first_join_index) = hash_join_indices.first().copied() {
+        if hash_join_indices
+            .iter()
+            .any(|join_index| *join_index > projection_index)
+        {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "hash join must appear before projection".to_string(),
             ));
         }
 
-        if join_index == 0 {
+        if first_join_index == 0 {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "hash join must appear after table scan".to_string(),
             ));
@@ -212,7 +247,9 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
             .operators
             .iter()
             .position(|op| matches!(op, PhysicalOperator::Sort { .. }))
-            && join_index > sort_index
+            && hash_join_indices
+                .iter()
+                .any(|join_index| *join_index > sort_index)
         {
             return Err(PlannerError::InvalidPhysicalPipeline(
                 "hash join must appear before sort".to_string(),
@@ -373,6 +410,26 @@ pub fn validate_physical_plan(plan: &PhysicalPlan) -> Result<(), PlannerError> {
                     if aggregate.output_name.trim().is_empty() {
                         return Err(PlannerError::InvalidPhysicalPipeline(
                             "aggregate output name cannot be empty".to_string(),
+                        ));
+                    }
+                }
+            }
+            PhysicalOperator::WindowAggr { spec } => {
+                if spec.functions.is_empty() {
+                    return Err(PlannerError::InvalidPhysicalPipeline(
+                        "window aggregate must include at least one function".to_string(),
+                    ));
+                }
+
+                for function in &spec.functions {
+                    if function.function_name.trim().is_empty() {
+                        return Err(PlannerError::InvalidPhysicalPipeline(
+                            "window function name cannot be empty".to_string(),
+                        ));
+                    }
+                    if function.output_name.trim().is_empty() {
+                        return Err(PlannerError::InvalidPhysicalPipeline(
+                            "window function output name cannot be empty".to_string(),
                         ));
                     }
                 }

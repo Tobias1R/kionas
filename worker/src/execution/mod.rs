@@ -5,3 +5,6 @@ pub(crate) mod pipeline;
 pub(crate) mod planner;
 pub(crate) mod query;
 pub(crate) mod router;
+pub(crate) mod window;
+pub(crate) mod window_frame;
+pub(crate) mod window_functions;

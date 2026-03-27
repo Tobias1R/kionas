@@ -384,27 +384,183 @@ fn split_once_case_insensitive<'a>(haystack: &'a str, needle: &str) -> Option<(&
     })
 }
 
-fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
-    let (_, after_order_by) = match split_once_case_insensitive(sql, "order by") {
-        Some(parts) => parts,
-        None => return Vec::new(),
-    };
+fn sanitize_sql_for_top_level_clause_search(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
 
-    let mut order_clause = after_order_by.trim();
-    for stopper in [" limit ", " offset ", " fetch "] {
-        if let Some((head, _)) = split_once_case_insensitive(order_clause, stopper) {
-            order_clause = head.trim();
+    while i < bytes.len() {
+        let ch = bytes[i] as char;
+
+        if ch == '\'' {
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() {
+                let current = bytes[i] as char;
+                if current == '\'' {
+                    if i + 1 < bytes.len() && (bytes[i + 1] as char) == '\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        if ch == '-' && i + 1 < bytes.len() && (bytes[i + 1] as char) == '-' {
+            out.push(' ');
+            i += 2;
+            while i < bytes.len() {
+                let current = bytes[i] as char;
+                if current == '\n' {
+                    out.push('\n');
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        if ch == '/' && i + 1 < bytes.len() && (bytes[i + 1] as char) == '*' {
+            out.push(' ');
+            i += 2;
+            while i + 1 < bytes.len() {
+                if (bytes[i] as char) == '*' && (bytes[i + 1] as char) == '/' {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(ch.to_ascii_lowercase());
+        i += 1;
+    }
+
+    out
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn find_top_level_keyword(sql: &str, keyword: &str, search_start: usize) -> Option<usize> {
+    if keyword.is_empty() || search_start >= sql.len() || keyword.len() > sql.len() {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut depth = 0i32;
+    let mut index = search_start;
+
+    while index + keyword_bytes.len() <= bytes.len() {
+        let ch = bytes[index] as char;
+        if ch == '(' {
+            depth += 1;
+            index += 1;
+            continue;
+        }
+
+        if ch == ')' {
+            depth = (depth - 1).max(0);
+            index += 1;
+            continue;
+        }
+
+        if depth == 0 && &bytes[index..index + keyword_bytes.len()] == keyword_bytes {
+            let before_ok = if index == 0 {
+                true
+            } else {
+                !is_identifier_char(bytes[index - 1] as char)
+            };
+            let after_index = index + keyword_bytes.len();
+            let after_ok = if after_index >= bytes.len() {
+                true
+            } else {
+                !is_identifier_char(bytes[after_index] as char)
+            };
+
+            if before_ok && after_ok {
+                return Some(index);
+            }
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn split_top_level_csv(clause: &str) -> Vec<String> {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::<String>::new();
+
+    for (index, ch) in clause.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                let segment = clause[start..index].trim();
+                if !segment.is_empty() {
+                    out.push(segment.to_string());
+                }
+                start = index + 1;
+            }
+            _ => {}
         }
     }
 
-    if order_clause.is_empty() {
-        return Vec::new();
+    let tail = clause[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
     }
 
-    order_clause
-        .split(',')
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
+    out
+}
+
+fn extract_top_level_clause(sql: &str, keyword: &str, stoppers: &[&str]) -> Option<String> {
+    let sanitized = sanitize_sql_for_top_level_clause_search(sql);
+    let start_index = find_top_level_keyword(&sanitized, keyword, 0)?;
+    let clause_start = start_index + keyword.len();
+
+    let mut clause_end = sanitized.len();
+    for stopper in stoppers {
+        if let Some(index) = find_top_level_keyword(&sanitized, stopper, clause_start)
+            && index < clause_end
+        {
+            clause_end = index;
+        }
+    }
+
+    let raw = sql[clause_start..clause_end].trim();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
+    let Some(order_clause) =
+        extract_top_level_clause(sql, "order by", &["limit", "offset", "fetch"])
+    else {
+        return Vec::new();
+    };
+
+    split_top_level_csv(order_clause.as_str())
+        .into_iter()
         .map(|segment| {
             let lower = segment.to_ascii_lowercase();
             if lower.ends_with(" desc") {
@@ -429,28 +585,15 @@ fn parse_order_by_from_sql(sql: &str) -> Vec<SortSpec> {
 }
 
 fn parse_group_by_from_sql(sql: &str) -> Vec<String> {
-    let (_, after_group_by) = match split_once_case_insensitive(sql, "group by") {
-        Some(parts) => parts,
-        None => return Vec::new(),
+    let Some(group_clause) = extract_top_level_clause(
+        sql,
+        "group by",
+        &["having", "order by", "limit", "offset", "fetch"],
+    ) else {
+        return Vec::new();
     };
 
-    let mut group_clause = after_group_by.trim();
-    for stopper in [" order by ", " limit ", " offset ", " fetch ", " having "] {
-        if let Some((head, _)) = split_once_case_insensitive(group_clause, stopper) {
-            group_clause = head.trim();
-        }
-    }
-
-    if group_clause.is_empty() {
-        return Vec::new();
-    }
-
-    group_clause
-        .split(',')
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
+    split_top_level_csv(group_clause.as_str())
 }
 
 /// What: Parse a SQL numeric clause token as non-negative integer.
@@ -1209,6 +1352,44 @@ mod tests {
 
         assert!(parsed.get("diagnostics").is_none());
         assert!(parsed.get("physical_plan").is_none());
+    }
+
+    #[test]
+    fn ignores_window_order_by_inside_cte() {
+        let statements = parse_query(
+            "WITH ranked_orders AS (SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY quantity DESC) AS rn FROM bench4.seed1.orders o) SELECT * FROM ranked_orders WHERE rn <= 3",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "bench4", "seed1")
+            .expect("query model should build")
+            .model;
+
+        assert!(model.order_by.is_empty());
+    }
+
+    #[test]
+    fn ignores_group_by_inside_cte_chain_for_outer_select() {
+        let statements = parse_query(
+            "WITH product_totals AS (SELECT product_id, SUM(quantity) AS total_quantity FROM bench4.seed1.orders GROUP BY product_id), ranked_products AS (SELECT pt.*, RANK() OVER (ORDER BY total_quantity DESC) AS rnk FROM product_totals pt) SELECT * FROM ranked_products WHERE rnk <= 5",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "bench4", "seed1")
+            .expect("query model should build")
+            .model;
+
+        assert!(model.group_by.is_empty());
     }
 
     #[tokio::test]

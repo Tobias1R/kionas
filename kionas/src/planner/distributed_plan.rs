@@ -93,6 +93,7 @@ fn is_stage_boundary_operator(operator: &PhysicalOperator) -> bool {
             | PhysicalOperator::ExchangeShuffle { .. }
             | PhysicalOperator::ExchangeBroadcast
             | PhysicalOperator::AggregateFinal { .. }
+            | PhysicalOperator::WindowAggr { .. }
             | PhysicalOperator::HashJoin { .. }
     )
 }
@@ -158,6 +159,19 @@ fn infer_partition_spec_for_boundary(
                 _ => None,
             })
             .unwrap_or(PartitionSpec::Single),
+        PhysicalOperator::WindowAggr { spec } => {
+            if spec.partition_by.is_empty() {
+                PartitionSpec::Single
+            } else {
+                PartitionSpec::Hash {
+                    keys: spec
+                        .partition_by
+                        .iter()
+                        .map(partition_key_for_expr)
+                        .collect::<Vec<_>>(),
+                }
+            }
+        }
         _ => PartitionSpec::Single,
     }
 }

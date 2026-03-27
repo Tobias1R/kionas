@@ -159,3 +159,35 @@ fn extract_runtime_plan_decodes_union_operand_filters() {
     assert!(union.operands[0].filter.is_some());
     assert!(union.operands[1].filter.is_some());
 }
+
+#[test]
+fn extract_runtime_plan_decodes_window_operator() {
+    let mut task = build_query_task();
+    task.execution_plan = serde_json::to_vec(&serde_json::json!([
+        {"TableScan": {"relation": {"database": "sales", "schema": "public", "table": "employees"}}},
+        {"WindowAggr": {
+            "spec": {
+                "partition_by": [{"ColumnRef": {"name": "dept"}}],
+                "order_by": [{"expression": {"ColumnRef": {"name": "salary"}}, "ascending": false}],
+                "functions": [{
+                    "function_name": "ROW_NUMBER",
+                    "args": [],
+                    "output_name": "rn",
+                    "frame": null
+                }]
+            }
+        }},
+        {"Projection": {"expressions": [{"Raw": {"sql": "dept"}}, {"Raw": {"sql": "rn"}}]}},
+        "Materialize"
+    ]))
+    .expect("execution plan payload should serialize");
+
+    let plan = extract_runtime_plan(&task)
+        .expect("runtime planner should decode window operator from execution_plan bytes");
+
+    let window_spec = plan.window_spec.expect("window spec should be extracted");
+    assert_eq!(window_spec.partition_by.len(), 1);
+    assert_eq!(window_spec.order_by.len(), 1);
+    assert_eq!(window_spec.functions.len(), 1);
+    assert_eq!(window_spec.functions[0].output_name, "rn");
+}

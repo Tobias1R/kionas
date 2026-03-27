@@ -15,6 +15,45 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+fn normalize_routing_column_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let no_prefix = if let Some((_, rhs)) = trimmed.rsplit_once('.') {
+        rhs
+    } else {
+        trimmed
+    };
+
+    no_prefix
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('[')
+        .trim_matches(']')
+        .to_string()
+}
+
+fn resolve_routing_column_index(
+    schema: &arrow::datatypes::Schema,
+    requested: &str,
+) -> Option<usize> {
+    if let Ok(index) = schema.index_of(requested) {
+        return Some(index);
+    }
+
+    let normalized = normalize_routing_column_name(requested);
+    if normalized != requested
+        && let Ok(index) = schema.index_of(normalized.as_str())
+    {
+        return Some(index);
+    }
+
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name().eq_ignore_ascii_case(normalized.as_str()))
+        .map(|(index, _)| index)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HashFunction {
     Fnv,
@@ -293,7 +332,7 @@ pub(crate) fn route_batch_hash(
     let key_indices = partition_key_columns
         .iter()
         .map(|column| {
-            schema.index_of(column).map_err(|_| {
+            resolve_routing_column_index(schema.as_ref(), column).ok_or_else(|| {
                 format!(
                     "hash partition key column '{}' is not present in output schema",
                     column
@@ -383,12 +422,13 @@ pub(crate) fn route_batch_range(
         return Err("downstream partition count must be greater than zero".to_string());
     }
 
-    let key_index = batch.schema().index_of(partition_key_column).map_err(|_| {
-        format!(
-            "range partition key column '{}' is not present in output schema",
-            partition_key_column
-        )
-    })?;
+    let key_index = resolve_routing_column_index(batch.schema().as_ref(), partition_key_column)
+        .ok_or_else(|| {
+            format!(
+                "range partition key column '{}' is not present in output schema",
+                partition_key_column
+            )
+        })?;
     let key_array = batch.column(key_index).clone();
 
     let partition_count = usize::try_from(downstream_partition_count)

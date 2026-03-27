@@ -1,7 +1,8 @@
 use crate::services::worker_service_server::worker_service;
 use kionas::planner::{
     PhysicalAggregateSpec, PhysicalExpr, PhysicalJoinSpec, PhysicalLimitSpec, PhysicalOperator,
-    PhysicalPlan, PhysicalSortExpr, PredicateComparisonOp, PredicateExpr, PredicateValue,
+    PhysicalPlan, PhysicalSortExpr, PhysicalWindowSpec, PredicateComparisonOp, PredicateExpr,
+    PredicateValue,
 };
 use kionas::sql::datatypes::ColumnDatatypeSpec;
 use std::collections::HashMap;
@@ -292,6 +293,7 @@ pub(crate) struct RuntimePlan {
     pub(crate) union_spec: Option<RuntimeUnionSpec>,
     pub(crate) aggregate_partial_spec: Option<PhysicalAggregateSpec>,
     pub(crate) aggregate_final_spec: Option<PhysicalAggregateSpec>,
+    pub(crate) window_spec: Option<PhysicalWindowSpec>,
     pub(crate) projection_exprs: Vec<PhysicalExpr>,
     pub(crate) sort_exprs: Vec<PhysicalSortExpr>,
     pub(crate) limit_spec: Option<PhysicalLimitSpec>,
@@ -454,6 +456,7 @@ pub(crate) fn extract_runtime_plan(
     let mut union_spec = None;
     let mut aggregate_partial_spec = None;
     let mut aggregate_final_spec = None;
+    let mut window_spec = None;
     let mut projection_exprs = Vec::new();
     let mut sort_exprs = Vec::new();
     let mut limit_spec = None;
@@ -510,6 +513,9 @@ pub(crate) fn extract_runtime_plan(
             PhysicalOperator::AggregateFinal { spec } => {
                 aggregate_final_spec = Some(spec);
             }
+            PhysicalOperator::WindowAggr { spec } => {
+                window_spec = Some(spec);
+            }
             PhysicalOperator::Projection { expressions } => {
                 projection_exprs = expressions;
             }
@@ -565,6 +571,7 @@ pub(crate) fn extract_runtime_plan(
         union_spec,
         aggregate_partial_spec,
         aggregate_final_spec,
+        window_spec,
         projection_exprs,
         sort_exprs,
         limit_spec,

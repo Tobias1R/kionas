@@ -8,6 +8,7 @@ use crate::execution::planner::{RuntimeScanHints, RuntimeScanMode};
 use crate::execution::planner::{RuntimeUnionSpec, extract_runtime_plan, stage_execution_context};
 use crate::execution::query::QueryNamespace;
 use crate::execution::router::route_batch_from_output_partitioning;
+use crate::execution::window::apply_window_pipeline;
 use crate::services::query_execution::{
     apply_filter_predicate_pipeline, apply_limit_pipeline, apply_projection_pipeline,
     apply_sort_pipeline, normalize_batches_for_sort, resolve_schema_column_index,
@@ -19,8 +20,8 @@ use crate::storage::exchange::{list_stage_exchange_data_keys, stage_exchange_met
 use crate::telemetry::{
     StageExecutionTelemetry, StageLatencyMetrics, StageMemoryMetrics, StageNetworkMetrics,
 };
-use arrow::array::{BooleanArray, new_empty_array};
 use arrow::array::StringArray;
+use arrow::array::{BooleanArray, new_empty_array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -1425,6 +1426,17 @@ pub(crate) async fn execute_query_task(
             );
         }
         batches = apply_aggregate_final_pipeline(&batches, aggregate_final_spec)?;
+    }
+
+    if let Some(window_spec) = runtime_plan.window_spec.as_ref() {
+        if stage_memory_metrics.enabled {
+            log::info!(
+                "event=worker.memory.spill_threshold_check stage_id={} threshold_bytes={} phase=window",
+                stage_context.stage_id,
+                stage_memory_metrics.spill_threshold_bytes
+            );
+        }
+        batches = apply_window_pipeline(&batches, window_spec)?;
     }
 
     if !runtime_plan.projection_exprs.is_empty() {

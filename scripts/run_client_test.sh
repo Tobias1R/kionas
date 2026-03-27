@@ -1,13 +1,13 @@
 #!/bin/bash
 # Script to run the Kionas client with required parameters
 
-CLIENT_BIN="cargo run -p client --"
+CLIENT_BIN="./docker-target/debug/client"
 USERNAME="kionas"
 PASSWORD="kionas"
 SERVER_ADDR="kionas-warehouse:443"
 
 if [ "$1" == "b" ]; then
-    CLIENT_BIN=./docker-target/debug/client
+    CLIENT_BIN=
 fi
 
-$CLIENT_BIN --username $USERNAME --password $PASSWORD --query-file /workspace/scripts/test-scripts/phase9_test.sql
+$CLIENT_BIN --username $USERNAME --password $PASSWORD --query-file /workspace/scripts/test-scripts/testv2.sql

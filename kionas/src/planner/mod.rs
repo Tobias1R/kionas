@@ -28,7 +28,8 @@ pub use logical_plan::{
 };
 pub use physical_plan::{
     PhysicalExpr, PhysicalLimitSpec, PhysicalOperator, PhysicalPlan, PhysicalSortExpr,
-    PhysicalUnionOperand,
+    PhysicalUnionOperand, PhysicalWindowFrameBound, PhysicalWindowFrameSpec,
+    PhysicalWindowFrameUnit, PhysicalWindowFunctionSpec, PhysicalWindowSpec,
 };
 pub use physical_translate::{
     build_distributed_plan_from_logical_plan, build_physical_plan_from_logical_plan,

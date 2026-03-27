@@ -1,0 +1,119 @@
+Date : 2026-03-27 14:35:18
+Directory : c:\code\kionas\worker
+Total : 75 files,  17593 codes, 2518 comments, 2112 blanks, all 22223 lines
+
+Languages
++----------+------------+------------+------------+------------+------------+
+| language | files      | code       | comment    | blank      | total      |
++----------+------------+------------+------------+------------+------------+
+| Rust     |         74 |     17,544 |      2,512 |      2,105 |     22,161 |
+| TOML     |          1 |         49 |          6 |          7 |         62 |
++----------+------------+------------+------------+------------+------------+
+
+Directories
++-------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                    | files      | code       | comment    | blank      | total      |
++-------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                       |         75 |     17,593 |      2,518 |      2,112 |     22,223 |
+| . (Files)                                                               |          2 |         62 |          6 |          8 |         76 |
+| src                                                                     |         71 |     17,247 |      2,461 |      2,070 |     21,778 |
+| src (Files)                                                             |          4 |        491 |        146 |         75 |        712 |
+| src\execution                                                           |         16 |      5,139 |        963 |        564 |      6,666 |
+| src\execution (Files)                                                   |         10 |      4,470 |        856 |        519 |      5,845 |
+| src\execution\aggregate                                                 |          6 |        669 |        107 |         45 |        821 |
+| src\flight                                                              |          4 |      1,690 |        362 |        214 |      2,266 |
+| src\interops                                                            |          3 |        133 |          2 |         11 |        146 |
+| src\services                                                            |          5 |      1,982 |        301 |        255 |      2,538 |
+| src\state                                                               |          1 |        214 |          2 |         24 |        240 |
+| src\storage                                                             |          9 |        938 |        181 |        106 |      1,225 |
+| src\telemetry                                                           |          1 |         62 |         52 |         11 |        125 |
+| src\tests                                                               |         18 |      4,951 |        247 |        640 |      5,838 |
+| src\transactions                                                        |          8 |      1,634 |        200 |        164 |      1,998 |
+| src\transactions (Files)                                                |          2 |      1,035 |         39 |         73 |      1,147 |
+| src\transactions\constraints                                            |          2 |        133 |         22 |         22 |        177 |
+| src\transactions\ddl                                                    |          4 |        466 |        139 |         69 |        674 |
+| src\txn                                                                 |          2 |         13 |          5 |          6 |         24 |
+| tests                                                                   |          2 |        284 |         51 |         34 |        369 |
++-------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++-------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| filename                                                                | language | code       | comment    | blank      | total      |
++-------------------------------------------------------------------------+----------+------------+------------+------------+------------+
+| c:\code\kionas\worker\Cargo.toml                                        | TOML     |         49 |          6 |          7 |         62 |
+| c:\code\kionas\worker\build.rs                                          | Rust     |         13 |          0 |          1 |         14 |
+| c:\code\kionas\worker\src\authz.rs                                      | Rust     |        255 |        111 |         37 |        403 |
+| c:\code\kionas\worker\src\execution\aggregate\aggregate_avg.rs          | Rust     |         21 |         27 |          4 |         52 |
+| c:\code\kionas\worker\src\execution\aggregate\aggregate_count.rs        | Rust     |          8 |         16 |          2 |         26 |
+| c:\code\kionas\worker\src\execution\aggregate\aggregate_max.rs          | Rust     |         12 |         16 |          2 |         30 |
+| c:\code\kionas\worker\src\execution\aggregate\aggregate_min.rs          | Rust     |         12 |         16 |          2 |         30 |
+| c:\code\kionas\worker\src\execution\aggregate\aggregate_sum.rs          | Rust     |          8 |         16 |          2 |         26 |
+| c:\code\kionas\worker\src\execution\aggregate\mod.rs                    | Rust     |        608 |         16 |         33 |        657 |
+| c:\code\kionas\worker\src\execution\artifacts.rs                        | Rust     |        172 |         56 |         27 |        255 |
+| c:\code\kionas\worker\src\execution\join.rs                             | Rust     |        382 |         46 |         47 |        475 |
+| c:\code\kionas\worker\src\execution\mod.rs                              | Rust     |         10 |          0 |          1 |         11 |
+| c:\code\kionas\worker\src\execution\pipeline.rs                         | Rust     |      1,810 |        358 |        205 |      2,373 |
+| c:\code\kionas\worker\src\execution\planner.rs                          | Rust     |        574 |         95 |         47 |        716 |
+| c:\code\kionas\worker\src\execution\query.rs                            | Rust     |        531 |        157 |         72 |        760 |
+| c:\code\kionas\worker\src\execution\router.rs                           | Rust     |        444 |         75 |         60 |        579 |
+| c:\code\kionas\worker\src\execution\window.rs                           | Rust     |        278 |         14 |         35 |        327 |
+| c:\code\kionas\worker\src\execution\window_frame.rs                     | Rust     |         64 |         22 |         10 |         96 |
+| c:\code\kionas\worker\src\execution\window_functions.rs                 | Rust     |        205 |         33 |         15 |        253 |
+| c:\code\kionas\worker\src\flight\client_pool.rs                         | Rust     |        129 |         64 |         19 |        212 |
+| c:\code\kionas\worker\src\flight\conversion.rs                          | Rust     |        106 |         67 |         17 |        190 |
+| c:\code\kionas\worker\src\flight\mod.rs                                 | Rust     |          3 |          0 |          1 |          4 |
+| c:\code\kionas\worker\src\flight\server.rs                              | Rust     |      1,452 |        231 |        177 |      1,860 |
+| c:\code\kionas\worker\src\init.rs                                       | Rust     |         91 |         10 |         18 |        119 |
+| c:\code\kionas\worker\src\interops\client.rs                            | Rust     |         75 |          2 |          3 |         80 |
+| c:\code\kionas\worker\src\interops\manager.rs                           | Rust     |         55 |          0 |          6 |         61 |
+| c:\code\kionas\worker\src\interops\mod.rs                               | Rust     |          3 |          0 |          2 |          5 |
+| c:\code\kionas\worker\src\lib.rs                                        | Rust     |         13 |          0 |          3 |         16 |
+| c:\code\kionas\worker\src\main.rs                                       | Rust     |        132 |         25 |         17 |        174 |
+| c:\code\kionas\worker\src\services\interops_service_client.rs           | Rust     |          9 |          1 |          3 |         13 |
+| c:\code\kionas\worker\src\services\mod.rs                               | Rust     |          4 |          0 |          1 |          5 |
+| c:\code\kionas\worker\src\services\query.rs                             | Rust     |          2 |          0 |          2 |          4 |
+| c:\code\kionas\worker\src\services\query_execution.rs                   | Rust     |      1,535 |        274 |        196 |      2,005 |
+| c:\code\kionas\worker\src\services\worker_service_server.rs             | Rust     |        432 |         26 |         53 |        511 |
+| c:\code\kionas\worker\src\state\mod.rs                                  | Rust     |        214 |          2 |         24 |        240 |
+| c:\code\kionas\worker\src\storage\deltalake.rs                          | Rust     |        222 |         15 |         25 |        262 |
+| c:\code\kionas\worker\src\storage\exchange.rs                           | Rust     |         63 |         46 |          8 |        117 |
+| c:\code\kionas\worker\src\storage\minio.rs                              | Rust     |        241 |         31 |         22 |        294 |
+| c:\code\kionas\worker\src\storage\minio_pool.rs                         | Rust     |         89 |         53 |         14 |        156 |
+| c:\code\kionas\worker\src\storage\mock.rs                               | Rust     |         59 |          0 |          8 |         67 |
+| c:\code\kionas\worker\src\storage\mod.rs                                | Rust     |         92 |          2 |          8 |        102 |
+| c:\code\kionas\worker\src\storage\object_store_adapter.rs               | Rust     |         52 |          6 |          5 |         63 |
+| c:\code\kionas\worker\src\storage\object_store_pool.rs                  | Rust     |         30 |         22 |          6 |         58 |
+| c:\code\kionas\worker\src\storage\staging.rs                            | Rust     |         90 |          6 |         10 |        106 |
+| c:\code\kionas\worker\src\telemetry\mod.rs                              | Rust     |         62 |         52 |         11 |        125 |
+| c:\code\kionas\worker\src\tests\authz_tests.rs                          | Rust     |         32 |          0 |          6 |         38 |
+| c:\code\kionas\worker\src\tests\execution_aggregate_mod_tests.rs        | Rust     |        210 |          0 |         18 |        228 |
+| c:\code\kionas\worker\src\tests\execution_is_operator_tests.rs          | Rust     |         64 |        174 |         19 |        257 |
+| c:\code\kionas\worker\src\tests\execution_join_tests.rs                 | Rust     |        121 |          0 |         21 |        142 |
+| c:\code\kionas\worker\src\tests\execution_pipeline_tests.rs             | Rust     |      1,066 |          0 |        155 |      1,221 |
+| c:\code\kionas\worker\src\tests\execution_planner_tests.rs              | Rust     |        172 |          0 |         22 |        194 |
+| c:\code\kionas\worker\src\tests\execution_query_tests.rs                | Rust     |        647 |          0 |         38 |        685 |
+| c:\code\kionas\worker\src\tests\execution_type_coercion_tests.rs        | Rust     |        297 |         49 |         33 |        379 |
+| c:\code\kionas\worker\src\tests\flight_client_pool_tests.rs             | Rust     |         34 |          1 |          5 |         40 |
+| c:\code\kionas\worker\src\tests\flight_conversion_tests.rs              | Rust     |        147 |          7 |         29 |        183 |
+| c:\code\kionas\worker\src\tests\flight_server_tests.rs                  | Rust     |      1,167 |         16 |        169 |      1,352 |
+| c:\code\kionas\worker\src\tests\router_tests.rs                         | Rust     |        164 |          0 |         25 |        189 |
+| c:\code\kionas\worker\src\tests\services_query_execution_tests.rs       | Rust     |        504 |          0 |         55 |        559 |
+| c:\code\kionas\worker\src\tests\services_worker_service_server_tests.rs | Rust     |        114 |          0 |         17 |        131 |
+| c:\code\kionas\worker\src\tests\storage_exchange_tests.rs               | Rust     |         16 |          0 |          4 |         20 |
+| c:\code\kionas\worker\src\tests\transactions_maestro_insert_tests.rs    | Rust     |         52 |          0 |          7 |         59 |
+| c:\code\kionas\worker\src\tests\transactions_maestro_uri_tests.rs       | Rust     |         22 |          0 |          3 |         25 |
+| c:\code\kionas\worker\src\tests\window_functions_tests.rs               | Rust     |        122 |          0 |         14 |        136 |
+| c:\code\kionas\worker\src\transactions\constraints\insert_not_null.rs   | Rust     |        132 |         22 |         21 |        175 |
+| c:\code\kionas\worker\src\transactions\constraints\mod.rs               | Rust     |          1 |          0 |          1 |          2 |
+| c:\code\kionas\worker\src\transactions\ddl\create_database.rs           | Rust     |        100 |         43 |         18 |        161 |
+| c:\code\kionas\worker\src\transactions\ddl\create_schema.rs             | Rust     |        107 |         34 |         17 |        158 |
+| c:\code\kionas\worker\src\transactions\ddl\create_table.rs              | Rust     |        256 |         62 |         33 |        351 |
+| c:\code\kionas\worker\src\transactions\ddl\mod.rs                       | Rust     |          3 |          0 |          1 |          4 |
+| c:\code\kionas\worker\src\transactions\maestro.rs                       | Rust     |      1,032 |         39 |         72 |      1,143 |
+| c:\code\kionas\worker\src\transactions\mod.rs                           | Rust     |          3 |          0 |          1 |          4 |
+| c:\code\kionas\worker\src\txn\manifest.rs                               | Rust     |         12 |          5 |          5 |         22 |
+| c:\code\kionas\worker\src\txn\mod.rs                                    | Rust     |          1 |          0 |          1 |          2 |
+| c:\code\kionas\worker\tests\execution_type_coercion_tests.rs            | Rust     |        261 |         49 |         29 |        339 |
+| c:\code\kionas\worker\tests\staging_tests.rs                            | Rust     |         23 |          2 |          5 |         30 |
+| Total                                                                   |          |     17,593 |      2,518 |      2,112 |     22,223 |
++-------------------------------------------------------------------------+----------+------------+------------+------------+------------+

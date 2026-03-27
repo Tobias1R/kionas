@@ -86,6 +86,33 @@ fn render_operator_diagnostic(operator: &PhysicalOperator) -> String {
                 .join(", ");
             format!("AggregateFinal(keys=[{}], aggs=[{}])", keys, aggregates)
         }
+        PhysicalOperator::WindowAggr { spec } => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(render_physical_expr)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|key| {
+                    let direction = if key.ascending { "ASC" } else { "DESC" };
+                    format!("{} {}", render_physical_expr(&key.expression), direction)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let functions = spec
+                .functions
+                .iter()
+                .map(|function| function.output_name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "WindowAggr(partition_by=[{}], order_by=[{}], outputs=[{}])",
+                partition_by, order_by, functions
+            )
+        }
         _ => operator.canonical_name().to_string(),
     }
 }

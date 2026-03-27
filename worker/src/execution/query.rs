@@ -96,7 +96,7 @@ fn validate_supported_operator_set(names: &[String]) -> Result<(), String> {
     for name in names {
         match name.as_str() {
             "TableScan" | "Filter" | "Projection" | "HashJoin" | "Sort" | "Limit"
-            | "AggregatePartial" | "AggregateFinal" | "Materialize" => {}
+            | "AggregatePartial" | "AggregateFinal" | "WindowAggr" | "Materialize" => {}
             other => {
                 return Err(format!(
                     "physical operator '{}' is not supported in this phase",
@@ -217,13 +217,17 @@ fn validate_physical_pipeline_shape(operators: &[serde_json::Value]) -> Result<(
         }
     }
 
-    let hash_join_count = names
+    let hash_join_indices = names
         .iter()
-        .filter(|name| name.as_str() == "HashJoin")
-        .count();
-    if hash_join_count > 1 {
-        return Err("physical_plan must include at most one HashJoin operator".to_string());
-    }
+        .enumerate()
+        .filter_map(|(index, name)| {
+            if name.as_str() == "HashJoin" {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
 
     let aggregate_partial_count = names
         .iter()
@@ -246,6 +250,14 @@ fn validate_physical_pipeline_shape(operators: &[serde_json::Value]) -> Result<(
             "physical_plan AggregatePartial and AggregateFinal operators must appear together"
                 .to_string(),
         );
+    }
+
+    let window_count = names
+        .iter()
+        .filter(|name| name.as_str() == "WindowAggr")
+        .count();
+    if window_count > 1 {
+        return Err("physical_plan must include at most one WindowAggr operator".to_string());
     }
 
     if let Some(aggregate_partial_index) = names
@@ -275,26 +287,49 @@ fn validate_physical_pipeline_shape(operators: &[serde_json::Value]) -> Result<(
             return Err("physical_plan AggregateFinal must appear before Projection".to_string());
         }
 
-        if let Some(hash_join_index) = names.iter().position(|name| name.as_str() == "HashJoin")
+        if let Some(hash_join_index) = names.iter().rposition(|name| name.as_str() == "HashJoin")
             && aggregate_partial_index < hash_join_index
         {
             return Err("physical_plan AggregatePartial must appear after HashJoin".to_string());
         }
     }
 
-    if let Some(hash_join_index) = names.iter().position(|name| name.as_str() == "HashJoin") {
+    if !hash_join_indices.is_empty() {
         let projection_index = names
             .iter()
             .position(|name| name.as_str() == "Projection")
             .ok_or_else(|| "physical_plan must include Projection".to_string())?;
-        if hash_join_index > projection_index {
+        if hash_join_indices
+            .iter()
+            .any(|hash_join_index| *hash_join_index > projection_index)
+        {
             return Err("physical_plan HashJoin must appear before Projection".to_string());
         }
 
         if let Some(sort_index) = names.iter().position(|name| name.as_str() == "Sort")
-            && hash_join_index > sort_index
+            && hash_join_indices
+                .iter()
+                .any(|hash_join_index| *hash_join_index > sort_index)
         {
             return Err("physical_plan HashJoin must appear before Sort".to_string());
+        }
+    }
+
+    if let Some(window_index) = names.iter().position(|name| name.as_str() == "WindowAggr") {
+        let projection_index = names
+            .iter()
+            .position(|name| name.as_str() == "Projection")
+            .ok_or_else(|| "physical_plan must include Projection".to_string())?;
+        if window_index >= projection_index {
+            return Err("physical_plan WindowAggr must appear before Projection".to_string());
+        }
+
+        if let Some(aggregate_final_index) = names
+            .iter()
+            .position(|name| name.as_str() == "AggregateFinal")
+            && window_index < aggregate_final_index
+        {
+            return Err("physical_plan WindowAggr must appear after AggregateFinal".to_string());
         }
     }
 
@@ -617,7 +652,7 @@ fn build_result_location(
 ///
 /// Details:
 /// - Preserves existing query handle contract while replacing stub behavior.
-/// - Runtime execution supports scan/filter/projection/sort/limit/materialize subset only.
+/// - Runtime execution supports scan/filter/join/aggregate/window/projection/sort/limit/materialize operators.
 pub(crate) async fn execute_query_task_stub(
     shared: &SharedData,
     task: &worker_service::StagePartitionExecution,
