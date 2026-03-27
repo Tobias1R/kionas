@@ -13,6 +13,9 @@ pub mod predicate_expr;
 pub mod translate;
 pub mod validate;
 
+#[cfg(test)]
+mod tests;
+
 pub use aggregate_spec::{
     AggregateFunction, LogicalAggregateExpr, PhysicalAggregateExpr, PhysicalAggregateSpec,
 };
@@ -36,8 +39,8 @@ pub use physical_translate::{
 };
 pub use physical_validate::validate_physical_plan;
 pub use predicate_expr::{
-    PredicateComparisonOp, PredicateExpr, PredicateValue, parse_predicate_sql,
-    render_predicate_expr,
+    PredicateComparisonOp, PredicateExpr, PredicateValue, parse_predicate_recursive,
+    parse_predicate_sql, render_predicate_expr,
 };
 pub use translate::build_logical_plan_from_select_model;
 pub use validate::{

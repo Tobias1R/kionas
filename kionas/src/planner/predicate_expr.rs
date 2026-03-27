@@ -43,6 +43,16 @@ pub enum PredicateValue {
 /// - Serializable typed predicate tree without raw SQL parsing at worker boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PredicateExpr {
+    And {
+        clauses: Vec<PredicateExpr>,
+    },
+    Or {
+        clauses: Vec<PredicateExpr>,
+    },
+    Not {
+        expr: Box<PredicateExpr>,
+    },
+    // Deprecated alias preserved for backward compatibility with existing payloads.
     Conjunction {
         clauses: Vec<PredicateExpr>,
     },
@@ -92,64 +102,219 @@ fn parse_filter_value(raw: &str) -> Result<PredicateValue, String> {
     ))
 }
 
-fn split_and_respecting_between(filter_sql: &str) -> Vec<String> {
-    let mut clauses = Vec::new();
-    let mut current_pos = 0;
-    let lower = filter_sql.to_ascii_lowercase();
+fn is_word_boundary_at(input: &str, idx: usize) -> bool {
+    if idx >= input.len() {
+        return true;
+    }
+    !input.as_bytes()[idx].is_ascii_alphanumeric() && input.as_bytes()[idx] != b'_'
+}
 
-    while current_pos < filter_sql.len() {
-        let mut closing_and_positions = std::collections::HashSet::new();
-        let mut between_search_pos = current_pos;
+fn has_word_at(lower: &str, idx: usize, token: &str) -> bool {
+    if idx + token.len() > lower.len() {
+        return false;
+    }
+    if &lower[idx..idx + token.len()] != token {
+        return false;
+    }
+    let before_ok = idx == 0 || is_word_boundary_at(lower, idx - 1);
+    let after_ok =
+        idx + token.len() >= lower.len() || is_word_boundary_at(lower, idx + token.len());
+    before_ok && after_ok
+}
 
-        while between_search_pos < filter_sql.len() {
-            let remaining_lower = &lower[between_search_pos..];
-            if let Some(between_offset) = remaining_lower.find(" between ") {
-                let between_pos = between_search_pos + between_offset;
-                let after_between = &lower[between_pos + " between ".len()..];
-                if let Some(and_offset) = after_between.find(" and ") {
-                    let closing_and_pos = between_pos + " between ".len() + and_offset;
-                    closing_and_positions.insert(closing_and_pos);
-                    between_search_pos = closing_and_pos + " and ".len();
-                } else {
-                    break;
+fn split_top_level_logical(input: &str, keyword: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let lower = input.to_ascii_lowercase();
+    let mut start = 0;
+    let mut i = 0;
+    let mut depth = 0_i32;
+    let mut in_single_quote = false;
+    let mut between_pending_and = false;
+
+    while i < input.len() {
+        let byte = input.as_bytes()[i];
+        if byte == b'\'' {
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+
+        if in_single_quote {
+            i += 1;
+            continue;
+        }
+
+        if byte == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if byte == b')' {
+            depth -= 1;
+            i += 1;
+            continue;
+        }
+
+        if depth == 0 {
+            if keyword == "and" && has_word_at(&lower, i, "between") {
+                between_pending_and = true;
+                i += "between".len();
+                continue;
+            }
+
+            if has_word_at(&lower, i, keyword) {
+                if keyword == "and" && between_pending_and {
+                    between_pending_and = false;
+                    i += keyword.len();
+                    continue;
                 }
-            } else {
-                break;
+
+                let part = input[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                i += keyword.len();
+                start = i;
+                continue;
             }
         }
 
-        let mut next_and_pos = None;
-        let mut search_pos = current_pos;
-        while search_pos < filter_sql.len() {
-            let remaining = &lower[search_pos..];
-            if let Some(and_idx) = remaining.find(" and ") {
-                let and_pos = search_pos + and_idx;
-                if !closing_and_positions.contains(&and_pos) {
-                    next_and_pos = Some(and_pos);
-                    break;
-                }
-                search_pos = and_pos + " and ".len();
-            } else {
-                break;
-            }
+        i += 1;
+    }
+
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+
+    parts
+}
+
+fn is_wrapped_by_outer_parentheses(input: &str) -> bool {
+    if !(input.starts_with('(') && input.ends_with(')')) {
+        return false;
+    }
+
+    let mut depth = 0_i32;
+    let mut in_single_quote = false;
+
+    for (idx, byte) in input.as_bytes().iter().enumerate() {
+        if *byte == b'\'' {
+            in_single_quote = !in_single_quote;
+            continue;
         }
 
-        if let Some(and_pos) = next_and_pos {
-            let clause = filter_sql[current_pos..and_pos].trim().to_string();
-            if !clause.is_empty() {
-                clauses.push(clause);
+        if in_single_quote {
+            continue;
+        }
+
+        if *byte == b'(' {
+            depth += 1;
+        } else if *byte == b')' {
+            depth -= 1;
+            if depth == 0 && idx < input.len() - 1 {
+                return false;
             }
-            current_pos = and_pos + " and ".len();
-        } else {
-            let clause = filter_sql[current_pos..].trim().to_string();
-            if !clause.is_empty() {
-                clauses.push(clause);
-            }
-            break;
         }
     }
 
-    clauses
+    depth == 0
+}
+
+fn trim_outer_parentheses(input: &str) -> &str {
+    let mut trimmed = input.trim();
+    while is_wrapped_by_outer_parentheses(trimmed) {
+        trimmed = trimmed[1..trimmed.len() - 1].trim();
+    }
+    trimmed
+}
+
+fn parse_predicate_leaf(raw: &str) -> Result<PredicateExpr, String> {
+    let lower = format!(" {} ", raw.to_ascii_lowercase());
+
+    if lower.contains(" is not null ") {
+        let idx = lower
+            .find(" is not null ")
+            .ok_or_else(|| format!("invalid IS NOT NULL clause '{}'", raw))?;
+        let column = raw[..idx].trim().to_ascii_lowercase();
+        return Ok(PredicateExpr::IsNotNull { column });
+    }
+
+    if lower.contains(" is null ") {
+        let idx = lower
+            .find(" is null ")
+            .ok_or_else(|| format!("invalid IS NULL clause '{}'", raw))?;
+        let column = raw[..idx].trim().to_ascii_lowercase();
+        return Ok(PredicateExpr::IsNull { column });
+    }
+
+    if lower.contains(" not between ") {
+        return parse_between_clause(raw, true);
+    }
+
+    if lower.contains(" between ") {
+        return parse_between_clause(raw, false);
+    }
+
+    if lower.contains(" in ") {
+        return parse_in_clause(raw);
+    }
+
+    let (column, op, rhs) = parse_single_clause(raw)?;
+    Ok(PredicateExpr::Comparison {
+        column,
+        op,
+        value: parse_filter_value(rhs)?,
+    })
+}
+
+/// What: Parse SQL filter text into structured predicate expressions with operator precedence.
+///
+/// Inputs:
+/// - `input`: Raw SQL predicate subset emitted by query model.
+///
+/// Output:
+/// - Structured predicate tree used by physical planning and worker execution.
+///
+/// Details:
+/// - Operator precedence is `NOT` (highest), then `AND`, then `OR` (lowest).
+/// - Parentheses are honored for explicit grouping.
+pub fn parse_predicate_recursive(input: &str) -> Result<PredicateExpr, String> {
+    let trimmed = trim_outer_parentheses(input);
+    if trimmed.is_empty() {
+        return Err("filter predicate is empty".to_string());
+    }
+
+    let or_parts = split_top_level_logical(trimmed, "or");
+    if or_parts.len() > 1 {
+        let mut clauses = Vec::with_capacity(or_parts.len());
+        for part in or_parts {
+            clauses.push(parse_predicate_recursive(&part)?);
+        }
+        return Ok(PredicateExpr::Or { clauses });
+    }
+
+    let and_parts = split_top_level_logical(trimmed, "and");
+    if and_parts.len() > 1 {
+        let mut clauses = Vec::with_capacity(and_parts.len());
+        for part in and_parts {
+            clauses.push(parse_predicate_recursive(&part)?);
+        }
+        return Ok(PredicateExpr::And { clauses });
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if has_word_at(&lower, 0, "not") {
+        let remainder = trimmed[3..].trim();
+        if remainder.is_empty() {
+            return Err("NOT predicate is missing expression".to_string());
+        }
+        return Ok(PredicateExpr::Not {
+            expr: Box::new(parse_predicate_recursive(remainder)?),
+        });
+    }
+
+    parse_predicate_leaf(trimmed)
 }
 
 fn parse_single_clause(input: &str) -> Result<(String, PredicateComparisonOp, &str), String> {
@@ -303,64 +468,7 @@ fn parse_in_clause(clause: &str) -> Result<PredicateExpr, String> {
 /// Output:
 /// - Structured predicate tree used by physical planning and worker execution.
 pub fn parse_predicate_sql(filter_sql: &str) -> Result<PredicateExpr, String> {
-    let trimmed = filter_sql.trim();
-    if trimmed.is_empty() {
-        return Err("filter predicate is empty".to_string());
-    }
-
-    let clauses = split_and_respecting_between(trimmed);
-    let mut nodes = Vec::with_capacity(clauses.len());
-
-    for clause in clauses {
-        let raw = clause.trim();
-        let lower = format!(" {} ", raw.to_ascii_lowercase());
-
-        if lower.contains(" is not null ") {
-            let idx = lower
-                .find(" is not null ")
-                .ok_or_else(|| format!("invalid IS NOT NULL clause '{}'", raw))?;
-            let column = raw[..idx].trim().to_ascii_lowercase();
-            nodes.push(PredicateExpr::IsNotNull { column });
-            continue;
-        }
-
-        if lower.contains(" is null ") {
-            let idx = lower
-                .find(" is null ")
-                .ok_or_else(|| format!("invalid IS NULL clause '{}'", raw))?;
-            let column = raw[..idx].trim().to_ascii_lowercase();
-            nodes.push(PredicateExpr::IsNull { column });
-            continue;
-        }
-
-        if lower.contains(" not between ") {
-            nodes.push(parse_between_clause(raw, true)?);
-            continue;
-        }
-
-        if lower.contains(" between ") {
-            nodes.push(parse_between_clause(raw, false)?);
-            continue;
-        }
-
-        if lower.contains(" in ") {
-            nodes.push(parse_in_clause(raw)?);
-            continue;
-        }
-
-        let (column, op, rhs) = parse_single_clause(raw)?;
-        nodes.push(PredicateExpr::Comparison {
-            column,
-            op,
-            value: parse_filter_value(rhs)?,
-        });
-    }
-
-    if nodes.len() == 1 {
-        return Ok(nodes.remove(0));
-    }
-
-    Ok(PredicateExpr::Conjunction { clauses: nodes })
+    parse_predicate_recursive(filter_sql)
 }
 
 /// What: Render a structured predicate into a deterministic diagnostic string.
@@ -372,11 +480,17 @@ pub fn parse_predicate_sql(filter_sql: &str) -> Result<PredicateExpr, String> {
 /// - Human-readable predicate string for explain and logs.
 pub fn render_predicate_expr(predicate: &PredicateExpr) -> String {
     match predicate {
-        PredicateExpr::Conjunction { clauses } => clauses
+        PredicateExpr::And { clauses } | PredicateExpr::Conjunction { clauses } => clauses
             .iter()
             .map(render_predicate_expr)
             .collect::<Vec<_>>()
             .join(" AND "),
+        PredicateExpr::Or { clauses } => clauses
+            .iter()
+            .map(render_predicate_expr)
+            .collect::<Vec<_>>()
+            .join(" OR "),
+        PredicateExpr::Not { expr } => format!("NOT ({})", render_predicate_expr(expr)),
         PredicateExpr::Comparison { column, op, value } => {
             let op_text = match op {
                 PredicateComparisonOp::Eq => "=",
@@ -469,7 +583,7 @@ mod tests {
             .expect("compound predicate must parse");
 
         match parsed {
-            PredicateExpr::Conjunction { clauses } => {
+            PredicateExpr::And { clauses } => {
                 assert_eq!(clauses.len(), 2);
                 assert!(matches!(clauses[0], PredicateExpr::Between { .. }));
                 assert!(matches!(clauses[1], PredicateExpr::InList { .. }));
@@ -500,7 +614,7 @@ mod tests {
             .expect("null-check predicates must parse");
 
         match parsed {
-            PredicateExpr::Conjunction { clauses } => {
+            PredicateExpr::And { clauses } => {
                 assert_eq!(clauses.len(), 2);
                 assert!(matches!(clauses[0], PredicateExpr::IsNotNull { .. }));
                 assert!(matches!(clauses[1], PredicateExpr::IsNull { .. }));
@@ -518,7 +632,7 @@ mod tests {
 
     #[test]
     fn renders_conjunction_expression() {
-        let predicate = PredicateExpr::Conjunction {
+        let predicate = PredicateExpr::And {
             clauses: vec![
                 PredicateExpr::Comparison {
                     column: "id".to_string(),
@@ -534,5 +648,27 @@ mod tests {
 
         let rendered = render_predicate_expr(&predicate);
         assert_eq!(rendered, "id >= 10 AND name IN ('alice', 'bob')");
+    }
+
+    #[test]
+    fn parses_not_and_or_with_precedence() {
+        let parsed = parse_predicate_sql("a = 1 OR b = 2 AND NOT c = 3")
+            .expect("predicate with OR/AND/NOT must parse");
+
+        match parsed {
+            PredicateExpr::Or { clauses } => {
+                assert_eq!(clauses.len(), 2);
+                assert!(matches!(clauses[0], PredicateExpr::Comparison { .. }));
+                match &clauses[1] {
+                    PredicateExpr::And { clauses } => {
+                        assert_eq!(clauses.len(), 2);
+                        assert!(matches!(clauses[0], PredicateExpr::Comparison { .. }));
+                        assert!(matches!(clauses[1], PredicateExpr::Not { .. }));
+                    }
+                    _ => panic!("expected right-hand side AND clause"),
+                }
+            }
+            _ => panic!("expected OR predicate"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::planner::{PhysicalExpr, PlannerError};
+use crate::planner::{PhysicalExpr, PlannerError, PredicateExpr, render_predicate_expr};
 use crate::sql::datatypes::ColumnDatatypeSpec;
 use std::collections::HashMap;
 
@@ -93,7 +93,53 @@ pub fn check_filter_predicate_types(
             // For Phase 9b Step 5, log known patterns; comprehensive type checking deferred to Step 6.
             validate_raw_sql_predicate(sql, column_types)
         }
-        PhysicalExpr::Predicate { .. } => Ok(()),
+        PhysicalExpr::Predicate { predicate } => {
+            validate_structured_predicate_columns(predicate, column_types)
+        }
+    }
+}
+
+fn schema_has_column(column_types: &HashMap<String, ColumnDatatypeSpec>, column: &str) -> bool {
+    if column_types.contains_key(column) {
+        return true;
+    }
+    column_types
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(column))
+}
+
+fn validate_structured_predicate_columns(
+    predicate: &PredicateExpr,
+    column_types: &HashMap<String, ColumnDatatypeSpec>,
+) -> Result<(), PlannerError> {
+    match predicate {
+        PredicateExpr::And { clauses }
+        | PredicateExpr::Or { clauses }
+        | PredicateExpr::Conjunction { clauses } => {
+            for clause in clauses {
+                validate_structured_predicate_columns(clause, column_types)?;
+            }
+            Ok(())
+        }
+        PredicateExpr::Not { expr } => validate_structured_predicate_columns(expr, column_types),
+        PredicateExpr::Comparison { column, .. }
+        | PredicateExpr::Between { column, .. }
+        | PredicateExpr::InList { column, .. }
+        | PredicateExpr::IsNull { column }
+        | PredicateExpr::IsNotNull { column } => {
+            if schema_has_column(column_types, column) {
+                return Ok(());
+            }
+
+            Err(PlannerError::TypeCoercionViolation(
+                format_planner_type_error(
+                    "MissingColumn",
+                    column,
+                    None,
+                    &render_predicate_expr(predicate),
+                ),
+            ))
+        }
     }
 }
 
@@ -661,5 +707,51 @@ mod tests {
             sql: "id IN ( 1 , 2 , 3 )".to_string(),
         };
         assert!(check_filter_predicate_types(&expr, &schema).is_ok());
+    }
+
+    #[test]
+    fn accepts_structured_nested_predicate_when_all_columns_exist() {
+        let schema = sample_column_schema();
+        let expr = PhysicalExpr::Predicate {
+            predicate: PredicateExpr::Or {
+                clauses: vec![
+                    PredicateExpr::Comparison {
+                        column: "id".to_string(),
+                        op: crate::planner::PredicateComparisonOp::Eq,
+                        value: crate::planner::PredicateValue::Int(1),
+                    },
+                    PredicateExpr::Not {
+                        expr: Box::new(PredicateExpr::IsNull {
+                            column: "name".to_string(),
+                        }),
+                    },
+                ],
+            },
+        };
+        assert!(check_filter_predicate_types(&expr, &schema).is_ok());
+    }
+
+    #[test]
+    fn rejects_structured_nested_predicate_with_missing_column() {
+        let schema = sample_column_schema();
+        let expr = PhysicalExpr::Predicate {
+            predicate: PredicateExpr::And {
+                clauses: vec![
+                    PredicateExpr::Comparison {
+                        column: "id".to_string(),
+                        op: crate::planner::PredicateComparisonOp::Eq,
+                        value: crate::planner::PredicateValue::Int(1),
+                    },
+                    PredicateExpr::Comparison {
+                        column: "missing_col".to_string(),
+                        op: crate::planner::PredicateComparisonOp::Gt,
+                        value: crate::planner::PredicateValue::Int(5),
+                    },
+                ],
+            },
+        };
+        let err = check_filter_predicate_types(&expr, &schema).unwrap_err();
+        assert!(matches!(err, PlannerError::TypeCoercionViolation(_)));
+        assert!(err.to_string().contains("missing_col"));
     }
 }

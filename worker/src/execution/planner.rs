@@ -206,7 +206,14 @@ fn decode_proto_predicate(
             for child in &node.clauses {
                 clauses.push(decode_proto_predicate(child)?);
             }
-            Ok(PredicateExpr::Conjunction { clauses })
+            Ok(PredicateExpr::And { clauses })
+        }
+        worker_service::filter_predicate::Variant::Disjunction(node) => {
+            let mut clauses = Vec::with_capacity(node.clauses.len());
+            for child in &node.clauses {
+                clauses.push(decode_proto_predicate(child)?);
+            }
+            Ok(PredicateExpr::Or { clauses })
         }
         worker_service::filter_predicate::Variant::Comparison(node) => {
             let op = match worker_service::ComparisonOperator::try_from(node.operator)
@@ -269,10 +276,15 @@ fn decode_proto_predicate(
                 column: node.column_name.clone(),
             })
         }
-        worker_service::filter_predicate::Variant::Disjunction(_)
-        | worker_service::filter_predicate::Variant::Not(_) => Err(
-            "disjunction/not predicates are not supported by runtime predicate model".to_string(),
-        ),
+        worker_service::filter_predicate::Variant::Not(node) => {
+            let inner = node
+                .predicate
+                .as_ref()
+                .ok_or_else(|| "NOT predicate payload is missing inner predicate".to_string())?;
+            Ok(PredicateExpr::Not {
+                expr: Box::new(decode_proto_predicate(inner)?),
+            })
+        }
     }
 }
 

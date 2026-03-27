@@ -484,12 +484,25 @@ fn predicate_expr_to_proto(
     use crate::services::worker_service_client::worker_service as ws;
 
     let variant = match predicate {
-        PredicateExpr::Conjunction { clauses } => {
+        PredicateExpr::And { clauses } | PredicateExpr::Conjunction { clauses } => {
             let clauses = clauses
                 .iter()
                 .map(predicate_expr_to_proto)
                 .collect::<Option<Vec<_>>>()?;
             ws::filter_predicate::Variant::Conjunction(ws::PredicateConjunction { clauses })
+        }
+        PredicateExpr::Or { clauses } => {
+            let clauses = clauses
+                .iter()
+                .map(predicate_expr_to_proto)
+                .collect::<Option<Vec<_>>>()?;
+            ws::filter_predicate::Variant::Disjunction(ws::PredicateDisjunction { clauses })
+        }
+        PredicateExpr::Not { expr } => {
+            let predicate = predicate_expr_to_proto(expr)?;
+            ws::filter_predicate::Variant::Not(Box::new(ws::PredicateNot {
+                predicate: Some(Box::new(predicate)),
+            }))
         }
         PredicateExpr::Comparison { column, op, value } => {
             let (proto_value, value_type) = predicate_value_to_proto_scalar(value)?;

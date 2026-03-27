@@ -422,15 +422,10 @@ pub fn apply_filter_predicate_pipeline(
         return Ok(Vec::new());
     }
 
-    let clauses = predicate_to_clauses(predicate)?;
     let mut out = Vec::with_capacity(input.len());
 
     for batch in input {
-        if let Some(schema_map) = schema {
-            validate_filter_clause_types(&clauses, schema_map)?;
-        }
-
-        let mask = build_filter_mask(batch, &clauses)?;
+        let mask = evaluate_predicate_expression(predicate, batch, schema)?;
         let filtered = filter_record_batch(batch, &mask)
             .map_err(|e| format!("failed to apply filter mask: {}", e))?;
         out.push(filtered);
@@ -439,14 +434,119 @@ pub fn apply_filter_predicate_pipeline(
     Ok(out)
 }
 
+/// What: Evaluate a structured predicate expression against a batch and return a row mask.
+///
+/// Inputs:
+/// - `predicate`: Structured predicate tree emitted by planner.
+/// - `batch`: Input batch to evaluate.
+/// - `schema`: Optional schema metadata contract for strict type validation.
+///
+/// Output:
+/// - Boolean mask where `true` marks rows that satisfy the predicate.
+///
+/// Details:
+/// - Supports recursive `AND`/`OR`/`NOT` evaluation with row-mask composition.
+/// - Keeps `Conjunction` as backward-compatible alias for `AND`.
+fn evaluate_predicate_expression(
+    predicate: &PredicateExpr,
+    batch: &RecordBatch,
+    schema: Option<&std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>>,
+) -> Result<BooleanArray, String> {
+    match predicate {
+        PredicateExpr::And { clauses } | PredicateExpr::Conjunction { clauses } => {
+            evaluate_and_predicate(clauses, batch, schema)
+        }
+        PredicateExpr::Or { clauses } => evaluate_or_predicate(clauses, batch, schema),
+        PredicateExpr::Not { expr } => {
+            let inner = evaluate_predicate_expression(expr, batch, schema)?;
+            let mut values = Vec::with_capacity(batch.num_rows());
+            for row_idx in 0..batch.num_rows() {
+                values.push(!inner.value(row_idx));
+            }
+            Ok(BooleanArray::from(values))
+        }
+        PredicateExpr::Comparison { .. }
+        | PredicateExpr::Between { .. }
+        | PredicateExpr::InList { .. }
+        | PredicateExpr::IsNull { .. }
+        | PredicateExpr::IsNotNull { .. } => evaluate_leaf_predicate(predicate, batch, schema),
+    }
+}
+
+fn evaluate_and_predicate(
+    clauses: &[PredicateExpr],
+    batch: &RecordBatch,
+    schema: Option<&std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>>,
+) -> Result<BooleanArray, String> {
+    if clauses.is_empty() {
+        return Ok(BooleanArray::from(vec![true; batch.num_rows()]));
+    }
+
+    let mut accumulator = vec![true; batch.num_rows()];
+    for clause in clauses {
+        if accumulator.iter().all(|value| !*value) {
+            break;
+        }
+
+        let mask = evaluate_predicate_expression(clause, batch, schema)?;
+        for (row_idx, acc) in accumulator.iter_mut().enumerate() {
+            *acc = *acc && mask.value(row_idx);
+        }
+    }
+
+    Ok(BooleanArray::from(accumulator))
+}
+
+fn evaluate_or_predicate(
+    clauses: &[PredicateExpr],
+    batch: &RecordBatch,
+    schema: Option<&std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>>,
+) -> Result<BooleanArray, String> {
+    if clauses.is_empty() {
+        return Ok(BooleanArray::from(vec![false; batch.num_rows()]));
+    }
+
+    let mut accumulator = vec![false; batch.num_rows()];
+    for clause in clauses {
+        if accumulator.iter().all(|value| *value) {
+            break;
+        }
+
+        let mask = evaluate_predicate_expression(clause, batch, schema)?;
+        for (row_idx, acc) in accumulator.iter_mut().enumerate() {
+            *acc = *acc || mask.value(row_idx);
+        }
+    }
+
+    Ok(BooleanArray::from(accumulator))
+}
+
+fn evaluate_leaf_predicate(
+    predicate: &PredicateExpr,
+    batch: &RecordBatch,
+    schema: Option<&std::collections::HashMap<String, kionas::sql::datatypes::ColumnDatatypeSpec>>,
+) -> Result<BooleanArray, String> {
+    let clauses = predicate_to_clauses(predicate)?;
+    if let Some(schema_map) = schema {
+        validate_filter_clause_types(&clauses, schema_map)?;
+    }
+    build_filter_mask(batch, &clauses)
+}
+
 fn predicate_to_clauses(predicate: &PredicateExpr) -> Result<Vec<FilterClause>, String> {
     match predicate {
-        PredicateExpr::Conjunction { clauses } => {
+        PredicateExpr::And { clauses } | PredicateExpr::Conjunction { clauses } => {
             let mut out = Vec::new();
             for clause in clauses {
                 out.extend(predicate_to_clauses(clause)?);
             }
             Ok(out)
+        }
+        PredicateExpr::Or { .. } => {
+            Err("OR predicates are not supported by the legacy filter clause pipeline".to_string())
+        }
+        PredicateExpr::Not { .. } => {
+            Err("NOT predicates are not supported by the legacy filter clause pipeline".to_string())
         }
         PredicateExpr::Comparison { column, op, value } => Ok(vec![FilterClause {
             column: normalize_projection_identifier(column),
@@ -2002,3 +2102,7 @@ fn normalize_string_for_comparison(value: &str) -> &str {
 #[cfg(test)]
 #[path = "../tests/services_query_execution_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/predicate_eval_tests.rs"]
+mod predicate_eval_tests;
