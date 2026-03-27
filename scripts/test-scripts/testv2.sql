@@ -1,5 +1,5 @@
 
-use warehouse compute_small;
+use warehouse compute_xl;
 
 -- select count(*) from bench4.seed1.orders;
 
@@ -40,9 +40,9 @@ with customer_orders as (
     select c.id, o.quantity, c.name, o.product_id
     from bench4.seed1.customers c
     join bench4.seed1.orders o on c.id = o.customer_id
-    where c.name = 'Alice Clark'
+    where c.id = 700
 )
-select * from customer_orders co
+select co.*, p.name from customer_orders co
 join bench4.seed1.products p on co.product_id = p.id
 ;
 
@@ -51,3 +51,7 @@ from bench4.seed1.orders
 group by customer_id
 order by total_quantity desc
 limit 5;
+
+select * from bench4.seed1.orders
+where id in (select id from bench4.seed1.orders where quantity > 5)
+order by quantity desc;

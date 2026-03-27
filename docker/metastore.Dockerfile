@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     librdkafka-dev \
     protobuf-compiler \
     git \
-    cmake \
+    cmake jq \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
@@ -19,7 +19,7 @@ RUN rustup component add rustfmt clippy
 WORKDIR /workspace
 
 # Create source directories for build context
-RUN mkdir -p kionas/src server/src worker/src client/src tool/src metastore/src flight_proxy/src
+RUN mkdir -p kionas/src server/src worker/src client/src tool/src metastore/src flight_proxy/src ui_backend/src
 
 # Copy only Cargo.toml files first for caching
 COPY kionas/Cargo.toml ./kionas/Cargo.toml
@@ -29,6 +29,7 @@ COPY client/Cargo.toml ./client/Cargo.toml
 COPY tool/Cargo.toml ./tool/Cargo.toml
 COPY metastore/Cargo.toml ./metastore/Cargo.toml
 COPY flight_proxy/Cargo.toml ./flight_proxy/Cargo.toml
+COPY ui_backend/Cargo.toml ./ui_backend/Cargo.toml
 COPY Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
 COPY clippy.toml ./clippy.toml
@@ -40,7 +41,8 @@ RUN touch kionas/src/lib.rs \
     && touch client/src/main.rs \
     && touch tool/src/main.rs \
     && touch metastore/src/main.rs \
-    && touch flight_proxy/src/main.rs
+    && touch flight_proxy/src/main.rs \
+    && touch ui_backend/src/main.rs
 
 
 
@@ -55,6 +57,7 @@ COPY client ./client
 COPY tool ./tool
 COPY metastore ./metastore
 COPY flight_proxy ./flight_proxy
+COPY ui_backend ./ui_backend
 COPY configs ./configs
 
 
