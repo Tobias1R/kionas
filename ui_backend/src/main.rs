@@ -1,6 +1,6 @@
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Query, State, Path};
+use axum::http::{StatusCode, HeaderMap, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use deadpool::managed::Pool;
@@ -13,6 +13,8 @@ use redis::AsyncCommands;
 use serde::Deserialize;
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use tokio::fs;
 
 const DEFAULT_REDIS_URL: &str = "redis://redis:6379/2";
 const DEFAULT_REDIS_POOL_SIZE: usize = 8;
@@ -69,11 +71,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/dashboard/key", get(get_dashboard_key))
+        // Default routes for legacy embedded assets
         .route("/", get(index_handler))
         .route("/styles.css", get(styles_handler))
         .route("/app.js", get(app_js_handler))
-        .route("/health", get(health_handler))
-        .route("/dashboard/key", get(get_dashboard_key))
+        // Catch-all for SPA fallback routing (Axum 0.8+ syntax: /{*path})
+        .route("/{*path}", get(spa_static_handler))
         .with_state(state);
 
     let bind_host =
@@ -91,6 +96,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// What: Get static directory path for serving Vite build artifacts.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - PathBuf to the static assets directory.
+/// - Defaults to `./dist` or `../frontend/build` if available.
+///
+/// Details:
+/// - Checks multiple possible paths to support both dev and prod deployments.
+/// - Falls back to current directory if configured directory doesn't exist.
+fn get_static_dir() -> PathBuf {
+    // Check for dist directory (production build output)
+    if PathBuf::from("./dist").exists() {
+        return PathBuf::from("./dist");
+    }
+    // Check for frontend/build (development)
+    if PathBuf::from("../frontend/build").exists() {
+        return PathBuf::from("../frontend/build");
+    }
+    // Check for ui_backend/frontend/build (from workspace root)
+    if PathBuf::from("ui_backend/frontend/build").exists() {
+        return PathBuf::from("ui_backend/frontend/build");
+    }
+    // Default fallback
+    PathBuf::from(".")
+}
+
+/// What: Get MIME type for a file based on extension.
+///
+/// Inputs:
+/// - path: File path or extension string.
+///
+/// Output:
+/// - MIME type string appropriate for HTTP Content-Type header.
+///
+/// Details:
+/// - Supports common web assets: JS, CSS, JSON, images, fonts, SVG.
+/// - Defaults to application/octet-stream for unknown types.
+fn mime_type_for_path(path: &str) -> &'static str {
+    match path {
+        p if p.ends_with(".html") => "text/html; charset=utf-8",
+        p if p.ends_with(".css") => "text/css; charset=utf-8",
+        p if p.ends_with(".js") => "application/javascript; charset=utf-8",
+        p if p.ends_with(".json") => "application/json",
+        p if p.ends_with(".svg") => "image/svg+xml",
+        p if p.ends_with(".png") => "image/png",
+        p if p.ends_with(".jpg") || p.ends_with(".jpeg") => "image/jpeg",
+        p if p.ends_with(".gif") => "image/gif",
+        p if p.ends_with(".webp") => "image/webp",
+        p if p.ends_with(".ico") => "image/x-icon",
+        p if p.ends_with(".woff") => "font/woff",
+        p if p.ends_with(".woff2") => "font/woff2",
+        p if p.ends_with(".ttf") => "font/ttf",
+        p if p.ends_with(".eot") => "application/vnd.ms-fontobject",
+        p if p.ends_with(".otf") => "font/otf",
+        p if p.ends_with(".txt") => "text/plain; charset=utf-8",
+        p if p.ends_with(".map") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// What: Serve static files with SPA fallback routing.
+///
+/// Inputs:
+/// - Path: Requested file path (e.g., "assets/index-abc123.js").
+///
+/// Output:
+/// - File content with correct Content-Type header if found.
+/// - index.html if file not found (SPA fallback for React Router).
+/// - 404 if file is a directory or truly inaccessible.
+///
+/// Details:
+/// - Supports serving Vite build output files with asset hashing.
+/// - For SPA apps, all non-existent routes return index.html.
+/// - Prevents directory traversal with basic path sanitization.
+async fn spa_static_handler(Path(path): Path<String>) -> Response {
+    let static_dir = get_static_dir();
+    
+    // Security: Prevent directory traversal
+    if path.contains("../") || path.contains("..\\") {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+
+    let file_path = static_dir.join(&path);
+
+    // Try to serve the requested file
+    match fs::read(&file_path).await {
+        Ok(content) => {
+            let mime = mime_type_for_path(&path);
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, mime.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()));
+            (StatusCode::OK, headers, content).into_response()
+        }
+        Err(_) => {
+            // If file not found, check if request might be for a React route
+            // Serve index.html for SPA routing (only for requests without extensions)
+            if !path.contains('.') || path.ends_with(".map") {
+                match fs::read(static_dir.join("index.html")).await {
+                    Ok(content) => {
+                        let mut headers = HeaderMap::new();
+                        headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+                        return (StatusCode::OK, headers, content).into_response();
+                    }
+                    Err(e) => {
+                        log::warn!("failed to fallback to index.html: {}", e);
+                        return (StatusCode::NOT_FOUND, "not found").into_response();
+                    }
+                }
+            }
+            (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+    }
 }
 
 fn build_redis_pool() -> Result<RedisPool, String> {
@@ -111,29 +232,73 @@ fn build_redis_pool() -> Result<RedisPool, String> {
         .map_err(|error| format!("redis pool build error: {error}"))
 }
 
+/// What: Serve main index.html entry point.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - HTML response with embedded or served index.html.
+///
+/// Details:
+/// - Uses embedded INDEX_HTML constant for reliable fallback.
+/// - Proper Content-Type header set for HTML.
 async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+/// What: Serve CSS stylesheet.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - CSS response with proper Content-Type header.
+///
+/// Details:
+/// - Uses embedded STYLES_CSS constant.
+/// - Sets charset UTF-8 for proper text encoding.
 async fn styles_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLES_CSS,
     )
 }
 
+/// What: Serve JavaScript bundle.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - JavaScript response with proper Content-Type header.
+///
+/// Details:
+/// - Uses embedded APP_JS constant.
+/// - Sets charset UTF-8 for proper text encoding.
 async fn app_js_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
         [(
-            axum::http::header::CONTENT_TYPE,
+            header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
         APP_JS,
     )
 }
 
+/// What: Health check endpoint for deployment orchestration.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Plain text "ok" response with 200 status.
+///
+/// Details:
+/// - Used by Kubernetes, Docker, and orchestration systems.
+/// - Indicates the backend service is running and responsive.
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -161,6 +326,22 @@ fn to_status_db_url(url: &str) -> Option<String> {
     Some(rebuilt)
 }
 
+/// What: Handle dashboard key retrieval from Redis.
+///
+/// Inputs:
+/// - State: Application state containing Redis connection pool.
+/// - Query: KeyQuery with `name` parameter (alias for Redis key).
+///
+/// Output:
+/// - 200 OK with JSON payload if key exists.
+/// - 400 Bad Request if alias is invalid.
+/// - 404 Not Found if key doesn't exist in Redis.
+/// - 503 Service Unavailable if Redis connection fails.
+///
+/// Details:
+/// - Translates friendly aliases (server_stats, sessions, etc.) to Redis keys.
+/// - Enforces connection pooling for efficient Redis access.
+/// - Proper error handling with clear messages for debugging.
 async fn get_dashboard_key(
     State(state): State<AppState>,
     Query(query): Query<KeyQuery>,
@@ -188,7 +369,7 @@ async fn get_dashboard_key(
     match value {
         Ok(Some(payload)) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            [(header::CONTENT_TYPE, "application/json")],
             payload,
         )
             .into_response(),
@@ -200,6 +381,18 @@ async fn get_dashboard_key(
     }
 }
 
+/// What: Translate user-friendly alias to Redis hash key constant.
+///
+/// Inputs:
+/// - name: Dashboard key alias (server_stats, sessions, tokens, workers, consul_cluster_summary).
+///
+/// Output:
+/// - Some(&'static str) with Redis key constant if alias is valid.
+/// - None if alias is not recognized.
+///
+/// Details:
+/// - Centralizes alias validation for dashboard endpoints.
+/// - References to kionas crate constants ensure consistency across codebase.
 fn key_alias_to_redis_key(name: &str) -> Option<&'static str> {
     match name {
         "server_stats" => Some(REDIS_UI_DASHBOARD_SERVER_STATS_KEY),
@@ -210,3 +403,4 @@ fn key_alias_to_redis_key(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+

@@ -1,0 +1,105 @@
+# Docker Compose for UI Development Environment
+#
+# Purpose: Local development with hot-reload frontend + backend API
+#
+# Usage:
+#   docker-compose -f docker/docker-compose.dev.yaml up
+#
+# Access:
+#   Frontend: http://localhost:5173 (Vite dev server with HMR)
+#   Backend: http://localhost:8081 (Rust API)
+#
+# Features:
+#   - Vite dev server with instant hot reload on .tsx changes
+#   - Volume mounts for live code editing
+#   - Backend serves API on http://ui-backend:8081
+#   - Frontend dev server proxies /api/* to backend
+
+version: '3.8'
+
+services:
+  # Frontend development server with hot module reloading
+  frontend:
+    image: node:24-bullseye
+    container_name: kionas-frontend-dev
+    working_dir: /workspace/ui_backend/frontend
+    
+    volumes:
+      # Mount entire workspace for source access
+      - ..:/workspace:cached
+      # Mount node_modules separately for performance
+      - frontend_node_modules:/workspace/ui_backend/frontend/node_modules
+    
+    environment:
+      # Keep npm quiet
+      NODE_ENV: development
+      VITE_API_BASE: http://ui-backend:8081
+    
+    ports:
+      # Vite dev server
+      - 5173:5173
+    
+    command: 
+      - bash
+      - -c
+      - |
+        echo "Installing dependencies..."
+        npm install
+        echo "Starting Vite dev server..."
+        npm run dev -- --host 0.0.0.0 --port 5173
+    
+    networks:
+      - dev_network
+    
+    depends_on:
+      ui-backend:
+        condition: service_started
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5173"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # Backend API server
+  ui-backend:
+    image: docker-builder
+    container_name: kionas-ui-backend-dev
+    
+    volumes:
+      - ..:/workspace:cached
+    
+    environment:
+      RUST_LOG: debug
+      RUST_BACKTRACE: full
+      KIONAS_HOME: /workspace
+      CARGO_TARGET_DIR: /workspace/docker-target
+      REDIS_URL: redis://192.168.0.15:6379
+      UI_BACKEND_BIND: 0.0.0.0
+      UI_BACKEND_PORT: 8081
+    
+    ports:
+      # Backend API
+      - 8081:8081
+    
+    networks:
+      - dev_network
+    
+    # Run pre-built binary (compile locally with: cargo build --bin ui_backend)
+    command: ["/workspace/docker-target/debug/ui_backend"]
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+
+networks:
+  dev_network:
+    driver: bridge
+
+volumes:
+  frontend_node_modules:

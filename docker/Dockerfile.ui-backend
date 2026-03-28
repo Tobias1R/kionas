@@ -1,0 +1,56 @@
+# What: Multi-stage build for ui_backend with embedded React frontend
+#
+# Stages:
+# 1. rust-builder: Compiles Rust binary (uses pre-built frontend)
+# 2. runtime: Minimal image with just the compiled binary
+#
+# Details:
+# - Frontend must be pre-built locally (npm run build)
+# - Frontend assets copied from ui_backend/dist at build time
+# - Rust compilation with embedded assets
+# - Final image contains only the binary, no build tools
+
+# Stage 1: Build Rust binary with pre-built frontend
+FROM rust:latest AS rust-builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy entire workspace
+COPY . .
+
+# Copy pre-built frontend assets into static directory
+# (dist directory contains the product of: npm run build)
+COPY ui_backend/dist ./ui_backend/static
+
+# Build Rust binary
+RUN cargo build --release --bin ui_backend
+
+# Stage 2: Runtime image
+FROM ubuntu:24.04
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the built binary from rust-builder stage
+COPY --from=rust-builder /build/target/release/ui_backend .
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["sh", "-c", "wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1"]
+
+# Expose port
+EXPOSE 8081
+
+# Run the binary
+CMD ["./ui_backend"]

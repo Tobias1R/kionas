@@ -2,7 +2,7 @@
 REM Restart all containers except builder and devcontainer
 
 REM Define the services you want restarted
-set SERVICES=kionas-metastore kionas-warehouse kionas-flight-proxy kionas-worker1 kionas-worker2 kionas-worker3 kionas-worker4 kionas-ui-backend
+set SERVICES=kionas-metastore kionas-warehouse kionas-flight-proxy kionas-worker1 kionas-worker2 kionas-worker3 kionas-worker4 kionas-ui-backend kionas-frontend-dev kionas-ui-backend-dev
 set LOGS_OUTPUT_DIR=logs
 
 echo clearing old logs in %LOGS_OUTPUT_DIR%...

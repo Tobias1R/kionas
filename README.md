@@ -16,13 +16,46 @@
 - **Tests**: : unit and integration tests for core components (see `worker/tests`).
 
 **Quickstart**
-- **Prereqs**: Rust toolchain (rustup), Cargo, Docker (recommended for MinIO), optional: OpenSSL for cert helpers.
+- **Prereqs**: Rust toolchain (rustup), Cargo, Docker (recommended for MinIO), Node.js >=22.12.0 (for UI), optional: OpenSSL for cert helpers.
 - Build the workspace: `cargo build --workspace`
 - Run a service locally (examples):
   - `cargo run -p metastore`
   - `cargo run -p server`
   - `cargo run -p worker -- <worker_id>`
-- Start compose stack: `docker compose -f docker/docker-compose.yaml up --build`
+  - `cargo run -p ui_backend` (starts dashboard on http://localhost:8081)
+- Start compose stack: `docker compose -f docker/kionas.docker-compose.yaml up --build`
+
+**UI Dashboard**
+
+The `ui_backend` provides a React-based admin dashboard for monitoring Kionas services.
+
+**Quick Start (Development with Hot Reload)**
+```bash
+# Terminal 1: Build and run backend
+cargo build --bin ui_backend
+cargo run --bin ui_backend
+
+# Terminal 2: Start frontend dev server with HMR
+cd ui_backend/frontend
+npm install
+npm run dev
+```
+Access dashboard at `http://localhost:5173` (edit `.tsx` files → auto-refresh in browser)
+
+**Features:**
+  - Real-time dashboard widgets for server stats, sessions, tokens, workers, Consul cluster status
+  - Auto-refreshing data from Redis (every 15 seconds)
+  - React Router SPA with responsive Material Design UI
+  - RESTful API: `GET /dashboard/key?name=<alias>`
+
+**Production Build:**
+```bash
+./scripts/build_ui.bat    # Windows
+./scripts/build_ui.sh     # Linux/Mac
+cargo run --bin ui_backend  # Access http://localhost:8081
+```
+
+For advanced setup, Docker dev environment, and troubleshooting, see [docs/UI_DEVELOPMENT_HOT_RELOAD.md](docs/UI_DEVELOPMENT_HOT_RELOAD.md) and [docs/UI_INTEGRATION_DEVELOPMENT.md](docs/UI_INTEGRATION_DEVELOPMENT.md).
 
 **Development**
 - **Format**: : `cargo fmt --all`

@@ -1,0 +1,28 @@
+# Development Dockerfile for ui_backend
+#
+# What: Minimal container for running pre-built debug binary
+#
+# Details:
+# - Expects binary already compiled locally: cargo build --bin ui_backend
+# - Mounts workspace for real-time code changes
+# - Fast startup for iteration during development
+
+FROM rust:latest
+
+WORKDIR /workspace
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy workspace (bind mount via docker-compose)
+# We use a bind mount instead of COPY for faster iteration
+
+# Expose port
+EXPOSE 8081
+
+# bash infinite loop to keep container running for development
+CMD ["bash", "-c", "while true; do sleep 1000; done"]

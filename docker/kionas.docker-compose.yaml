@@ -27,9 +27,7 @@ services:
     command: ["bash", "-c", "echo 'Builder container ready'" ]
   
   devcontainer:
-    build:
-      context: ..
-      dockerfile: ./docker/Dockerfile.dev
+    image: docker-builder
     container_name: kionas-dev
     environment:
       RUST_LOG: debug
@@ -48,7 +46,7 @@ services:
    
   # Metastore container
   metastore:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-metastore
     container_name: kionas-metastore
     networks:
@@ -73,7 +71,7 @@ services:
 
   # warehouse container
   warehouse:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-warehouse
     container_name: kionas-warehouse
     networks:
@@ -103,7 +101,7 @@ services:
 
   # flight proxy container
   flight-proxy:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-flight-proxy
     container_name: kionas-flight-proxy
     networks:
@@ -125,7 +123,7 @@ services:
 
   # worker container
   worker1:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-worker1
     container_name: kionas-worker1
     networks:
@@ -155,7 +153,7 @@ services:
     command: ["bash", "-c", "/workspace/scripts/run_worker1.sh" ]
 
   worker2:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-worker2
     container_name: kionas-worker2
     networks:
@@ -185,7 +183,7 @@ services:
     command: ["bash", "-c", "/workspace/scripts/run_worker2.sh" ]
 
   worker3:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-worker3
     container_name: kionas-worker3
     networks:
@@ -216,7 +214,7 @@ services:
     command: ["bash", "-c", "/workspace/scripts/run_worker3.sh" ]
 
   worker4:
-    image: docker-devcontainer
+    image: docker-builder
     hostname: kionas-worker4
     container_name: kionas-worker4
     networks:
@@ -247,29 +245,32 @@ services:
     command: ["bash", "-c", "/workspace/scripts/run_worker4.sh" ]
 
   # UI backend container
-  ui-backend:
-    image: docker-devcontainer
-    hostname: kionas-ui-backend
-    container_name: kionas-ui-backend
-    networks:
-      - warehouse_network
-    extra_hosts: *remote_infra_hosts
-    ports:
-      - 8081:8081
-    environment:
-      RUST_LOG: debug
-      RUST_BACKTRACE: full
-      KIONAS_HOME: /workspace
-      CARGO_TARGET_DIR: /workspace/docker-target
-      REDIS_URL: redis://kionas-redis:6379
-      UI_BACKEND_BIND: 0.0.0.0
-      UI_BACKEND_PORT: 8081
-    volumes:
-      - ..:/workspace:cached
-    depends_on:
-      warehouse:
-        condition: service_started
-    command: ["bash", "-c", "/workspace/docker-target/debug/ui_backend" ]
+  # ui-backend:
+  #   build:
+  #     context: ..
+  #     dockerfile: ./docker/Dockerfile.ui-backend
+  #   hostname: kionas-ui-backend
+  #   container_name: kionas-ui-backend
+  #   networks:
+  #     - warehouse_network
+  #   extra_hosts: *remote_infra_hosts
+  #   ports:
+  #     - 8081:8081
+  #   environment:
+  #     RUST_LOG: debug
+  #     RUST_BACKTRACE: full
+  #     KIONAS_HOME: /workspace
+  #     CARGO_TARGET_DIR: /workspace/docker-target
+  #     REDIS_URL: redis://kionas-redis:6379
+  #     UI_BACKEND_BIND: 0.0.0.0
+  #     UI_BACKEND_PORT: 8081
+  #   volumes:
+  #     - ..:/workspace:cached
+  #   depends_on:
+  #     warehouse:
+  #       condition: service_started
+  #   # Run the pre-built binary directly (frontend already embedded)
+  #   command: ["./ui_backend"]
     
 
   
