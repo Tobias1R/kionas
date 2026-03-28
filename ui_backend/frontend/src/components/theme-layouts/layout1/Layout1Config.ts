@@ -14,7 +14,7 @@ const Layout1Config = {
 			open: true
 		},
 		toolbar: {
-			display: true,
+			display: false,
 			style: 'fixed'
 		},
 		footer: {

@@ -36,16 +36,16 @@ function Logo(props: LogoProps) {
 					alt="logo"
 				/>
 				<div className="logo-text flex flex-auto flex-col gap-0.5">
-					<Typography className="tracking-light text-lg leading-none font-semibold">FUSE</Typography>
+					<Typography className="tracking-light text-lg leading-none font-semibold">KIONΔS</Typography>
 					<Typography
 						className="tracking-light text-[12px] leading-none font-semibold"
 						color="text.secondary"
 					>
-						React
+						warehouse
 					</Typography>
 				</div>
 			</div>
-			<MainProjectSelection />
+			
 		</Root>
 	);
 }
