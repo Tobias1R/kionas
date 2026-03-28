@@ -1,6 +1,6 @@
 
 
-use warehouse kionas-worker1;
+use warehouse compute_xl;
 
 create database abc;
 
