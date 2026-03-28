@@ -827,9 +827,21 @@ fn normalize_join_key_identifier(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn cte_projection_alias_map(model: &SelectQueryModel) -> HashMap<String, String> {
-    let mut aliases = HashMap::<String, String>::new();
+fn cte_projection_source_map(model: &SelectQueryModel) -> HashMap<String, String> {
+    let mut sources = HashMap::<String, String>::new();
 
+    if !model.alias_column_map.is_empty() {
+        for (alias, source) in &model.alias_column_map {
+            sources.insert(
+                normalize_join_key_identifier(alias.as_str()),
+                normalize_join_key_identifier(source.column.as_str()),
+            );
+        }
+        return sources;
+    }
+
+    // Backward-compatible fallback for legacy payloads that do not include
+    // query-model alias metadata.
     for projection in &model.projection {
         let (base_expr, alias) = parse_projection_alias(projection);
         let Some(alias) = alias else {
@@ -840,36 +852,28 @@ fn cte_projection_alias_map(model: &SelectQueryModel) -> HashMap<String, String>
             continue;
         }
 
-        aliases.insert(
+        sources.insert(
             normalize_join_key_identifier(alias.as_str()),
             normalize_join_key_identifier(base_expr.as_str()),
         );
     }
 
-    aliases
+    sources
 }
 
-fn remap_join_key_with_cte_alias(raw: &str, aliases: &HashMap<String, String>) -> String {
+fn remap_join_key_with_cte_source(raw: &str, sources: &HashMap<String, String>) -> String {
     let normalized = normalize_join_key_identifier(raw);
 
-    // If key already references an exposed alias, keep it.
-    if aliases.contains_key(normalized.as_str()) {
-        return normalized;
-    }
-
-    // If key references the source column for an aliased projection, rewrite it
-    // to the CTE-exposed alias so downstream stage routing uses visible columns.
-    if let Some((alias, _)) = aliases
-        .iter()
-        .find(|(_, source)| source.eq_ignore_ascii_case(normalized.as_str()))
-    {
-        return alias.clone();
+    // If key references a CTE output alias, resolve it to the source column that
+    // exists before projection materialization.
+    if let Some(source_column) = sources.get(normalized.as_str()) {
+        return source_column.clone();
     }
 
     normalized
 }
 
-fn remap_join_operand_with_cte_alias(raw: &str, aliases: &HashMap<String, String>) -> String {
+fn remap_join_operand_with_cte_source(raw: &str, sources: &HashMap<String, String>) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return trimmed.to_string();
@@ -884,32 +888,66 @@ fn remap_join_operand_with_cte_alias(raw: &str, aliases: &HashMap<String, String
         return trimmed.to_string();
     }
 
-    remap_join_key_with_cte_alias(trimmed, aliases)
+    remap_join_key_with_cte_source(trimmed, sources)
+}
+
+fn key_references_cte_alias(raw: &str, sources: &HashMap<String, String>) -> bool {
+    let normalized = normalize_join_key_identifier(raw);
+    sources.contains_key(normalized.as_str())
+}
+
+fn remap_join_key_pair_with_cte_source(
+    key: &kionas::sql::query_model::QueryJoinKey,
+    sources: &HashMap<String, String>,
+) -> JoinKeyPair {
+    let left_is_cte_alias = key_references_cte_alias(key.left.as_str(), sources);
+    let right_is_cte_alias = key_references_cte_alias(key.right.as_str(), sources);
+
+    // Join runtime expects key.left to reference the accumulated left-side batch and
+    // key.right to reference the current right-side join relation.
+    if left_is_cte_alias && !right_is_cte_alias {
+        return JoinKeyPair {
+            left: remap_join_key_with_cte_source(key.left.as_str(), sources),
+            right: remap_join_key_with_cte_source(key.right.as_str(), sources),
+        };
+    }
+
+    if right_is_cte_alias && !left_is_cte_alias {
+        return JoinKeyPair {
+            left: remap_join_key_with_cte_source(key.right.as_str(), sources),
+            right: remap_join_key_with_cte_source(key.left.as_str(), sources),
+        };
+    }
+
+    JoinKeyPair {
+        left: remap_join_key_with_cte_source(key.left.as_str(), sources),
+        right: remap_join_key_with_cte_source(key.right.as_str(), sources),
+    }
 }
 
 fn map_query_join_predicate_to_physical(
     predicate: &kionas::sql::query_model::QueryJoinPredicate,
-    cte_aliases: &HashMap<String, String>,
+    cte_sources: &HashMap<String, String>,
 ) -> PhysicalJoinPredicate {
     match predicate {
         kionas::sql::query_model::QueryJoinPredicate::Equality { left, right } => {
             PhysicalJoinPredicate::Equality {
-                left: remap_join_operand_with_cte_alias(left.as_str(), cte_aliases),
-                right: remap_join_operand_with_cte_alias(right.as_str(), cte_aliases),
+                left: remap_join_operand_with_cte_source(left.as_str(), cte_sources),
+                right: remap_join_operand_with_cte_source(right.as_str(), cte_sources),
             }
         }
         kionas::sql::query_model::QueryJoinPredicate::Theta { left, op, right } => {
             PhysicalJoinPredicate::Theta {
-                left: remap_join_operand_with_cte_alias(left.as_str(), cte_aliases),
+                left: remap_join_operand_with_cte_source(left.as_str(), cte_sources),
                 op: op.clone(),
-                right: remap_join_operand_with_cte_alias(right.as_str(), cte_aliases),
+                right: remap_join_operand_with_cte_source(right.as_str(), cte_sources),
             }
         }
         kionas::sql::query_model::QueryJoinPredicate::Composite { predicates } => {
             PhysicalJoinPredicate::Composite {
                 predicates: predicates
                     .iter()
-                    .map(|inner| map_query_join_predicate_to_physical(inner, cte_aliases))
+                    .map(|inner| map_query_join_predicate_to_physical(inner, cte_sources))
                     .collect::<Vec<_>>(),
             }
         }
@@ -1192,7 +1230,7 @@ fn build_kionas_plan_from_intent(
     let source_model = translation_source_model(model);
     let source_chain = collect_translation_source_chain(model);
     let translation_joins = collect_translation_joins(model, &source_chain);
-    let cte_aliases = cte_projection_alias_map(source_model);
+    let cte_sources = cte_projection_source_map(source_model);
     let scan_source_model = deepest_translation_source_model(model);
     let primary_relation = primary_relation_dependency(scan_source_model).ok_or_else(|| {
         PlannerError::InvalidPhysicalPipeline(
@@ -1452,7 +1490,7 @@ fn build_kionas_plan_from_intent(
             let join_predicates = join
                 .predicates
                 .iter()
-                .map(|predicate| map_query_join_predicate_to_physical(predicate, &cte_aliases))
+                .map(|predicate| map_query_join_predicate_to_physical(predicate, &cte_sources))
                 .collect::<Vec<_>>();
 
             let join_algorithm = detect_join_algorithm(join, 0, 0);
@@ -1477,16 +1515,7 @@ fn build_kionas_plan_from_intent(
                             keys: join
                                 .keys
                                 .iter()
-                                .map(|key| JoinKeyPair {
-                                    left: remap_join_key_with_cte_alias(
-                                        key.left.as_str(),
-                                        &cte_aliases,
-                                    ),
-                                    right: remap_join_key_with_cte_alias(
-                                        key.right.as_str(),
-                                        &cte_aliases,
-                                    ),
-                                })
+                                .map(|key| remap_join_key_pair_with_cte_source(key, &cte_sources))
                                 .collect::<Vec<_>>(),
                         },
                     });
@@ -1509,16 +1538,7 @@ fn build_kionas_plan_from_intent(
                             keys: join
                                 .keys
                                 .iter()
-                                .map(|key| JoinKeyPair {
-                                    left: remap_join_key_with_cte_alias(
-                                        key.left.as_str(),
-                                        &cte_aliases,
-                                    ),
-                                    right: remap_join_key_with_cte_alias(
-                                        key.right.as_str(),
-                                        &cte_aliases,
-                                    ),
-                                })
+                                .map(|key| remap_join_key_pair_with_cte_source(key, &cte_sources))
                                 .collect::<Vec<_>>(),
                         },
                     });
@@ -1678,3 +1698,7 @@ mod spike_union_exec;
 #[cfg(test)]
 #[path = "../tests/phase4d_sprint1_integration_tests.rs"]
 mod phase4d_sprint1_integration_tests;
+
+#[cfg(test)]
+#[path = "../tests/phase4d_sprint2_integration_tests.rs"]
+mod phase4d_sprint2_integration_tests;

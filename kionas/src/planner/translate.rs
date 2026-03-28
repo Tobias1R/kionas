@@ -265,6 +265,7 @@ mod tests {
             limit: Some(5),
             offset: Some(2),
             ctes: Vec::new(),
+            alias_column_map: std::collections::HashMap::new(),
             relation_dependencies: vec![QueryNamespace {
                 database: "sales".to_string(),
                 schema: "public".to_string(),

@@ -618,7 +618,7 @@ async fn translates_pure_cte_select_star_with_cte_projection_columns_only() {
 }
 
 #[tokio::test]
-async fn remaps_outer_join_key_from_cte_alias_to_source_column() {
+async fn resolves_outer_join_key_from_cte_alias_to_source_column() {
     let customers = customers_relation_metadata("bench4", "seed1", "customers");
     let orders = orders_relation_metadata("bench4", "seed1", "orders");
     let products = products_relation_metadata("bench4", "seed1", "products");
@@ -663,8 +663,59 @@ async fn remaps_outer_join_key_from_cte_alias_to_source_column() {
         join_keys
             .iter()
             .flatten()
-            .any(|key| key.left == "ppid" && key.right == "id"),
-        "outer join key should resolve to CTE-exposed alias for routing compatibility"
+            .any(|key| key.left == "product_id" && key.right == "id"),
+        "outer join key should resolve to source column so join execution can read pre-projection schema"
+    );
+}
+
+#[tokio::test]
+async fn resolves_unqualified_outer_join_key_from_cte_alias_to_source_column() {
+    let customers = customers_relation_metadata("bench4", "seed1", "customers");
+    let orders = orders_relation_metadata("bench4", "seed1", "orders");
+    let products = products_relation_metadata("bench4", "seed1", "products");
+
+    let statements = parse_query(
+        "WITH customer_orders AS (SELECT c.id, o.quantity, c.name, o.product_id AS ppid2 FROM bench4.seed1.customers c JOIN bench4.seed1.orders o ON c.id = o.customer_id WHERE c.id = 700) SELECT * FROM customer_orders co JOIN bench4.seed1.products p ON p.id = ppid2",
+    )
+    .expect("sql should parse");
+    let statement = statements.first().expect("statement expected");
+    let query = match statement {
+        crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+        _ => panic!("expected query statement"),
+    };
+
+    let model = build_select_query_model(query, "s1", "bench4", "seed1")
+        .expect("query model should build")
+        .model;
+
+    let translated = translate_datafusion_to_kionas_physical_plan_with_providers(
+        &model,
+        &[customers, orders, products],
+    )
+    .await
+    .expect("cte alias join query translation should succeed");
+
+    let join_keys = translated
+        .operators
+        .iter()
+        .filter_map(|op| match op {
+            kionas::planner::PhysicalOperator::HashJoin { spec } => Some(spec.keys.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        join_keys.len(),
+        2,
+        "translated plan should include both CTE-internal and outer hash joins"
+    );
+
+    assert!(
+        join_keys.iter().flatten().any(|key| {
+            (key.left == "product_id" && key.right == "id")
+                || (key.left == "id" && key.right == "product_id")
+        }),
+        "unqualified alias should resolve to source column in outer join key"
     );
 }
 

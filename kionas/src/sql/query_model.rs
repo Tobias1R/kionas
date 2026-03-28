@@ -1,9 +1,10 @@
 use crate::parser::datafusion_sql::sqlparser::ast::{
-    BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query as SqlQuery, Select, SetExpr,
-    SetOperator, SetQuantifier, TableFactor,
+    BinaryOperator, Expr, Join, JoinConstraint, JoinOperator, Query as SqlQuery, Select,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 
 /// What: Canonical payload version used by current query dispatch contract.
 ///
@@ -162,6 +163,22 @@ pub enum QueryFromSpec {
 pub struct QueryCteSpec {
     pub name: String,
     pub query: Box<SelectQueryModel>,
+    #[serde(default)]
+    pub column_mapping: HashMap<String, QueryColumnSource>,
+}
+
+/// What: Source-column binding for one projected output column.
+///
+/// Inputs:
+/// - `table`: Source table or relation alias for the projected column.
+/// - `column`: Source column name for the projected column.
+///
+/// Output:
+/// - Serializable mapping entry used for deterministic alias resolution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryColumnSource {
+    pub table: String,
+    pub column: String,
 }
 
 /// What: Shared semantic model for a minimal SELECT query.
@@ -194,6 +211,8 @@ pub struct SelectQueryModel {
     pub offset: Option<u64>,
     #[serde(default)]
     pub ctes: Vec<QueryCteSpec>,
+    #[serde(default)]
+    pub alias_column_map: HashMap<String, QueryColumnSource>,
     #[serde(default)]
     pub relation_dependencies: Vec<QueryNamespace>,
     #[serde(default)]
@@ -979,6 +998,7 @@ fn build_select_query_model_from_select(
     }
 
     let (limit, offset) = parse_limit_offset_from_sql(canonical_sql.as_str())?;
+    let alias_column_map = build_projection_alias_column_map(select);
     Ok(SelectQueryModel {
         version: QUERY_PAYLOAD_VERSION,
         statement: "Select".to_string(),
@@ -999,10 +1019,71 @@ fn build_select_query_model_from_select(
         limit,
         offset,
         ctes,
+        alias_column_map,
         relation_dependencies,
         union: None,
         sql: canonical_sql,
     })
+}
+
+/// What: Parse a simple SQL expression as a source column reference.
+///
+/// Inputs:
+/// - `expr`: SQL expression from a projection item.
+///
+/// Output:
+/// - Source table/column pair when expression is a simple column reference.
+///
+/// Details:
+/// - Supports unqualified (`col`) and two-part qualified (`t.col`) identifiers.
+fn parse_simple_projection_source(expr: &Expr) -> Option<QueryColumnSource> {
+    match expr {
+        Expr::Identifier(identifier) => Some(QueryColumnSource {
+            table: String::new(),
+            column: normalize_identifier(identifier.value.as_str()),
+        }),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(QueryColumnSource {
+            table: normalize_identifier(parts[0].value.as_str()),
+            column: normalize_identifier(parts[1].value.as_str()),
+        }),
+        Expr::CompoundIdentifier(parts) if parts.len() == 1 => Some(QueryColumnSource {
+            table: String::new(),
+            column: normalize_identifier(parts[0].value.as_str()),
+        }),
+        _ => None,
+    }
+}
+
+/// What: Build projection output-to-source bindings for one SELECT query.
+///
+/// Inputs:
+/// - `select`: SQL SELECT AST node.
+///
+/// Output:
+/// - Map from projected output column name to source table/column binding.
+///
+/// Details:
+/// - Only simple identifier projections are mapped. Expressions/functions are ignored.
+fn build_projection_alias_column_map(select: &Select) -> HashMap<String, QueryColumnSource> {
+    let mut mapping = HashMap::<String, QueryColumnSource>::new();
+
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } => {
+                if let Some(source) = parse_simple_projection_source(expr) {
+                    mapping.insert(normalize_identifier(alias.value.as_str()), source);
+                }
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                if let Some(source) = parse_simple_projection_source(expr) {
+                    mapping.insert(source.column.clone(), source);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    mapping
 }
 
 fn build_select_query_model_from_query(
@@ -1034,6 +1115,7 @@ fn build_select_query_model_from_query(
             )?;
             ctes.push(QueryCteSpec {
                 name: normalize_identifier(cte.alias.name.value.as_str()),
+                column_mapping: cte_model.alias_column_map.clone(),
                 query: Box::new(cte_model),
             });
         }
@@ -1416,7 +1498,7 @@ pub fn primary_relation_dependency(model: &SelectQueryModel) -> Option<&QueryNam
 #[cfg(test)]
 mod tests {
     use super::{
-        QueryFromSpec, QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
+        QueryColumnSource, QueryFromSpec, QueryModelError, VALIDATION_CODE_UNSUPPORTED_OPERATOR,
         VALIDATION_CODE_UNSUPPORTED_PIPELINE, VALIDATION_CODE_UNSUPPORTED_PREDICATE,
         VALIDATION_CODE_UNSUPPORTED_QUERY_SHAPE, build_select_query_dispatch_envelope,
         build_select_query_model, validation_code_for_query_error,
@@ -1873,6 +1955,40 @@ mod tests {
                 .relation_dependencies
                 .iter()
                 .any(|dep| dep.table == "orders")
+        );
+    }
+
+    #[test]
+    fn captures_cte_projection_alias_to_source_column_mapping() {
+        let statements = parse_query(
+            "WITH customer_orders AS (SELECT c.id, o.product_id AS ppid2 FROM sales.public.customers c JOIN sales.public.orders o ON c.id = o.customer_id) SELECT * FROM customer_orders",
+        )
+        .expect("statement should parse");
+        let statement = statements.first().expect("statement expected");
+        let query = match statement {
+            crate::parser::datafusion_sql::sqlparser::ast::Statement::Query(query) => query,
+            _ => panic!("expected query statement"),
+        };
+
+        let model = build_select_query_model(query, "s1", "sales", "public")
+            .expect("query model should build")
+            .model;
+
+        assert_eq!(model.ctes.len(), 1);
+        let cte = &model.ctes[0];
+        assert_eq!(
+            cte.column_mapping.get("ppid2"),
+            Some(&QueryColumnSource {
+                table: "o".to_string(),
+                column: "product_id".to_string(),
+            })
+        );
+        assert_eq!(
+            cte.column_mapping.get("id"),
+            Some(&QueryColumnSource {
+                table: "c".to_string(),
+                column: "id".to_string(),
+            })
         );
     }
 

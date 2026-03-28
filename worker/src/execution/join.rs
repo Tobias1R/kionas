@@ -57,9 +57,11 @@ pub(crate) fn apply_hash_join_pipeline(
         )?]);
     }
 
-    let left_key_columns = resolve_join_key_indices(left_all.schema().as_ref(), &spec.keys, true)?;
-    let right_key_columns =
-        resolve_join_key_indices(right_all.schema().as_ref(), &spec.keys, false)?;
+    let (left_key_columns, right_key_columns) = resolve_join_key_indices_with_side_fallback(
+        left_all.schema().as_ref(),
+        right_all.schema().as_ref(),
+        &spec.keys,
+    )?;
 
     let mut right_index = HashMap::<String, Vec<u32>>::with_capacity(right_all.num_rows());
     for row in 0..right_all.num_rows() {
@@ -307,9 +309,11 @@ fn apply_keyed_nested_loop_join_pipeline(
         )?]);
     }
 
-    let left_key_columns = resolve_join_key_indices(left_all.schema().as_ref(), &spec.keys, true)?;
-    let right_key_columns =
-        resolve_join_key_indices(right_all.schema().as_ref(), &spec.keys, false)?;
+    let (left_key_columns, right_key_columns) = resolve_join_key_indices_with_side_fallback(
+        left_all.schema().as_ref(),
+        right_all.schema().as_ref(),
+        &spec.keys,
+    )?;
 
     let mut right_index = HashMap::<String, Vec<u32>>::with_capacity(right_all.num_rows());
     for row in 0..right_all.num_rows() {
@@ -949,6 +953,84 @@ fn resolve_join_key_indices(
         indices.push(index);
     }
     Ok(indices)
+}
+
+fn resolve_join_key_indices_with_side_fallback(
+    left_schema: &Schema,
+    right_schema: &Schema,
+    keys: &[kionas::planner::JoinKeyPair],
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    let mut left_indices = Vec::with_capacity(keys.len());
+    let mut right_indices = Vec::with_capacity(keys.len());
+
+    for key in keys {
+        let left_raw = key.left.trim();
+        let right_raw = key.right.trim();
+
+        let left_idx = resolve_join_key_indices(
+            left_schema,
+            &[kionas::planner::JoinKeyPair {
+                left: left_raw.to_string(),
+                right: right_raw.to_string(),
+            }],
+            true,
+        )
+        .ok()
+        .and_then(|indices| indices.first().copied());
+
+        let right_idx = resolve_join_key_indices(
+            right_schema,
+            &[kionas::planner::JoinKeyPair {
+                left: left_raw.to_string(),
+                right: right_raw.to_string(),
+            }],
+            false,
+        )
+        .ok()
+        .and_then(|indices| indices.first().copied());
+
+        if let (Some(left), Some(right)) = (left_idx, right_idx) {
+            left_indices.push(left);
+            right_indices.push(right);
+            continue;
+        }
+
+        let swapped_left_idx = resolve_join_key_indices(
+            left_schema,
+            &[kionas::planner::JoinKeyPair {
+                left: right_raw.to_string(),
+                right: left_raw.to_string(),
+            }],
+            true,
+        )
+        .ok()
+        .and_then(|indices| indices.first().copied());
+
+        let swapped_right_idx = resolve_join_key_indices(
+            right_schema,
+            &[kionas::planner::JoinKeyPair {
+                left: right_raw.to_string(),
+                right: left_raw.to_string(),
+            }],
+            false,
+        )
+        .ok()
+        .and_then(|indices| indices.first().copied());
+
+        if let (Some(left), Some(right)) = (swapped_left_idx, swapped_right_idx) {
+            left_indices.push(left);
+            right_indices.push(right);
+            continue;
+        }
+
+        // Keep existing error shape for caller diagnostics.
+        if left_idx.is_none() {
+            return Err(format!("join key '{}' is not present in schema", left_raw));
+        }
+        return Err(format!("join key '{}' is not present in schema", right_raw));
+    }
+
+    Ok((left_indices, right_indices))
 }
 
 fn fallback_semantic_to_physical_column(schema: &Schema, requested: &str) -> Option<String> {
