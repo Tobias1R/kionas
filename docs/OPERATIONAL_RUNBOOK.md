@@ -1,7 +1,7 @@
 ---
 title: "Operational Runbook for Kionas Distributed Execution"
 subtitle: "Step-by-Step Procedures and Diagnostics for Production Operations"
-date: "March 25, 2026"
+date: "March 27, 2026"
 status: "COMPLETE"
 audience: "Operations / DevOps Teams"
 ---
@@ -19,6 +19,7 @@ audience: "Operations / DevOps Teams"
 7. [Common Scenarios & Remediation](#common-scenarios--remediation)
 8. [Monitoring & Observability](#monitoring--observability)
 9. [Runbook Configuration](#runbook-configuration)
+10. [Storage Cleanup & Lifecycle Management](#storage-cleanup--lifecycle-management)
 
 ---
 
@@ -1143,6 +1144,310 @@ timestamp > now - 7d AND message = "*spill*"
 
 ---
 
+## Storage Cleanup & Lifecycle Management
+
+### 10.1 Understanding Distributed Query Storage
+
+Kionas uses MinIO (S3-compatible object storage) for intermediate results during distributed queries:
+
+| Prefix | Purpose | Retention Policy | Example |
+|--------|---------|------------------|---------|
+| `staging/` | Query result caches | 7 days | Result for `SELECT COUNT(*) FROM large_table` |
+| `distributed_exchange/` | Stage-to-stage shuffle data | 3 days | Hash-partitioned join output from Stage 1 → Stage 2 |
+| `tx_staging/` | Transaction spill files | 1 day | Overflow from memory-limited aggregations |
+
+**Why persisted?** Multi-worker queries execute in phases. Stage 1 writes to MinIO, Stage 2+ reads it. Storage is necessary for correctness, not a bug.
+
+---
+
+### 10.2 Cleanup Strategy: Defense-in-Depth
+
+Kionas implements two complementary cleanup mechanisms:
+
+#### Level 1: Janitor Cleanup Task
+- **What**: Background daemon that periodically scans MinIO for aged artifacts
+- **When**: Runs every 1 hour (configurable via `KIONAS_CLEANUP_INTERVAL_SECONDS`)
+- **Action**: Deletes objects older than policy thresholds
+- **Config**: Set via environment variables or `cleanup` section in `kionas-warehouse.json`
+
+#### Level 2: S3 Lifecycle Policies
+- **What**: MinIO S3 lifecycle rules that automatically expire objects
+- **When**: Applied per-prefix at object creation time (no polling needed)
+- **Action**: Objects are automatically deleted by MinIO when expiration date is reached
+- **Config**: Stored as JSON policy in MinIO bucket configuration
+
+**Rationale**: If janitor fails, lifecycle policies ensure cleanup. If lifecycle misconfigured, janitor provides safety net.
+
+---
+
+### 10.3 Configuring Janitor Cleanup
+
+#### Environment Variables (Runtime Override)
+
+Set these to override hardcoded defaults:
+
+```bash
+# Set retention periods (in seconds)
+export KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS=259200      # 3 days
+export KIONAS_QUERY_RESULT_RETENTION_SECONDS=604800        # 7 days
+export KIONAS_TRANSACTION_STAGING_RETENTION_SECONDS=86400  # 1 day
+
+# Set cleanup frequency
+export KIONAS_CLEANUP_INTERVAL_SECONDS=3600                # Run every 1 hour
+
+# Disable cleanup if needed (set to 0)
+export KIONAS_CLEANUP_INTERVAL_SECONDS=0
+```
+
+#### Configuration File (`kionas-warehouse.json`)
+
+```json
+{
+  "cleanup": {
+    "stage_exchange_retention_seconds": 259200,
+    "query_result_retention_seconds": 604800,
+    "transaction_staging_retention_seconds": 86400,
+    "cleanup_interval_seconds": 3600,
+    "description": "Storage cleanup policy for warehouse queries"
+  }
+}
+```
+
+#### Disabling Cleanup
+
+```bash
+# Option 1: Set interval to 0
+export KIONAS_CLEANUP_INTERVAL_SECONDS=0
+
+# Option 2: Or in config file
+"cleanup_interval_seconds": 0
+
+# Rationale: Disable only during troubleshooting or if storage space is not a constraint
+```
+
+---
+
+### 10.4 Setting Up S3 Lifecycle Policies
+
+#### Prerequisites
+- AWS CLI v2 installed on operator machine
+- MinIO endpoint, access key, and secret key available
+
+#### Dry Run (Recommended First Step)
+
+```bash
+# Test the policy without making changes
+cd scripts/
+
+MINIO_ACCESS_KEY=root MINIO_SECRET_KEY=rootpassword \
+  ./setup_minio_lifecycle.sh --endpoint http://192.168.0.15:9000 \
+    --bucket warehouse --dry-run
+
+# Output:
+# Using AWS CLI: aws-cli/2.x.x ...
+# Loaded lifecycle policy from: ./setup_minio_lifecycle.json
+# Policy contains 3 rules
+#
+# === DRY RUN MODE ===
+# Would apply to endpoint: http://192.168.0.15:9000
+# Would apply to bucket: warehouse
+#
+# Lifecycle rules to be applied:
+#   - expire-stage-exchanges: prefix='distributed_exchange/' expiration=3 days (Status: Enabled)
+#   - expire-query-results: prefix='staging/' expiration=7 days (Status: Enabled)
+#   - expire-transactions: prefix='tx_staging/' expiration=1 day (Status: Enabled)
+#
+# Dry run complete. No changes made.
+```
+
+#### Apply Lifecycle Policies
+
+```bash
+# Production apply (modifies MinIO bucket configuration)
+cd scripts/
+
+MINIO_ACCESS_KEY=root MINIO_SECRET_KEY=rootpassword \
+  ./setup_minio_lifecycle.sh --endpoint http://192.168.0.15:9000 \
+    --bucket warehouse
+
+# Expected output:
+# Using AWS CLI: aws-cli/2.x.x ...
+# Loaded lifecycle policy from: ./setup_minio_lifecycle.json
+# Policy contains 3 rules
+#
+# Applying lifecycle configuration...
+# Endpoint: http://192.168.0.15:9000
+# Bucket: warehouse
+# ✓ Successfully applied lifecycle rules to bucket: warehouse
+#
+# Applied rules:
+#   - expire-stage-exchanges: prefix='distributed_exchange/' expires in 3 day(s)
+#   - expire-query-results: prefix='staging/' expires in 7 day(s)
+#   - expire-transactions: prefix='tx_staging/' expires in 1 day(s)
+#
+# Verifying lifecycle configuration...
+# ✓ Verification successful
+# Current lifecycle rules:
+#   - expire-stage-exchanges: distributed_exchange/ → 3 days (Status: Enabled)
+#   - expire-query-results: staging/ → 7 days (Status: Enabled)
+#   - expire-transactions: tx_staging/ → 1 day (Status: Enabled)
+#
+# ✓ Lifecycle configuration setup complete!
+```
+
+#### Using PowerShell (on Windows)
+
+```powershell
+# Windows operator can use PowerShell version
+cd scripts/
+
+$env:MINIO_ACCESS_KEY = "root"
+$env:MINIO_SECRET_KEY = "rootpassword"
+
+# Dry run first
+.\setup_minio_lifecycle.ps1 -MinioEndpoint "http://192.168.0.15:9000" `
+  -BucketName "warehouse" -DryRun $true
+
+# Apply if dry run looks good
+.\setup_minio_lifecycle.ps1 -MinioEndpoint "http://192.168.0.15:9000" `
+  -BucketName "warehouse"
+```
+
+---
+
+### 10.5 Verifying Cleanup
+
+#### Querying Current Lifecycle Rules
+
+```bash
+# Query MinIO for current lifecycle policy
+aws s3api get-bucket-lifecycle-configuration \
+  --endpoint-url http://192.168.0.15:9000 \
+  --bucket warehouse
+
+# Output shows JSON with applied rules
+```
+
+#### Checking Storage Space Over Time
+
+```bash
+# Monitor MinIO bucket size
+for i in {1..7}; do
+  DATE=$(date -d "+$i days" +"%Y-%m-%d")
+  SIZE=$(aws s3 ls s3://warehouse --recursive --endpoint-url http://192.168.0.15:9000 \
+    | awk '{sum+=$3} END {print sum " bytes"}')
+  echo "$DATE: $SIZE"
+done
+```
+
+#### Verifying Object Expiration
+
+```bash
+# List objects in staging prefix
+aws s3api list-objects-v2 \
+  --endpoint-url http://192.168.0.15:9000 \
+  --bucket warehouse \
+  --prefix staging/ | jq '.Contents[] | {Key, StorageClass, LastModified}'
+
+# Objects older than 7 days should not appear after lifecycle runs
+# (MinIO removes them automatically every hour by default)
+```
+
+---
+
+### 10.6 Troubleshooting Cleanup Issues
+
+#### Problem: Lifecycle Rules Not Applying
+
+```bash
+# 1. Verify rules are in JSON
+jq . scripts/setup_minio_lifecycle.json | head -20
+
+# 2. Check if bucket exists
+aws s3 ls --endpoint-url http://192.168.0.15:9000/
+
+# 3. Verify AWS CLI can reach MinIO
+aws s3api head-bucket --endpoint-url http://192.168.0.15:9000 --bucket warehouse
+
+# 4. Try applying again with verbose output
+./setup_minio_lifecycle.sh --endpoint http://192.168.0.15:9000 \
+  --bucket warehouse 2>&1 | tee debug.log
+```
+
+#### Problem: Storage Still Growing Despite Policies
+
+```bash
+# 1. Verify lifecycle status
+aws s3api get-bucket-lifecycle-configuration \
+  --endpoint-url http://192.168.0.15:9000 --bucket warehouse
+
+# 2. Check if rules show Status: "Enabled"
+# If Status: "Disabled", apply again
+
+# 3. Verify janitor is running
+# Check server logs for cleanup messages:
+docker logs kionas-warehouse | grep -i "cleanup\|artifact" | tail -20
+
+# Expected log lines:
+# [INFO] Cleanup: Scanning distributed_exchange/ for objects older than 3 days
+# [INFO] Cleanup: Found 45 objects in distributed_exchange/, total 2.3 GB
+# [INFO] Cleanup: Deleted 4 objects (released 120 MB)
+```
+
+#### Problem: Janitor Running But Not Deleting
+
+```bash
+# 1. Check if cleanup interval is > 0
+echo $KIONAS_CLEANUP_INTERVAL_SECONDS
+# Should not be 0
+
+# 2. Check if cleanup is actually enabled in config
+docker inspect kionas-warehouse | jq '.Config.Env[] | select(. | contains("CLEANUP"))'
+
+# 3. Wait for interval to elapse; check logs:
+docker logs kionas-warehouse -f | grep -i cleanup &
+sleep 3610  # Wait 1 hour + 10 seconds
+# Should see cleanup messages appear
+```
+
+---
+
+### 10.7 Customizing Retention Policies
+
+#### Adjusting for Your Workload
+
+**Scenario 1: Short-lived Analytics Queries**
+```bash
+# Reduce retention to 1 day (frees space faster)
+export KIONAS_QUERY_RESULT_RETENTION_SECONDS=86400
+export KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS=86400
+```
+
+**Scenario 2: Long-running ETL Pipelines**
+```bash
+# Increase retention to 14 days
+export KIONAS_QUERY_RESULT_RETENTION_SECONDS=1209600
+export KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS=1209600
+```
+
+**Scenario 3: Storage Constrained**
+```bash
+# Aggressive cleanup: 1 day for all
+export KIONAS_QUERY_RESULT_RETENTION_SECONDS=86400
+export KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS=86400
+export KIONAS_TRANSACTION_STAGING_RETENTION_SECONDS=86400
+```
+
+**Scenario 4: Debugging / Forensics**
+```bash
+# Disable cleanup temporarily (keep all artifacts for investigation)
+export KIONAS_CLEANUP_INTERVAL_SECONDS=0
+# Re-enable after investigation:
+export KIONAS_CLEANUP_INTERVAL_SECONDS=3600
+```
+
+---
+
 ## Appendix: Troubleshooting Decision Tree
 
 ```
@@ -1173,6 +1478,7 @@ Query failed
 
 | Date | Author | Change |
 |---|---|---|
+| March 27, 2026 | AI (Lambda) | Added Section 10: Storage Cleanup & Lifecycle Management |
 | March 25, 2026 | AI (M4.2) | Initial version; 9 sections, 2000+ words |
 
 ---

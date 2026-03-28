@@ -1,3 +1,4 @@
+use kionas::constants::{REDIS_SESSION_TTL_ENV, REDIS_SESSION_TTL_SECONDS};
 use kionas::get_digest;
 use kionas::session::SessionProvider;
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,25 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const SESSION_KEY_PREFIX: &str = "kionas:session";
+
+/// What: Get the configured session TTL from environment or use default.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - TTL duration in seconds
+///
+/// Details:
+/// - Checks KIONAS_SESSION_TTL_SECONDS environment variable
+/// - Falls back to REDIS_SESSION_TTL_SECONDS constant if not set
+/// - Returns u64 for use with Redis SETEX command
+fn get_session_ttl() -> u64 {
+    std::env::var(REDIS_SESSION_TTL_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(REDIS_SESSION_TTL_SECONDS)
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
@@ -187,7 +207,8 @@ impl SessionManager {
         println!("Add session: {:?}", session);
         let key = Self::session_key(&session.get_id());
         let value = serde_json::to_string(&session).unwrap();
-        self.provider.set(&key, &value).await.unwrap();
+        let ttl = get_session_ttl();
+        self.provider.set_ex(&key, &value, ttl).await.unwrap();
     }
 
     pub async fn get_session(&self, id: String) -> Option<Session> {
@@ -214,7 +235,8 @@ impl SessionManager {
     pub async fn update_session(&self, id: String, session: &mut Session) {
         let key = Self::session_key(&id);
         let value = serde_json::to_string(&session).unwrap();
-        self.provider.set(&key, &value).await.unwrap();
+        let ttl = get_session_ttl();
+        self.provider.set_ex(&key, &value, ttl).await.unwrap();
     }
 
     // get token session

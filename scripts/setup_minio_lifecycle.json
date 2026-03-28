@@ -1,0 +1,34 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-stage-exchanges",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "distributed_exchange/"
+      },
+      "Expiration": {
+        "Days": 3
+      }
+    },
+    {
+      "ID": "expire-query-results",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "staging/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    },
+    {
+      "ID": "expire-transactions",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "tx_staging/"
+      },
+      "Expiration": {
+        "Days": 1
+      }
+    }
+  ]
+}

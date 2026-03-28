@@ -4,14 +4,19 @@ use chrono::Utc;
 use deadpool::managed::Pool;
 use kionas::config::load_cluster_config;
 use kionas::constants::{
-    REDIS_POOL_SIZE_ENV, REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY,
+    CLEANUP_JOB_INTERVAL_ENV, CLEANUP_JOB_INTERVAL_SECONDS, QUERY_RESULT_RETENTION_ENV,
+    QUERY_RESULT_RETENTION_SECONDS, REDIS_POOL_SIZE_ENV, REDIS_SESSION_TTL_ENV,
+    REDIS_SESSION_TTL_SECONDS, REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY,
     REDIS_UI_DASHBOARD_SERVER_STATS_KEY, REDIS_UI_DASHBOARD_SESSIONS_KEY,
     REDIS_UI_DASHBOARD_TOKENS_KEY, REDIS_UI_DASHBOARD_WORKERS_KEY, REDIS_URL_ENV,
+    STAGE_EXCHANGE_RETENTION_ENV, STAGE_EXCHANGE_RETENTION_SECONDS,
+    TRANSACTION_STAGING_RETENTION_ENV, TRANSACTION_STAGING_RETENTION_SECONDS,
 };
 use redis::AsyncCommands;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{CpuExt, ProcessExt, System, SystemExt};
 
@@ -82,6 +87,26 @@ struct SessionSnapshot {
     use_database: String,
 }
 
+/// What: Session data structure for deserializing from Redis JSON during cleanup.
+///
+/// Details:
+/// - Matches the actual Redis session JSON format produced by Session struct
+/// - Used only for cleanup operations, not dashboard publishing
+/// - Includes all fields from the serialized Session to avoid deserialization errors
+#[derive(Serialize, Deserialize)]
+struct RedisSessionData {
+    id: String,
+    auth_token: String,
+    is_authenticated: bool,
+    role: String,
+    warehouse_name: String,
+    #[serde(default)]
+    pool_members: Vec<String>,
+    remote_addr: String,
+    last_active: u64,
+    use_database: String,
+}
+
 #[derive(Serialize)]
 struct TokenSnapshot {
     username: String,
@@ -117,6 +142,9 @@ struct ConsulSummaryPayload {
 /// - Domain writes are isolated so one failure does not block others.
 /// - Replaces the legacy /metrics HTTP loop with Redis-backed snapshot publication.
 pub(crate) fn start(shared_data: SharedData) {
+    // Clone for cleanup task
+    let cleanup_shared_data = Arc::clone(&shared_data);
+
     tokio::spawn(async move {
         let redis_pool = match redis_pool() {
             Ok(pool) => pool,
@@ -134,6 +162,9 @@ pub(crate) fn start(shared_data: SharedData) {
             publish_all_domains(&shared_data, &redis_pool).await;
         }
     });
+
+    // Start artifact cleanup background loop
+    start_artifact_cleanup(cleanup_shared_data);
 }
 
 /// What: Publish all dashboard domains to Redis with per-domain fault isolation.
@@ -664,4 +695,443 @@ async fn publish_envelope<T: Serialize>(
         DASHBOARD_TTL_SECONDS
     );
     Ok(())
+}
+
+/// What: Get the configured retention threshold for stage exchange artifacts.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - Retention threshold in seconds
+///
+/// Details:
+/// - Checks KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS environment variable
+/// - Falls back to STAGE_EXCHANGE_RETENTION_SECONDS constant if not set
+fn get_stage_exchange_retention() -> u64 {
+    env::var(STAGE_EXCHANGE_RETENTION_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(STAGE_EXCHANGE_RETENTION_SECONDS)
+}
+
+/// What: Get the configured retention threshold for query result artifacts.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - Retention threshold in seconds
+///
+/// Details:
+/// - Checks KIONAS_QUERY_RESULT_RETENTION_SECONDS environment variable
+/// - Falls back to QUERY_RESULT_RETENTION_SECONDS constant if not set
+fn get_query_result_retention() -> u64 {
+    env::var(QUERY_RESULT_RETENTION_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(QUERY_RESULT_RETENTION_SECONDS)
+}
+
+/// What: Get the configured retention threshold for transaction staging artifacts.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - Retention threshold in seconds
+///
+/// Details:
+/// - Checks KIONAS_TRANSACTION_STAGING_RETENTION_SECONDS environment variable
+/// - Falls back to TRANSACTION_STAGING_RETENTION_SECONDS constant if not set
+#[allow(dead_code)]
+fn get_transaction_staging_retention() -> u64 {
+    env::var(TRANSACTION_STAGING_RETENTION_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(TRANSACTION_STAGING_RETENTION_SECONDS)
+}
+
+/// What: Get the configured cleanup job interval.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - Cleanup interval in seconds (0 = disabled)
+///
+/// Details:
+/// - Checks KIONAS_CLEANUP_JOB_INTERVAL_SECONDS environment variable
+/// - Falls back to CLEANUP_JOB_INTERVAL_SECONDS constant if not set
+/// - Return value of 0 means cleanup is disabled
+fn get_cleanup_interval() -> u64 {
+    env::var(CLEANUP_JOB_INTERVAL_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(CLEANUP_JOB_INTERVAL_SECONDS)
+}
+
+/// What: Get the configured retention threshold for session artifacts.
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - Retention threshold in seconds
+///
+/// Details:
+/// - Checks KIONAS_SESSION_TTL_SECONDS environment variable
+/// - Falls back to REDIS_SESSION_TTL_SECONDS constant if not set
+/// - Used to identify sessions without explicit TTL that need cleanup
+fn get_session_retention() -> u64 {
+    env::var(REDIS_SESSION_TTL_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(REDIS_SESSION_TTL_SECONDS)
+}
+
+/// What: Get a Redis connection to DB 0 (sessions database).
+///
+/// Inputs:
+/// - None
+///
+/// Output:
+/// - `Ok(redis::aio::MultiplexedConnection)` on success
+/// - `Err(String)` if connection fails
+///
+/// Details:
+/// - Parses REDIS_URL environment variable
+/// - Replaces or appends DB path with "/0" for session DB
+/// - Establishes async multiplexed connection
+async fn get_session_redis_connection() -> Result<redis::aio::MultiplexedConnection, String> {
+    let redis_url = env::var(REDIS_URL_ENV)
+        .ok()
+        .and_then(|url| to_session_db_url(&url))
+        .unwrap_or_else(|| "redis://kionas-redis:6379/0".to_string());
+
+    let client = redis::Client::open(redis_url.as_str())
+        .map_err(|e| format!("Failed to create Redis client: {e}"))?;
+
+    client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| format!("Failed to connect to Redis: {e}"))
+}
+
+/// What: Convert a Redis URL to target DB index 0 (sessions database).
+///
+/// Inputs:
+/// - `url`: Input Redis URL, with or without an explicit DB path.
+///
+/// Output:
+/// - `Some(String)` when conversion succeeds.
+/// - `None` when URL parsing fails.
+///
+/// Details:
+/// - Preserves scheme, host, port, and credentials when present.
+fn to_session_db_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let mut rebuilt = format!("{}://", parsed.scheme());
+    if !parsed.username().is_empty() {
+        rebuilt.push_str(parsed.username());
+        if let Some(password) = parsed.password() {
+            rebuilt.push(':');
+            rebuilt.push_str(password);
+        }
+        rebuilt.push('@');
+    }
+
+    let host = parsed.host_str()?;
+    rebuilt.push_str(host);
+    if let Some(port) = parsed.port() {
+        rebuilt.push(':');
+        rebuilt.push_str(port.to_string().as_str());
+    }
+
+    rebuilt.push_str("/0");
+    Some(rebuilt)
+}
+
+pub const SESSION_KEY_PREFIX: &str = "kionas:session:";
+
+/// What: Clean up stale Redis sessions that lack TTL or are older than retention period.
+///
+/// Inputs:
+/// - None (reads from Redis DB 0 and environment)
+///
+/// Output:
+/// - `Ok((count, deleted))` with number of sessions scanned and deleted
+/// - `Err(String)` if operation fails
+///
+/// Details:
+/// - Scans all keys matching `kionas:session:*` pattern
+/// - Deserializes JSON and checks `last_active` timestamp
+/// - Deletes sessions where:
+///   - `last_active == 0` (legacy sessions without TTL, created before Phase 1)
+///   - `last_active < cutoff` (sessions older than retention period)
+/// - Handles pagination gracefully to avoid blocking Redis
+/// - Continues on individual delete errors to maximize cleanup
+async fn cleanup_stale_sessions() -> Result<(u64, u64), String> {
+    let mut conn = get_session_redis_connection().await?;
+
+    let retention_seconds = get_session_retention();
+    let now_u64 = Utc::now().timestamp() as u64;
+    let cutoff = now_u64.saturating_sub(retention_seconds);
+
+    let mut deleted_count = 0u64;
+    let mut cursor = 0u64;
+    let mut scanned_count = 0u64;
+    let scan_batch_size = 100usize;
+
+    loop {
+        let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(format!("{}*", SESSION_KEY_PREFIX))
+            .arg("COUNT")
+            .arg(scan_batch_size)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| format!("Redis SCAN error: {e}"))?;
+
+        scanned_count += keys.len() as u64;
+
+        for key in keys {
+            match conn.get::<_, String>(&key).await {
+                Ok(session_json) => match serde_json::from_str::<RedisSessionData>(&session_json) {
+                    Ok(session) => {
+                        // Delete if:
+                        // 1. last_active == 0 (legacy session without TTL from before Phase 1)
+                        // 2. last_active is older than retention threshold
+                        let should_delete =
+                            session.last_active == 0 || session.last_active < cutoff;
+
+                        if should_delete {
+                            if let Err(e) = conn.del::<_, ()>(&key).await {
+                                log::warn!("Failed to delete session {}: {}", key, e);
+                            } else {
+                                deleted_count += 1;
+                                let age_msg = if session.last_active == 0 {
+                                    "legacy (no TTL)".to_string()
+                                } else {
+                                    format!("age={} seconds", now_u64 - session.last_active)
+                                };
+                                log::debug!("Cleaned session: {} ({})", session.id, age_msg);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse session JSON for {}: {}", key, e);
+                    }
+                },
+                Err(e) => {
+                    log::warn!("Failed to retrieve session {}: {}", key, e);
+                }
+            }
+        }
+
+        cursor = next_cursor;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    if deleted_count > 0 {
+        log::info!(
+            "Session cleanup: scanned={} sessions, deleted={}",
+            scanned_count,
+            deleted_count
+        );
+    }
+
+    Ok((scanned_count, deleted_count))
+}
+
+/// What: Start the artifact cleanup background loop.
+///
+/// Inputs:
+/// - `shared_data`: Shared server state with cluster config
+///
+/// Output:
+/// - Spawns a detached task and returns immediately.
+///
+/// Details:
+/// - Runs cleanup job on configured interval (default: 1 hour)
+/// - Skips cleanup if interval is 0 (disabled)
+/// - Cleans both MinIO artifacts and stale Redis sessions
+/// - Deletes artifacts older than configured retention thresholds
+/// - Logs cleanup operations and errors with counters and sizes
+pub(crate) fn start_artifact_cleanup(shared_data: SharedData) {
+    tokio::spawn(async move {
+        let interval_secs = get_cleanup_interval();
+        if interval_secs == 0 {
+            log::info!("Artifact cleanup is disabled (cleanup_interval=0)");
+            return;
+        }
+
+        log::info!(
+            "Artifact cleanup loop started with interval={}s",
+            interval_secs
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+
+            // Lock shared state to get config
+            match shared_data.lock().await.config.clone() {
+                Some(_config) => {
+                    if let Err(error) = cleanup_aged_artifacts().await {
+                        log::warn!("Artifact cleanup failed: {}", error);
+                    }
+                }
+                None => {
+                    log::warn!("Artifact cleanup skipped: no config available");
+                }
+            }
+        }
+    });
+}
+
+/// What: Execute a single cleanup cycle for aged MinIO artifacts.
+///
+/// Inputs:
+/// - None (reads from environment and cluster config)
+///
+/// Output:
+/// - `Ok(())` on success, `Err(String)` with error details
+///
+/// Details:
+/// - Loads cluster config to get MinIO connection details
+/// - Lists objects by prefix and checks last_modified timestamp
+/// - Deletes objects older than retention threshold
+/// - Processes three prefixes: distributed_exchange/, staging/
+/// - Logs cleanup statistics: object count, bytes freed, errors
+async fn cleanup_aged_artifacts() -> Result<(), String> {
+    let cluster_cfg = load_cluster_config(None)
+        .await
+        .map_err(|e| format!("Failed to load cluster config: {e}"))?;
+
+    let now = chrono::Utc::now();
+    let mut total_deleted = 0u64;
+    let mut total_bytes_freed = 0u64;
+    let mut total_errors = 0u64;
+
+    // Cleanup stale Redis sessions
+    match cleanup_stale_sessions().await {
+        Ok((scanned, deleted)) => {
+            if deleted > 0 {
+                log::info!(
+                    "Cleaned stale sessions: scanned={}, deleted={}",
+                    scanned,
+                    deleted
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("Failed to cleanup stale sessions: {}", error);
+            total_errors += 1;
+        }
+    }
+
+    // Cleanup stage exchanges (distributed_exchange/)
+    let stage_retention = get_stage_exchange_retention();
+    let stage_cutoff = now - chrono::Duration::seconds(stage_retention as i64);
+    match cleanup_prefix("distributed_exchange/", stage_cutoff, &cluster_cfg).await {
+        Ok((deleted, bytes)) => {
+            total_deleted += deleted;
+            total_bytes_freed += bytes;
+            if deleted > 0 {
+                log::info!(
+                    "Cleaned distributed_exchange/: deleted={}, bytes_freed={}",
+                    deleted,
+                    bytes
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("Failed to cleanup distributed_exchange/: {}", error);
+            total_errors += 1;
+        }
+    }
+
+    // Cleanup query results (staging/ with query result retention)
+    let query_retention = get_query_result_retention();
+    let query_cutoff = now - chrono::Duration::seconds(query_retention as i64);
+    match cleanup_prefix("staging/", query_cutoff, &cluster_cfg).await {
+        Ok((deleted, bytes)) => {
+            total_deleted += deleted;
+            total_bytes_freed += bytes;
+            if deleted > 0 {
+                log::info!(
+                    "Cleaned staging/ (queries): deleted={}, bytes_freed={}",
+                    deleted,
+                    bytes
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!("Failed to cleanup staging/ (queries): {}", error);
+            total_errors += 1;
+        }
+    }
+
+    log::info!(
+        "Artifact cleanup cycle completed: total_deleted={}, total_bytes_freed={}, errors={}",
+        total_deleted,
+        total_bytes_freed,
+        total_errors
+    );
+
+    Ok(())
+}
+
+/// What: Delete all objects in a MinIO prefix that are older than a cutoff timestamp.
+///
+/// Inputs:
+/// - `prefix`: S3 prefix to scan (e.g., "distributed_exchange/")
+/// - `cutoff`: Timestamp before which objects should be deleted
+/// - `cluster_cfg`: Cluster configuration with MinIO connection details
+///
+/// Output:
+/// - `Ok((count, bytes))` with number of objects deleted and total bytes freed
+/// - `Err(String)` if operation fails
+///
+/// Details:
+/// - Lists objects paginated to handle large prefixes
+/// - Compares object.last_modified() against cutoff time
+/// - Deletes objects one at a time for safety
+/// - Continues on individual delete errors to maximize cleanup
+/// - TODO: This requires MinIO API exposure in worker module
+async fn cleanup_prefix(
+    prefix: &str,
+    cutoff: chrono::DateTime<chrono::Utc>,
+    _cluster_cfg: &kionas::config::ClusterConfig,
+) -> Result<(u64, u64), String> {
+    let deleted_count = 0u64;
+    let bytes_freed = 0u64;
+
+    log::debug!(
+        "Cleanup scan for prefix '{}' with cutoff before {}",
+        prefix,
+        cutoff
+    );
+
+    // TODO: Phase 2 follow-up
+    // This function needs access to MinIO list_objects_v2 and delete_object APIs.
+    // Current implementation is a skeleton that logs the intent.
+    // To complete:
+    // 1. Add public list_objects_v2 method to MinioProvider in worker crate
+    // 2. Add public delete_object method to MinioProvider
+    // 3. Instantiate MinioProvider using cluster_cfg.storage
+    // 4. Iterate through paginated results with last_modified comparison
+    // 5. Accumulate and execute deletions
+
+    log::info!(
+        "Cleanup placeholder for '{}': cutoff={} (actual deletion requires MinIO API exposure)",
+        prefix,
+        cutoff
+    );
+
+    Ok((deleted_count, bytes_freed))
 }

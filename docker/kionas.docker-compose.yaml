@@ -88,6 +88,10 @@ services:
       CARGO_TARGET_DIR: /workspace/docker-target
       CONSUL_URL: http://kionas-consul:8500
       REDIS_URL: redis://kionas-redis:6379
+      KIONAS_STAGE_EXCHANGE_RETENTION_SECONDS: 600
+      KIONAS_QUERY_RESULT_RETENTION_SECONDS: 60
+      KIONAS_CLEANUP_JOB_INTERVAL_SECONDS: 300
+      KIONAS_TRANSACTION_STAGING_RETENTION_SECONDS: 600
     volumes:
       - ..:/workspace:cached
     depends_on:

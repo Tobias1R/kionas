@@ -25,6 +25,12 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
     // service endpoints
     pub services: ServicesConfig,
+    // session configuration
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
+    // cleanup configuration
+    #[serde(default)]
+    pub cleanup: Option<CleanupConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +72,51 @@ pub struct SecurityConfig {
     pub token: String,
     pub secret: String,
     pub data_path: String,
+}
+
+/// What: Session configuration for Redis TTL and expiration.
+///
+/// Inputs:
+/// - `ttl_seconds`: Session expiration time in seconds
+/// - `description`: Documentation of the setting
+///
+/// Output:
+/// - Deserialized session config used by session manager
+///
+/// Details:
+/// - TTL can be overridden via KIONAS_SESSION_TTL_SECONDS environment variable
+/// - Default: 604800 seconds (7 days)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// What: Cleanup configuration for aged artifact retention and job scheduling.
+///
+/// Inputs:
+/// - `stage_exchange_retention_seconds`: How long to keep distributed_exchange/ artifacts
+/// - `query_result_retention_seconds`: How long to keep staging/ query results
+/// - `transaction_staging_retention_seconds`: How long to keep transaction staging objects
+/// - `cleanup_interval_seconds`: How often to run cleanup job (0 = disabled)
+/// - `description`: Documentation of the policy
+///
+/// Output:
+/// - Deserialized cleanup config used by janitor cleanup task
+///
+/// Details:
+/// - Retention settings can be overridden via environment variables
+/// - Set cleanup_interval_seconds to 0 to disable cleanup entirely
+/// - Defaults: 3 days for exchanges, 7 days for results, 1 day for txn staging, 1 hour interval
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupConfig {
+    pub stage_exchange_retention_seconds: Option<u64>,
+    pub query_result_retention_seconds: Option<u64>,
+    pub transaction_staging_retention_seconds: Option<u64>,
+    pub cleanup_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
