@@ -1,4 +1,6 @@
+#[cfg(test)]
 use super::StorageProvider;
+#[cfg(test)]
 use std::sync::Arc;
 
 /// What: Build deterministic prefix for stage exchange artifacts.
@@ -73,6 +75,7 @@ pub fn stage_exchange_metadata_key(
 ///
 /// Output:
 /// - Sorted parquet keys for all exchange partition artifacts produced by the stage.
+#[cfg(test)]
 pub async fn list_stage_exchange_data_keys(
     provider: &Arc<dyn StorageProvider + Send + Sync>,
     query_run_id: &str,

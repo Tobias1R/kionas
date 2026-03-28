@@ -2,7 +2,9 @@ use super::{
     DispatchAuthContext, format_stage_dispatch_boundary_event,
     format_stage_dispatch_observability_event, validate_query_dispatch_context,
 };
-use crate::statement_handler::shared::distributed_dag::{self, ExecutionModeHint, StageTaskGroup};
+use crate::statement_handler::shared::distributed_dag::{
+    self, ExecutionModeHint, OutputDestination, StageTaskGroup,
+};
 use kionas::planner::PartitionSpec;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1079,5 +1081,113 @@ async fn mixed_version_upgrade_succeeds_after_worker_contract_upgrade() {
     assert_eq!(
         final_location,
         "{\"stage_id\":1,\"partition_index\":0,\"partition_count\":1,\"payload\":{}}"
+    );
+}
+
+#[tokio::test]
+async fn query_dispatch_includes_auth_params_for_worker_pull_context() {
+    let stage_groups = vec![stage_group(0, 0, 1, Vec::new())];
+    let captured = Arc::new(tokio::sync::Mutex::new(
+        Vec::<HashMap<String, String>>::new(),
+    ));
+    let captured_for_executor = captured.clone();
+
+    let execute_partition =
+        std::sync::Arc::new(move |group: StageTaskGroup, _auth_ctx, _timeout_secs| {
+            let captured_for_executor = captured_for_executor.clone();
+            Box::pin(async move {
+                captured_for_executor
+                    .lock()
+                    .await
+                    .push(group.params.clone());
+                Ok::<String, Box<dyn std::error::Error + Send + Sync>>(stage_result_location(
+                    &group,
+                ))
+            }) as super::StagePartitionFuture
+        });
+
+    let _ = super::run_stage_groups_with_partition_executor(
+        &stage_groups,
+        Some(&auth_ctx_with_query_id("q-auth-params")),
+        1,
+        execute_partition,
+    )
+    .await
+    .expect("query dispatch should include auth metadata in stage params");
+
+    let values = captured.lock().await;
+    assert_eq!(values.len(), 1);
+    let params = &values[0];
+    assert_eq!(params.get("__query_id"), Some(&"q-auth-params".to_string()));
+    assert_eq!(params.get("__rbac_user"), Some(&"u1".to_string()));
+    assert_eq!(params.get("__rbac_role"), Some(&"r1".to_string()));
+    assert_eq!(
+        params.get("__auth_scope"),
+        Some(&"select:*.*.*".to_string())
+    );
+}
+
+#[tokio::test]
+async fn dependent_stage_receives_upstream_flight_endpoint_map() {
+    let mut stage0 = stage_group(0, 0, 1, Vec::new());
+    stage0.output_destinations = vec![OutputDestination {
+        downstream_stage_id: 1,
+        worker_addresses: vec!["http://10.0.0.9:4100".to_string()],
+        partitioning: PartitionSpec::Single,
+        downstream_partition_count: 1,
+    }];
+
+    let stage1 = stage_group(1, 0, 1, vec![0]);
+    let stage_groups = vec![stage0, stage1];
+
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::<StageTaskGroup>::new()));
+    let captured_for_executor = captured.clone();
+
+    let execute_partition =
+        std::sync::Arc::new(move |group: StageTaskGroup, _auth_ctx, _timeout_secs| {
+            let captured_for_executor = captured_for_executor.clone();
+            Box::pin(async move {
+                captured_for_executor.lock().await.push(group.clone());
+                Ok::<String, Box<dyn std::error::Error + Send + Sync>>(stage_result_location(
+                    &group,
+                ))
+            }) as super::StagePartitionFuture
+        });
+
+    let _ = super::run_stage_groups_with_partition_executor(
+        &stage_groups,
+        Some(&auth_ctx_with_query_id("q-endpoint-map")),
+        1,
+        execute_partition,
+    )
+    .await
+    .expect("dependent stage should receive upstream endpoint map");
+
+    let values = captured.lock().await;
+    let stage1_params = values
+        .iter()
+        .find(|entry| entry.stage_id == 1)
+        .map(|entry| &entry.params)
+        .expect("stage 1 params should be captured");
+
+    let payload = stage1_params
+        .get("__upstream_stage_flight_endpoints_json")
+        .expect("stage 1 should receive upstream endpoint map payload");
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).expect("endpoint payload should be valid JSON");
+
+    let configured_flight_port = std::env::var("WORKER_FLIGHT_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(4101);
+    let expected_endpoint = format!("http://10.0.0.9:{}", configured_flight_port);
+
+    assert_eq!(
+        parsed
+            .get("0")
+            .and_then(|value| value.get("0"))
+            .and_then(serde_json::Value::as_str),
+        Some(expected_endpoint.as_str())
     );
 }

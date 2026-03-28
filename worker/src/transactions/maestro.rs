@@ -759,6 +759,35 @@ pub async fn handle_execute_task(
         .unwrap_or_default();
     let session_id = req.session_id.clone();
 
+    if operation == "cleanup_session" {
+        let cleanup_target = first_task
+            .as_ref()
+            .and_then(|task| task.params.get("cleanup_session_id"))
+            .map(String::as_str)
+            .unwrap_or(session_id.as_str())
+            .trim()
+            .to_string();
+
+        if cleanup_target.is_empty() {
+            return crate::services::worker_service_server::worker_service::TaskResponse {
+                status: "error".to_string(),
+                error: "cleanup_session requires non-empty session_id or cleanup_session_id"
+                    .to_string(),
+                result_location: String::new(),
+            };
+        }
+
+        shared
+            .cleanup_runtime_session(cleanup_target.as_str())
+            .await;
+
+        return crate::services::worker_service_server::worker_service::TaskResponse {
+            status: "ok".to_string(),
+            error: String::new(),
+            result_location: String::new(),
+        };
+    }
+
     if operation == "create_database" {
         let task = match first_task.as_ref() {
             Some(t) => t,

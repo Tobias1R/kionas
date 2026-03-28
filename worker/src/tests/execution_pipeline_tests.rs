@@ -564,9 +564,14 @@ async fn load_upstream_exchange_batches_applies_many_to_one_distribution_mapping
         stage_id: 20,
         upstream_stage_ids: vec![upstream_stage_id],
         upstream_partition_counts,
+        upstream_stage_flight_endpoints: HashMap::new(),
         partition_count: 2,
         partition_index: 1,
         query_run_id: query_run_id.to_string(),
+        rbac_user: None,
+        rbac_role: None,
+        auth_scope: None,
+        query_id: None,
         scan_hints: RuntimeScanHints::full_scan(),
     };
 
@@ -625,9 +630,14 @@ async fn load_upstream_exchange_batches_many_to_one_distribution_covers_all_rows
             stage_id: 21,
             upstream_stage_ids: vec![upstream_stage_id],
             upstream_partition_counts: upstream_partition_counts.clone(),
+            upstream_stage_flight_endpoints: HashMap::new(),
             partition_count: 2,
             partition_index,
             query_run_id: query_run_id.to_string(),
+            rbac_user: None,
+            rbac_role: None,
+            auth_scope: None,
+            query_id: None,
             scan_hints: RuntimeScanHints::full_scan(),
         };
 

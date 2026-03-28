@@ -8,12 +8,13 @@ use super::{
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{FlightData, FlightDescriptor};
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, TryStreamExt, stream};
 use std::str::FromStr;
 use std::sync::Arc;
 use tonic14::metadata::MetadataValue;
@@ -427,28 +428,149 @@ async fn do_put_rejects_empty_stream_with_invalid_argument() {
 }
 
 #[tokio::test]
-async fn streams_stage_partition_output_to_downstream_destinations() {
+async fn stage_stream_get_flight_info_returns_ticket_and_row_count() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
     let addr = listener.local_addr().expect("must have local addr");
     drop(listener);
 
-    let downstream_provider = crate::storage::mock::MockProvider::new().into_arc();
-    let mut downstream_shared = sample_shared_data();
-    downstream_shared.worker_info.worker_id = "downstream-worker".to_string();
-    downstream_shared.worker_info.host = "127.0.0.1".to_string();
-    downstream_shared.worker_info.port = addr.port() as u32;
-    downstream_shared.worker_info.server_url = format!("http://{}", addr);
-    downstream_shared.set_storage_provider(downstream_provider.clone());
+    let mut shared_data = sample_shared_data();
+    shared_data.worker_info.host = "127.0.0.1".to_string();
+    shared_data.worker_info.port = addr.port() as u32;
+    shared_data
+        .stage_streaming_state
+        .store_partition_batches("s1", 7, 0, sample_batches())
+        .await;
 
-    let downstream_service = WorkerFlightService::new(downstream_shared);
-    let downstream_handle = tokio::spawn(async move {
+    let service = WorkerFlightService::new(shared_data);
+    let handle = tokio::spawn(async move {
         Server::builder()
-            .add_service(FlightServiceServer::new(downstream_service))
+            .add_service(FlightServiceServer::new(service))
             .serve(addr)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     });
 
+    let endpoint = format!("http://{}", addr);
+    let channel = Endpoint::from_shared(endpoint)
+        .expect("endpoint must parse")
+        .connect()
+        .await
+        .expect("test client must connect");
+    let mut client = FlightServiceClient::new(channel);
+
+    let descriptor = FlightDescriptor {
+        path: vec!["s1".to_string(), "7".to_string(), "0".to_string()],
+        cmd: Bytes::from_static(b"STAGE_STREAM"),
+        ..Default::default()
+    };
+    let mut request = Request::new(descriptor);
+    insert_dispatch_metadata(&mut request, "s1");
+
+    let info = client
+        .get_flight_info(request)
+        .await
+        .expect("stage-stream get_flight_info should succeed")
+        .into_inner();
+
+    assert_eq!(info.total_records, 2);
+    assert_eq!(info.endpoint.len(), 1);
+    let first_endpoint = info.endpoint.first().expect("endpoint must exist");
+    let ticket = first_endpoint
+        .ticket
+        .as_ref()
+        .expect("ticket must be present");
+    assert!(
+        !ticket.ticket.is_empty(),
+        "ticket payload should be non-empty"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stage_stream_do_get_decodes_registered_batches() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
+    let addr = listener.local_addr().expect("must have local addr");
+    drop(listener);
+
+    let mut shared_data = sample_shared_data();
+    shared_data.worker_info.host = "127.0.0.1".to_string();
+    shared_data.worker_info.port = addr.port() as u32;
+    shared_data
+        .stage_streaming_state
+        .store_partition_batches("s1", 8, 0, sample_batches())
+        .await;
+
+    let service = WorkerFlightService::new(shared_data);
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(service))
+            .serve(addr)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    });
+
+    let endpoint = format!("http://{}", addr);
+    let channel = Endpoint::from_shared(endpoint)
+        .expect("endpoint must parse")
+        .connect()
+        .await
+        .expect("test client must connect");
+    let mut client = FlightServiceClient::new(channel);
+
+    let descriptor = FlightDescriptor {
+        path: vec!["s1".to_string(), "8".to_string(), "0".to_string()],
+        cmd: Bytes::from_static(b"STAGE_STREAM"),
+        ..Default::default()
+    };
+    let mut info_request = Request::new(descriptor);
+    insert_dispatch_metadata(&mut info_request, "s1");
+
+    let info = client
+        .get_flight_info(info_request)
+        .await
+        .expect("stage-stream get_flight_info should succeed")
+        .into_inner();
+    let ticket = info
+        .endpoint
+        .first()
+        .and_then(|endpoint| endpoint.ticket.clone())
+        .expect("ticket should be provided for stage-stream do_get");
+
+    let mut get_request = Request::new(ticket);
+    insert_dispatch_metadata(&mut get_request, "s1");
+    let response_stream = client
+        .do_get(get_request)
+        .await
+        .expect("stage-stream do_get should succeed")
+        .into_inner();
+
+    let flight_data_stream = stream::try_unfold(response_stream, |mut upstream| async {
+        match upstream.message().await {
+            Ok(Some(frame)) => Ok(Some((frame, upstream))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(tonic14::Status::internal(format!(
+                "failed to read stage-stream Flight frame: {}",
+                e
+            ))),
+        }
+    })
+    .map_err(Into::into);
+
+    let mut decoder = FlightRecordBatchStream::new_from_flight_data(flight_data_stream);
+    let mut rows = 0usize;
+    while let Some(batch) = decoder.next().await {
+        let batch = batch.expect("stage-stream batch should decode");
+        rows = rows.saturating_add(batch.num_rows());
+    }
+
+    assert_eq!(rows, 2);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn registers_stage_partition_output_for_pull_retrieval() {
     let upstream_shared = sample_shared_data();
     let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
         execution_mode_hint: 0,
@@ -456,7 +578,7 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
         output_destinations: vec![
             crate::services::worker_service_server::worker_service::OutputDestination {
                 downstream_stage_id: 2,
-                worker_addresses: vec![format!("http://{}", addr)],
+                worker_addresses: vec!["http://127.0.0.1:32101".to_string()],
                 partitioning: "Single".to_string(),
                 downstream_partition_count: 1,
             },
@@ -482,7 +604,7 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
         filter_predicate: None,
     };
 
-    stream_stage_partition_to_output_destinations(
+    let summary = stream_stage_partition_to_output_destinations(
         &upstream_shared,
         &task,
         "s1",
@@ -490,65 +612,22 @@ async fn streams_stage_partition_output_to_downstream_destinations() {
         None,
     )
     .await
-    .expect("stage output should stream to downstream do_put destination");
+    .expect("stage output registration should succeed");
 
-    let mut keys = downstream_provider
-        .list_objects("query/flight/s1/")
+    assert_eq!(summary.endpoint_count, 1);
+    assert_eq!(summary.queued_frames, 1);
+
+    let registered = upstream_shared
+        .stage_streaming_state
+        .get_partition_batches("s1", 1, 0)
         .await
-        .expect("downstream storage listing should succeed");
-    keys.sort();
-
-    assert!(keys.iter().any(|k| k.ends_with("part-00000.parquet")));
-    assert!(keys.iter().any(|k| k.ends_with("result_metadata.json")));
-
-    downstream_handle.abort();
+        .expect("stage stream batches should be registered");
+    assert_eq!(registered.len(), 1);
+    assert_eq!(registered[0].num_rows(), 2);
 }
 
 #[tokio::test]
-async fn streams_routed_batches_to_matching_output_destination_index() {
-    let listener_a = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
-    let addr_a = listener_a.local_addr().expect("must have local addr");
-    drop(listener_a);
-
-    let listener_b = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
-    let addr_b = listener_b.local_addr().expect("must have local addr");
-    drop(listener_b);
-
-    let provider_a = crate::storage::mock::MockProvider::new().into_arc();
-    let provider_b = crate::storage::mock::MockProvider::new().into_arc();
-
-    let mut shared_a = sample_shared_data();
-    shared_a.worker_info.worker_id = "downstream-worker-a".to_string();
-    shared_a.worker_info.host = "127.0.0.1".to_string();
-    shared_a.worker_info.port = addr_a.port() as u32;
-    shared_a.worker_info.server_url = format!("http://{}", addr_a);
-    shared_a.set_storage_provider(provider_a.clone());
-
-    let mut shared_b = sample_shared_data();
-    shared_b.worker_info.worker_id = "downstream-worker-b".to_string();
-    shared_b.worker_info.host = "127.0.0.1".to_string();
-    shared_b.worker_info.port = addr_b.port() as u32;
-    shared_b.worker_info.server_url = format!("http://{}", addr_b);
-    shared_b.set_storage_provider(provider_b.clone());
-
-    let service_a = WorkerFlightService::new(shared_a);
-    let service_b = WorkerFlightService::new(shared_b);
-
-    let handle_a = tokio::spawn(async move {
-        Server::builder()
-            .add_service(FlightServiceServer::new(service_a))
-            .serve(addr_a)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-    let handle_b = tokio::spawn(async move {
-        Server::builder()
-            .add_service(FlightServiceServer::new(service_b))
-            .serve(addr_b)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-
+async fn routed_batches_prefers_first_non_empty_destination_slice_for_registration() {
     let upstream_shared = sample_shared_data();
     let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
         execution_mode_hint: 0,
@@ -556,13 +635,13 @@ async fn streams_routed_batches_to_matching_output_destination_index() {
         output_destinations: vec![
             crate::services::worker_service_server::worker_service::OutputDestination {
                 downstream_stage_id: 2,
-                worker_addresses: vec![format!("http://{}", addr_a)],
+                worker_addresses: vec!["http://127.0.0.1:32102".to_string()],
                 partitioning: "Single".to_string(),
                 downstream_partition_count: 1,
             },
             crate::services::worker_service_server::worker_service::OutputDestination {
                 downstream_stage_id: 3,
-                worker_addresses: vec![format!("http://{}", addr_b)],
+                worker_addresses: vec!["http://127.0.0.1:32103".to_string()],
                 partitioning: "Single".to_string(),
                 downstream_partition_count: 1,
             },
@@ -604,7 +683,7 @@ async fn streams_routed_batches_to_matching_output_destination_index() {
     ];
     let routed = vec![routed_a, routed_b];
 
-    stream_stage_partition_to_output_destinations(
+    let summary = stream_stage_partition_to_output_destinations(
         &upstream_shared,
         &task,
         "s1",
@@ -612,54 +691,15 @@ async fn streams_routed_batches_to_matching_output_destination_index() {
         Some(&routed),
     )
     .await
-    .expect("routed stage output should stream to matching downstream destinations");
+    .expect("routed stage output registration should succeed");
 
-    let mut keys_a = provider_a
-        .list_objects("query/flight/s1/")
+    assert_eq!(summary.endpoint_count, 2);
+    let registered = upstream_shared
+        .stage_streaming_state
+        .get_partition_batches("s1", 1, 0)
         .await
-        .expect("provider A list should succeed");
-    keys_a.sort();
-    let metadata_key_a = keys_a
-        .iter()
-        .find(|key| key.ends_with("result_metadata.json"))
-        .expect("provider A metadata key should exist")
-        .clone();
-    let metadata_a = provider_a
-        .get_object(&metadata_key_a)
-        .await
-        .expect("provider A metadata read should succeed")
-        .expect("provider A metadata should exist");
-    let metadata_a: serde_json::Value =
-        serde_json::from_slice(&metadata_a).expect("provider A metadata should parse");
-    assert_eq!(
-        metadata_a.get("row_count").and_then(|v| v.as_u64()),
-        Some(2)
-    );
-
-    let mut keys_b = provider_b
-        .list_objects("query/flight/s1/")
-        .await
-        .expect("provider B list should succeed");
-    keys_b.sort();
-    let metadata_key_b = keys_b
-        .iter()
-        .find(|key| key.ends_with("result_metadata.json"))
-        .expect("provider B metadata key should exist")
-        .clone();
-    let metadata_b = provider_b
-        .get_object(&metadata_key_b)
-        .await
-        .expect("provider B metadata read should succeed")
-        .expect("provider B metadata should exist");
-    let metadata_b: serde_json::Value =
-        serde_json::from_slice(&metadata_b).expect("provider B metadata should parse");
-    assert_eq!(
-        metadata_b.get("row_count").and_then(|v| v.as_u64()),
-        Some(3)
-    );
-
-    handle_a.abort();
-    handle_b.abort();
+        .expect("stage stream batches should be registered");
+    assert_eq!(registered[0].num_rows(), 2);
 }
 
 #[tokio::test]
@@ -719,27 +759,6 @@ async fn rejects_routed_destination_count_mismatch() {
 
 #[tokio::test]
 async fn routed_empty_destination_batches_fall_back_to_broadcast_batches() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("must bind local test port");
-    let addr = listener.local_addr().expect("must have local addr");
-    drop(listener);
-
-    let downstream_provider = crate::storage::mock::MockProvider::new().into_arc();
-    let mut downstream_shared = sample_shared_data();
-    downstream_shared.worker_info.worker_id = "downstream-worker-fallback".to_string();
-    downstream_shared.worker_info.host = "127.0.0.1".to_string();
-    downstream_shared.worker_info.port = addr.port() as u32;
-    downstream_shared.worker_info.server_url = format!("http://{}", addr);
-    downstream_shared.set_storage_provider(downstream_provider.clone());
-
-    let downstream_service = WorkerFlightService::new(downstream_shared);
-    let downstream_handle = tokio::spawn(async move {
-        Server::builder()
-            .add_service(FlightServiceServer::new(downstream_service))
-            .serve(addr)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-    });
-
     let upstream_shared = sample_shared_data();
     let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
         execution_mode_hint: 0,
@@ -747,7 +766,7 @@ async fn routed_empty_destination_batches_fall_back_to_broadcast_batches() {
         output_destinations: vec![
             crate::services::worker_service_server::worker_service::OutputDestination {
                 downstream_stage_id: 2,
-                worker_addresses: vec![format!("http://{}", addr)],
+                worker_addresses: vec!["http://127.0.0.1:32104".to_string()],
                 partitioning: "Single".to_string(),
                 downstream_partition_count: 1,
             },
@@ -784,26 +803,12 @@ async fn routed_empty_destination_batches_fall_back_to_broadcast_batches() {
     .await
     .expect("empty routed destination batches should fall back to broadcast batches");
 
-    let mut keys = downstream_provider
-        .list_objects("query/flight/s1/")
+    let registered = upstream_shared
+        .stage_streaming_state
+        .get_partition_batches("s1", 1, 0)
         .await
-        .expect("downstream storage listing should succeed");
-    keys.sort();
-    let metadata_key = keys
-        .iter()
-        .find(|key| key.ends_with("result_metadata.json"))
-        .expect("metadata key should exist")
-        .clone();
-    let metadata_bytes = downstream_provider
-        .get_object(&metadata_key)
-        .await
-        .expect("metadata read should succeed")
-        .expect("metadata should exist");
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&metadata_bytes).expect("metadata JSON should parse");
-    assert_eq!(metadata.get("row_count").and_then(|v| v.as_u64()), Some(2));
-
-    downstream_handle.abort();
+        .expect("registered batches should exist");
+    assert_eq!(registered[0].num_rows(), 2);
 }
 
 #[test]
@@ -906,7 +911,7 @@ fn end_to_end_scan_repartition_aggregate_preserves_rows_and_sum() {
 }
 
 #[tokio::test]
-async fn slow_consumer_throttles_fast_producer_with_bounded_queue() {
+async fn stage_registration_ignores_push_backpressure_limits() {
     let upstream_shared = sample_shared_data();
     let task = crate::services::worker_service_server::worker_service::StagePartitionExecution {
         execution_mode_hint: 0,
@@ -948,7 +953,7 @@ async fn slow_consumer_throttles_fast_producer_with_bounded_queue() {
     };
 
     let batches = sample_many_single_row_batches(8);
-    let error = stream_stage_partition_to_output_destinations_with_limits(
+    let summary = stream_stage_partition_to_output_destinations_with_limits(
         &upstream_shared,
         &task,
         "s1",
@@ -957,9 +962,9 @@ async fn slow_consumer_throttles_fast_producer_with_bounded_queue() {
         limits,
     )
     .await
-    .expect_err("slow consumer should trigger bounded queue backpressure");
+    .expect("stage registration should not fail due to push backpressure limits");
 
-    assert!(error.contains("is too slow; bounded queue capacity=1"));
+    assert_eq!(summary.queued_frames, batches.len());
 }
 
 #[tokio::test]

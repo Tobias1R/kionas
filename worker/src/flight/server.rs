@@ -7,7 +7,6 @@ use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
-use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::utils::batches_to_flight_data;
 use arrow_flight::{
@@ -24,7 +23,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tonic14::metadata::MetadataValue;
 use tonic14::{Request, Response, Status, Streaming};
 use url::Url;
@@ -450,16 +448,9 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
     routed_batches_by_destination: Option<&[Vec<RecordBatch>]>,
     limits: DownstreamRoutingLimits,
 ) -> Result<DownstreamNetworkSummary, String> {
-    if task.output_destinations.is_empty() {
-        return Ok(DownstreamNetworkSummary::default());
-    }
-
     if batches.is_empty() {
         return Err("cannot stream empty stage output batches to downstream workers".to_string());
     }
-
-    let service = WorkerFlightService::new(shared_data.clone());
-    let mut network_summary = DownstreamNetworkSummary::default();
 
     if let Some(routed_batches) = routed_batches_by_destination
         && routed_batches.len() != task.output_destinations.len()
@@ -471,180 +462,50 @@ async fn stream_stage_partition_to_output_destinations_with_limits(
         ));
     }
 
-    for (destination_index, destination) in task.output_destinations.iter().enumerate() {
-        if destination.worker_addresses.is_empty() {
-            return Err(format!(
-                "output destination for downstream_stage_id={} has no worker addresses",
-                destination.downstream_stage_id
-            ));
-        }
+    let batches_for_partition = routed_batches_by_destination
+        .and_then(|routed| routed.first())
+        .filter(|routed| !routed.is_empty())
+        .cloned()
+        .unwrap_or_else(|| batches.to_vec());
 
-        let destination_batches = match routed_batches_by_destination
-            .and_then(|routed| routed.get(destination_index))
-            .filter(|routed| !routed.is_empty())
-        {
-            Some(routed) => routed.as_slice(),
-            None => batches,
-        };
-
-        let base_payloads = batches_to_flight_data(
-            destination_batches[0].schema().as_ref(),
-            destination_batches.to_vec(),
+    shared_data
+        .stage_streaming_state
+        .store_partition_batches(
+            session_id,
+            task.stage_id,
+            task.partition_id,
+            batches_for_partition,
         )
-        .map_err(|e| format!("failed to encode stage output FlightData: {}", e))?;
+        .await;
 
-        for (worker_index, worker_address) in destination.worker_addresses.iter().enumerate() {
-            let endpoint = normalize_destination_endpoint(worker_address)?;
-            let downstream_task_id =
-                stage_destination_task_id(task, destination, worker_address, worker_index);
+    let endpoint_count = task
+        .output_destinations
+        .iter()
+        .map(|destination| destination.worker_addresses.len())
+        .sum::<usize>();
 
-            let mut payloads = base_payloads.clone();
-            if let Some(first) = payloads.first_mut() {
-                first.flight_descriptor = Some(FlightDescriptor::new_path(vec![
-                    session_id.to_string(),
-                    downstream_task_id,
-                ]));
-            }
+    let queued_frames = batches.len();
+    let queued_bytes = batches
+        .iter()
+        .map(|batch| {
+            let batch_payload =
+                batches_to_flight_data(batch.schema().as_ref(), vec![batch.clone()])
+                    .unwrap_or_default();
+            batch_payload
+                .first()
+                .map(flight_data_wire_size_bytes)
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
 
-            let (tx, rx) = mpsc::channel::<FlightData>(limits.queue_capacity);
-            let task_clone = task.clone();
-            let endpoint_clone = endpoint.clone();
-            let session_id_owned = session_id.to_string();
-            let service_clone = service.clone();
+    let _ = limits;
 
-            let stream_started_at = Instant::now();
-            let consumer = tokio::spawn(async move {
-                if limits.startup_delay > Duration::from_millis(0) {
-                    tokio::time::sleep(limits.startup_delay).await;
-                }
-
-                let channel = service_clone
-                    .get_downstream_channel(&endpoint_clone)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "failed to connect downstream Flight endpoint {}: {}",
-                            endpoint_clone, e
-                        )
-                    })?;
-
-                let request_stream = stream::unfold(rx, |mut receiver| async {
-                    receiver.recv().await.map(|payload| (payload, receiver))
-                });
-                let mut request = Request::new(request_stream);
-                insert_dispatch_metadata_for_downstream(
-                    &mut request,
-                    &task_clone,
-                    &session_id_owned,
-                )?;
-
-                let max_message_bytes = flight_max_message_bytes();
-                let mut client = FlightServiceClient::new(channel)
-                    .max_decoding_message_size(max_message_bytes)
-                    .max_encoding_message_size(max_message_bytes);
-                let mut response =
-                    tokio::time::timeout(limits.request_timeout, client.do_put(request))
-                        .await
-                        .map_err(|_| {
-                            format!(
-                                "downstream endpoint {} request timed out after {:?}",
-                                endpoint_clone, limits.request_timeout
-                            )
-                        })?
-                        .map_err(|e| {
-                            format!(
-                                "failed to stream stage output to downstream endpoint {}: {}",
-                                endpoint_clone, e
-                            )
-                        })?
-                        .into_inner();
-
-                while response
-                    .message()
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "downstream endpoint {} failed while acknowledging stage stream: {}",
-                            endpoint_clone, e
-                        )
-                    })?
-                    .is_some()
-                {}
-
-                Ok::<u128, String>(stream_started_at.elapsed().as_millis())
-            });
-
-            let mut queued_frames = 0usize;
-            let mut queued_bytes = 0usize;
-            let mut enqueue_wait_ms = 0u128;
-
-            let mut dispatch_error = None::<String>;
-            for payload in payloads {
-                let payload_size = flight_payload_wire_size_bytes(&payload);
-                let send_started = Instant::now();
-                let send_result =
-                    tokio::time::timeout(limits.enqueue_timeout, tx.send(payload)).await;
-                enqueue_wait_ms =
-                    enqueue_wait_ms.saturating_add(send_started.elapsed().as_millis());
-
-                match send_result {
-                    Ok(Ok(())) => {
-                        queued_frames = queued_frames.saturating_add(1);
-                        queued_bytes = queued_bytes.saturating_add(payload_size);
-                    }
-                    Ok(Err(_)) => {
-                        dispatch_error = Some(format!(
-                            "downstream endpoint {} closed queue while receiving stage output",
-                            endpoint
-                        ));
-                        break;
-                    }
-                    Err(_) => {
-                        dispatch_error = Some(format!(
-                            "downstream endpoint {} is too slow; bounded queue capacity={} timed out after {:?}",
-                            endpoint, limits.queue_capacity, limits.enqueue_timeout
-                        ));
-                        break;
-                    }
-                }
-            }
-
-            drop(tx);
-
-            if let Some(error) = dispatch_error {
-                consumer.abort();
-                return Err(error);
-            }
-
-            let stream_time_ms = consumer.await.map_err(|e| {
-                format!(
-                    "downstream endpoint {} dispatch task panicked: {}",
-                    endpoint, e
-                )
-            })??;
-
-            log_downstream_dispatch_metrics(
-                &endpoint,
-                task,
-                DownstreamDispatchMetrics {
-                    queued_frames,
-                    queued_bytes,
-                    enqueue_wait_ms,
-                    stream_time_ms,
-                },
-            );
-            network_summary.endpoint_count = network_summary.endpoint_count.saturating_add(1);
-            network_summary.queued_frames =
-                network_summary.queued_frames.saturating_add(queued_frames);
-            network_summary.queued_bytes =
-                network_summary.queued_bytes.saturating_add(queued_bytes);
-            network_summary.stream_time_ms = network_summary
-                .stream_time_ms
-                .saturating_add(stream_time_ms);
-        }
-    }
-
-    Ok(network_summary)
+    Ok(DownstreamNetworkSummary {
+        endpoint_count,
+        queued_frames,
+        queued_bytes,
+        stream_time_ms: 0,
+    })
 }
 
 /// What: Decode and verify the signed internal Flight ticket.
@@ -1043,6 +904,78 @@ fn parse_descriptor_scope(descriptor: &FlightDescriptor) -> Result<(String, Stri
     Err(Status::invalid_argument(
         "flight descriptor must provide session and task scope",
     ))
+}
+
+const STAGE_STREAM_CMD: &str = "STAGE_STREAM";
+const STAGE_STREAM_TASK_PREFIX: &str = "stage-stream:";
+
+/// What: Build synthetic task id used inside signed Flight tickets for stage stream pulls.
+///
+/// Inputs:
+/// - `stage_id`: Upstream stage id.
+/// - `partition_id`: Upstream partition id.
+///
+/// Output:
+/// - Deterministic task id payload for authz ticket claims.
+fn stage_stream_task_id(stage_id: u32, partition_id: u32) -> String {
+    format!("{}{}:{}", STAGE_STREAM_TASK_PREFIX, stage_id, partition_id)
+}
+
+/// What: Parse synthetic stage stream task id from signed ticket claims.
+///
+/// Inputs:
+/// - `task_id`: Ticket claim task identifier.
+///
+/// Output:
+/// - `(stage_id, partition_id)` when the task id is stage-stream encoded.
+/// - `None` for non-stage-stream task ids.
+fn parse_stage_stream_task_id(task_id: &str) -> Option<(u32, u32)> {
+    let payload = task_id.strip_prefix(STAGE_STREAM_TASK_PREFIX)?;
+    let mut parts = payload.splitn(2, ':');
+    let stage_id = parts.next()?.trim().parse::<u32>().ok()?;
+    let partition_id = parts.next()?.trim().parse::<u32>().ok()?;
+    Some((stage_id, partition_id))
+}
+
+/// What: Parse StageStream descriptor scope from Flight descriptor.
+///
+/// Inputs:
+/// - `descriptor`: Flight descriptor expected to carry STAGE_STREAM cmd and path scope.
+///
+/// Output:
+/// - `(session_id, stage_id, partition_id)` for stage stream descriptors.
+fn parse_stage_stream_descriptor_scope(
+    descriptor: &FlightDescriptor,
+) -> Result<(String, u32, u32), Status> {
+    let cmd = std::str::from_utf8(&descriptor.cmd)
+        .map_err(|_| Status::invalid_argument("flight descriptor cmd is not valid UTF-8"))?;
+    if cmd.trim() != STAGE_STREAM_CMD {
+        return Err(Status::invalid_argument(
+            "flight descriptor cmd must be STAGE_STREAM for stage output pulls",
+        ));
+    }
+
+    if descriptor.path.len() < 3 {
+        return Err(Status::invalid_argument(
+            "stage stream descriptor path must include [session_id, stage_id, partition_id]",
+        ));
+    }
+
+    let session_id = descriptor.path[0].trim().to_string();
+    let stage_id = descriptor.path[1].trim().parse::<u32>().map_err(|_| {
+        Status::invalid_argument("stage stream descriptor stage_id must be an unsigned integer")
+    })?;
+    let partition_id = descriptor.path[2].trim().parse::<u32>().map_err(|_| {
+        Status::invalid_argument("stage stream descriptor partition_id must be an unsigned integer")
+    })?;
+
+    if session_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "stage stream descriptor session_id is required",
+        ));
+    }
+
+    Ok((session_id, stage_id, partition_id))
 }
 
 /// What: Encode Arrow schema into Flight schema payload bytes.
@@ -1609,6 +1542,78 @@ impl FlightService for WorkerFlightService {
     ) -> Result<Response<FlightInfo>, Status> {
         let authz = crate::authz::WorkerAuthorizer::new();
         let descriptor = request.get_ref().clone();
+        let is_stage_stream = std::str::from_utf8(&descriptor.cmd)
+            .ok()
+            .map(|cmd| cmd.trim() == STAGE_STREAM_CMD)
+            .unwrap_or(false);
+
+        if is_stage_stream {
+            let (session_id, stage_id, partition_id) =
+                parse_stage_stream_descriptor_scope(&descriptor)?;
+            let dispatch_ctx =
+                dispatch_context_from_flight_metadata(request.metadata(), &session_id)?;
+            authz
+                .validate_dispatch_context(&dispatch_ctx)
+                .await
+                .map_err(map_tonic_status)?;
+
+            if dispatch_ctx.session_id != session_id {
+                return Err(Status::permission_denied(
+                    "flight descriptor session_id does not match auth context",
+                ));
+            }
+
+            let batches = self
+                .shared_data
+                .stage_streaming_state
+                .get_partition_batches(&session_id, stage_id, partition_id)
+                .await
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "stage stream not found for session_id={}, stage_id={}, partition_id={}",
+                        session_id, stage_id, partition_id
+                    ))
+                })?;
+
+            let schema = batches.first().map(RecordBatch::schema).ok_or_else(|| {
+                Status::not_found("no record batches available for stage FlightInfo")
+            })?;
+            let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as i64;
+            let schema_result = schema_result_from_schema(schema.as_ref())?;
+
+            let endpoint_uri = resolve_flight_endpoint(
+                &self.shared_data.worker_info.host,
+                self.shared_data.worker_info.port,
+            );
+            let ticket_task_id = stage_stream_task_id(stage_id, partition_id);
+            let ticket = authz
+                .issue_signed_flight_ticket(
+                    &dispatch_ctx,
+                    &ticket_task_id,
+                    &self.shared_data.worker_info.worker_id,
+                )
+                .map_err(map_tonic_status)?;
+
+            let flight_info = FlightInfo {
+                schema: schema_result.schema,
+                flight_descriptor: Some(descriptor),
+                endpoint: vec![FlightEndpoint {
+                    ticket: Some(Ticket {
+                        ticket: ticket.into_bytes().into(),
+                    }),
+                    location: vec![Location { uri: endpoint_uri }],
+                    expiration_time: None,
+                    app_metadata: Default::default(),
+                }],
+                total_records: row_count,
+                total_bytes: -1,
+                ordered: false,
+                app_metadata: Default::default(),
+            };
+
+            return Ok(Response::new(flight_info));
+        }
+
         let (session_id, task_id) = parse_descriptor_scope(&descriptor)?;
         let dispatch_ctx = dispatch_context_from_flight_metadata(request.metadata(), &session_id)?;
         authz
@@ -1758,24 +1763,38 @@ impl FlightService for WorkerFlightService {
             ));
         }
 
-        let result_location = self
-            .shared_data
-            .get_task_result_location(&claims.sid, &claims.tid)
-            .await
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "result location missing or expired for task_id={}",
-                    claims.tid
-                ))
-            })?;
+        let batches =
+            if let Some((stage_id, partition_id)) = parse_stage_stream_task_id(&claims.tid) {
+                self.shared_data
+                .stage_streaming_state
+                .get_partition_batches(&claims.sid, stage_id, partition_id)
+                .await
+                .ok_or_else(|| {
+                    Status::not_found(format!(
+                        "stage stream not found for session_id={}, stage_id={}, partition_id={}",
+                        claims.sid, stage_id, partition_id
+                    ))
+                })?
+            } else {
+                let result_location = self
+                    .shared_data
+                    .get_task_result_location(&claims.sid, &claims.tid)
+                    .await
+                    .ok_or_else(|| {
+                        Status::not_found(format!(
+                            "result location missing or expired for task_id={}",
+                            claims.tid
+                        ))
+                    })?;
 
-        let batches = load_result_batches(
-            &self.shared_data,
-            &result_location,
-            &claims.sid,
-            &claims.tid,
-        )
-        .await?;
+                load_result_batches(
+                    &self.shared_data,
+                    &result_location,
+                    &claims.sid,
+                    &claims.tid,
+                )
+                .await?
+            };
         let schema = batches
             .first()
             .map(|b| b.schema())

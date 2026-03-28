@@ -336,9 +336,14 @@ pub(crate) struct StageExecutionContext {
     pub(crate) stage_id: u32,
     pub(crate) upstream_stage_ids: Vec<u32>,
     pub(crate) upstream_partition_counts: HashMap<u32, u32>,
+    pub(crate) upstream_stage_flight_endpoints: HashMap<u32, HashMap<u32, String>>,
     pub(crate) partition_count: u32,
     pub(crate) partition_index: u32,
     pub(crate) query_run_id: String,
+    pub(crate) rbac_user: Option<String>,
+    pub(crate) rbac_role: Option<String>,
+    pub(crate) auth_scope: Option<String>,
+    pub(crate) query_id: Option<String>,
     pub(crate) scan_hints: RuntimeScanHints,
 }
 
@@ -695,6 +700,94 @@ pub(crate) fn stage_execution_context(
         1
     };
     let upstream_partition_counts = task.upstream_partition_counts.clone();
+    let upstream_stage_flight_endpoints = task
+        .params
+        .get("__upstream_stage_flight_endpoints_json")
+        .filter(|value| !value.trim().is_empty())
+        .map(|raw| {
+            let parsed = serde_json::from_str::<serde_json::Value>(raw).map_err(|e| {
+                format!(
+                    "invalid __upstream_stage_flight_endpoints_json payload for task_id={}: {}",
+                    task.task_id, e
+                )
+            })?;
+
+            let object = parsed.as_object().ok_or_else(|| {
+                format!(
+                    "invalid __upstream_stage_flight_endpoints_json payload for task_id={}: expected JSON object",
+                    task.task_id
+                )
+            })?;
+
+            let mut normalized =
+                HashMap::<u32, HashMap<u32, String>>::with_capacity(object.len());
+            for (stage_key, endpoint_value) in object {
+                let stage_id = stage_key.trim().parse::<u32>().map_err(|e| {
+                    format!(
+                        "invalid upstream stage id '{}' in __upstream_stage_flight_endpoints_json for task_id={}: {}",
+                        stage_key, task.task_id, e
+                    )
+                })?;
+
+                // Backward-compatible parse: allow either
+                // 1) stage -> endpoint string
+                // 2) stage -> { partition_id -> endpoint string }
+                let partition_map = if let Some(endpoint) = endpoint_value.as_str() {
+                    let endpoint = endpoint.trim().to_string();
+                    if endpoint.is_empty() {
+                        return Err(format!(
+                            "empty upstream endpoint for stage_id={} in task_id={}",
+                            stage_id, task.task_id
+                        ));
+                    }
+                    let mut map = HashMap::<u32, String>::new();
+                    map.insert(0, endpoint);
+                    map
+                } else {
+                    let endpoint_object = endpoint_value.as_object().ok_or_else(|| {
+                        format!(
+                            "invalid upstream endpoint map for stage_id={} in task_id={}: expected string or object",
+                            stage_id, task.task_id
+                        )
+                    })?;
+                    let mut map = HashMap::<u32, String>::with_capacity(endpoint_object.len());
+                    for (partition_key, endpoint_value) in endpoint_object {
+                        let partition_id = partition_key.trim().parse::<u32>().map_err(|e| {
+                            format!(
+                                "invalid upstream partition id '{}' for stage_id={} in task_id={}: {}",
+                                partition_key, stage_id, task.task_id, e
+                            )
+                        })?;
+                        let endpoint = endpoint_value
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "empty upstream endpoint for stage_id={} partition_id={} in task_id={}",
+                                    stage_id, partition_id, task.task_id
+                                )
+                            })?
+                            .to_string();
+                        map.insert(partition_id, endpoint);
+                    }
+                    map
+                };
+
+                if partition_map.is_empty() {
+                    return Err(format!(
+                        "upstream endpoint map is empty for stage_id={} in task_id={}",
+                        stage_id, task.task_id
+                    ));
+                }
+
+                normalized.insert(stage_id, partition_map);
+            }
+
+            Ok::<HashMap<u32, HashMap<u32, String>>, String>(normalized)
+        })
+        .transpose()?
+        .unwrap_or_default();
     let partition_index = if is_staged_task {
         if task.partition_id >= partition_count {
             return Err(format!(
@@ -711,6 +804,26 @@ pub(crate) fn stage_execution_context(
     } else {
         task.query_run_id.clone()
     };
+    let rbac_user = task
+        .params
+        .get("__rbac_user")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let rbac_role = task
+        .params
+        .get("__rbac_role")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let auth_scope = task
+        .params
+        .get("__auth_scope")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let query_id = task
+        .params
+        .get("__query_id")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let scan_hints = RuntimeScanHints {
         mode: RuntimeScanMode::parse_or_default(task.params.get("scan_mode").map(String::as_str)),
         pruning_hints_json: task
@@ -737,9 +850,14 @@ pub(crate) fn stage_execution_context(
         stage_id,
         upstream_stage_ids,
         upstream_partition_counts,
+        upstream_stage_flight_endpoints,
         partition_count,
         partition_index,
         query_run_id,
+        rbac_user,
+        rbac_role,
+        auth_scope,
+        query_id,
         scan_hints,
     })
 }

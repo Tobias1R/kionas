@@ -11,6 +11,7 @@ use crate::workers::PooledConn;
 use uuid::Uuid;
 
 const OUTCOME_PREFIX: &str = "RESULT";
+const UPSTREAM_STAGE_FLIGHT_ENDPOINTS_PARAM: &str = "__upstream_stage_flight_endpoints_json";
 
 fn format_outcome(category: &str, code: &str, message: &str) -> String {
     format!("{}|{}|{}|{}", OUTCOME_PREFIX, category, code, message)
@@ -311,6 +312,123 @@ fn normalize_worker_address_for_match(address: &str) -> String {
 
     let without_path = trimmed.split('/').next().unwrap_or(trimmed);
     without_path.to_string()
+}
+
+fn normalize_worker_address_to_flight_endpoint(address: &str) -> Option<String> {
+    let normalized = normalize_worker_address_for_match(address);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut host_port = normalized.split(':');
+    let host = host_port.next()?.trim();
+    let interops_port = host_port.next()?.trim().parse::<u32>().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+
+    let flight_port = std::env::var("WORKER_FLIGHT_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| interops_port.saturating_add(1));
+
+    Some(format!("http://{}:{}", host, flight_port))
+}
+
+fn build_upstream_stage_flight_endpoints_json(
+    stage_group: &crate::statement_handler::shared::distributed_dag::StageTaskGroup,
+    groups_by_stage: &HashMap<
+        u32,
+        Vec<crate::statement_handler::shared::distributed_dag::StageTaskGroup>,
+    >,
+) -> Result<Option<String>, String> {
+    if stage_group.upstream_stage_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut stage_map = serde_json::Map::<String, serde_json::Value>::new();
+
+    for upstream_stage_id in &stage_group.upstream_stage_ids {
+        let Some(upstream_groups) = groups_by_stage.get(upstream_stage_id) else {
+            continue;
+        };
+
+        let upstream_partition_count = upstream_groups
+            .first()
+            .map(|value| value.partition_count)
+            .unwrap_or(0);
+        if upstream_partition_count == 0 {
+            continue;
+        }
+
+        let selected_partitions = if upstream_partition_count <= stage_group.partition_count {
+            if stage_group.partition_index < upstream_partition_count {
+                vec![stage_group.partition_index]
+            } else {
+                Vec::new()
+            }
+        } else {
+            (0..upstream_partition_count)
+                .filter(|partition_id| {
+                    partition_id % stage_group.partition_count == stage_group.partition_index
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut partition_map = serde_json::Map::<String, serde_json::Value>::new();
+        for partition_id in selected_partitions {
+            let upstream_group = upstream_groups
+                .iter()
+                .find(|group| group.partition_index == partition_id)
+                .ok_or_else(|| {
+                    format!(
+                        "missing upstream group for stage {} partition {}",
+                        upstream_stage_id, partition_id
+                    )
+                })?;
+
+            let Some(destination) = upstream_group
+                .output_destinations
+                .iter()
+                .find(|destination| destination.downstream_stage_id == stage_group.stage_id)
+            else {
+                continue;
+            };
+
+            let Some(worker_address) = destination
+                .worker_addresses
+                .get(partition_id as usize)
+                .or_else(|| destination.worker_addresses.first())
+            else {
+                continue;
+            };
+
+            let Some(endpoint) = normalize_worker_address_to_flight_endpoint(worker_address) else {
+                continue;
+            };
+
+            partition_map.insert(
+                partition_id.to_string(),
+                serde_json::Value::String(endpoint),
+            );
+        }
+
+        if !partition_map.is_empty() {
+            stage_map.insert(
+                upstream_stage_id.to_string(),
+                serde_json::Value::Object(partition_map),
+            );
+        }
+    }
+
+    if stage_map.is_empty() {
+        return Ok(None);
+    }
+
+    serde_json::to_string(&serde_json::Value::Object(stage_map))
+        .map(Some)
+        .map_err(|e| format!("failed to serialize upstream Flight endpoint map: {}", e))
 }
 
 async fn resolve_worker_key_by_name(
@@ -623,6 +741,9 @@ pub async fn run_task_for_input_with_params(
         && let Some(ctx) = auth_ctx
     {
         params.insert("__query_id".to_string(), ctx.query_id.clone());
+        params.insert("__rbac_user".to_string(), ctx.rbac_user.clone());
+        params.insert("__rbac_role".to_string(), ctx.rbac_role.clone());
+        params.insert("__auth_scope".to_string(), ctx.scope.clone());
     }
     if operation.eq_ignore_ascii_case("query") {
         let now_epoch_ms = SystemTime::now()
@@ -925,12 +1046,29 @@ async fn run_stage_groups_with_partition_executor(
         let mut wave_join_set = tokio::task::JoinSet::new();
 
         for stage_id in wave {
-            let stage_partitions = groups_by_stage.get(&stage_id).cloned().ok_or_else(|| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("missing stage partition groups for stage {}", stage_id),
-                )) as Box<dyn Error + Send + Sync>
-            })?;
+            let mut stage_partitions =
+                groups_by_stage.get(&stage_id).cloned().ok_or_else(|| {
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("missing stage partition groups for stage {}", stage_id),
+                    )) as Box<dyn Error + Send + Sync>
+                })?;
+
+            for group in &mut stage_partitions {
+                if !group.upstream_stage_ids.is_empty() {
+                    let endpoints_json =
+                        build_upstream_stage_flight_endpoints_json(group, &groups_by_stage)
+                            .map_err(|e| {
+                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                                    as Box<dyn Error + Send + Sync>
+                            })?;
+                    if let Some(value) = endpoints_json {
+                        group
+                            .params
+                            .insert(UPSTREAM_STAGE_FLIGHT_ENDPOINTS_PARAM.to_string(), value);
+                    }
+                }
+            }
 
             let expected_partition_count = stage_partitions
                 .first()
