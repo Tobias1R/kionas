@@ -5,6 +5,12 @@ use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ClusterInfo {
+    #[serde(default)]
+    pub cluster_name: String,
+    #[serde(default)]
+    pub cluster_id: String,
+    #[serde(default, alias = "version")]
+    pub cluster_version: String,
     pub nodes: Vec<String>,
     pub master: String,
     pub storage: serde_json::Value,

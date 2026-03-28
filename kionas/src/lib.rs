@@ -2,11 +2,16 @@ pub mod config;
 pub mod constants;
 pub mod consul;
 pub mod logging;
+pub mod monitoring;
 pub mod parser;
 pub mod planner;
+pub mod redis_monitoring;
 pub mod session;
 pub mod sql;
 pub mod utils;
+
+#[cfg(test)]
+mod tests;
 
 use chrono::Utc;
 use get_if_addrs::get_if_addrs;

@@ -157,11 +157,27 @@ pub struct WarehousePoolTierConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterConfig {
+    pub cluster_name: String,
+    pub cluster_id: String,
+    #[serde(alias = "version")]
+    pub cluster_version: String,
     pub nodes: Vec<String>,
     pub master: String,
     pub storage: StorageConfig,
     #[serde(default, alias = "warehouse_pools_types")]
     pub warehouse_pools_tiers: Vec<WarehousePoolTierConfig>,
+}
+
+fn validate_cluster_config(config: &ClusterConfig) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if config.cluster_name.trim().is_empty() {
+        return Err("cluster_name must be non-empty".into());
+    }
+
+    if config.cluster_id.trim().is_empty() {
+        return Err("cluster_id must be non-empty".into());
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -276,9 +292,11 @@ pub async fn load_cluster_config(
         let trimmed = raw.trim();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             let cfg: ClusterConfig = serde_json::from_str(&raw)?;
+            validate_cluster_config(&cfg)?;
             return Ok(cfg);
         } else {
             let cfg: ClusterConfig = toml::from_str(&raw)?;
+            validate_cluster_config(&cfg)?;
             return Ok(cfg);
         }
     }
@@ -286,6 +304,7 @@ pub async fn load_cluster_config(
     let json_path = "/workspace/configs/cluster.json";
     if let Ok(content) = fs::read_to_string(json_path) {
         let cfg: ClusterConfig = serde_json::from_str(&content)?;
+        validate_cluster_config(&cfg)?;
         return Ok(cfg);
     }
 

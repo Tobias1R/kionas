@@ -12,6 +12,7 @@ use kionas::constants::{
     STAGE_EXCHANGE_RETENTION_ENV, STAGE_EXCHANGE_RETENTION_SECONDS,
     TRANSACTION_STAGING_RETENTION_ENV, TRANSACTION_STAGING_RETENTION_SECONDS,
 };
+use kionas::monitoring::{init_redis_pool, update_cluster_info};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -146,6 +147,8 @@ pub(crate) fn start(shared_data: SharedData) {
     let cleanup_shared_data = Arc::clone(&shared_data);
 
     tokio::spawn(async move {
+        let janitor_start_time = Utc::now();
+        let status_redis_url = resolved_status_redis_url();
         let redis_pool = match redis_pool() {
             Ok(pool) => pool,
             Err(error) => {
@@ -154,12 +157,35 @@ pub(crate) fn start(shared_data: SharedData) {
             }
         };
 
+        let monitoring_redis_pool = match init_redis_pool(status_redis_url.as_str()).await {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                log::warn!(
+                    "Janitor failed to initialize monitoring redis connection manager: {}",
+                    error
+                );
+                None
+            }
+        };
+
         log::info!("Janitor loop started");
-        publish_all_domains(&shared_data, &redis_pool).await;
+        publish_all_domains(
+            &shared_data,
+            &redis_pool,
+            monitoring_redis_pool.as_ref(),
+            janitor_start_time,
+        )
+        .await;
         let mut interval = tokio::time::interval(Duration::from_secs(FRESHNESS_TARGET_SECONDS));
         loop {
             interval.tick().await;
-            publish_all_domains(&shared_data, &redis_pool).await;
+            publish_all_domains(
+                &shared_data,
+                &redis_pool,
+                monitoring_redis_pool.as_ref(),
+                janitor_start_time,
+            )
+            .await;
         }
     });
 
@@ -178,12 +204,18 @@ pub(crate) fn start(shared_data: SharedData) {
 /// Details:
 /// - Uses one shared Redis pool with multiplexed connections.
 /// - Errors are logged and converted into partial-failure envelopes per domain.
-async fn publish_all_domains(shared_data: &SharedData, redis_pool: &RedisPool) {
+async fn publish_all_domains(
+    shared_data: &SharedData,
+    redis_pool: &RedisPool,
+    monitoring_redis_pool: Option<&redis::aio::ConnectionManager>,
+    janitor_start_time: chrono::DateTime<Utc>,
+) {
     log::debug!("Janitor publish cycle started");
     publish_server_stats(shared_data, redis_pool).await;
     publish_sessions(shared_data, redis_pool).await;
     publish_tokens(shared_data, redis_pool).await;
     publish_workers(shared_data, redis_pool).await;
+    publish_cluster_info(shared_data, monitoring_redis_pool, janitor_start_time).await;
     publish_consul_summary(shared_data, redis_pool).await;
     log::debug!("Janitor publish cycle completed");
 }
@@ -200,10 +232,7 @@ async fn publish_all_domains(shared_data: &SharedData, redis_pool: &RedisPool) {
 /// Details:
 /// - Uses `REDIS_URL` when provided, otherwise defaults to status DB index 2.
 fn redis_pool() -> Result<RedisPool, String> {
-    let redis_url = env::var(REDIS_URL_ENV)
-        .ok()
-        .and_then(|url| to_status_db_url(&url))
-        .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string());
+    let redis_url = resolved_status_redis_url();
 
     let pool_size = env::var(REDIS_POOL_SIZE_ENV)
         .ok()
@@ -221,6 +250,24 @@ fn redis_pool() -> Result<RedisPool, String> {
         .max_size(pool_size)
         .build()
         .map_err(|error| format!("redis pool build error: {error}"))
+}
+
+/// What: Resolve the Redis URL used for status/dashboard data.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Redis URL pointing to DB index 2.
+///
+/// Details:
+/// - Reads REDIS_URL and forces status DB semantics.
+/// - Falls back to the janitor default when REDIS_URL is unset or invalid.
+fn resolved_status_redis_url() -> String {
+    env::var(REDIS_URL_ENV)
+        .ok()
+        .and_then(|url| to_status_db_url(&url))
+        .unwrap_or_else(|| DEFAULT_REDIS_URL.to_string())
 }
 
 /// What: Convert a Redis URL to target DB index 2 (status cache).
@@ -385,6 +432,79 @@ async fn publish_consul_summary(shared_data: &SharedData, redis_pool: &RedisPool
                 );
             }
         }
+    }
+}
+
+/// What: Publish cluster identity and health metadata for dashboard use.
+///
+/// Inputs:
+/// - `shared_data`: Shared state with app config for cluster source lookup.
+/// - `redis_pool`: Redis pool used for envelope writes.
+/// - `janitor_start_time`: Janitor start timestamp used for uptime approximation.
+///
+/// Output:
+/// - None.
+///
+/// Details:
+/// - Publishes to the dedicated cluster_info domain key.
+/// - Uses a static healthy status until richer health checks are implemented.
+async fn publish_cluster_info(
+    shared_data: &SharedData,
+    monitoring_redis_pool: Option<&redis::aio::ConnectionManager>,
+    janitor_start_time: chrono::DateTime<Utc>,
+) {
+    let Some(connection_manager) = monitoring_redis_pool else {
+        log::debug!("Skipping cluster info publish because monitoring redis is unavailable");
+        return;
+    };
+
+    let consul_host = {
+        let shared = shared_data.lock().await;
+        let config = match shared.config.as_ref() {
+            Some(cfg) => cfg,
+            None => {
+                log::warn!("Skipping cluster info publish: missing shared config");
+                return;
+            }
+        };
+        config.consul_host.clone()
+    };
+
+    let consul_ref = if consul_host.is_empty() {
+        None
+    } else {
+        Some(consul_host.as_str())
+    };
+
+    let cluster_config = match load_cluster_config(consul_ref).await {
+        Ok(config) => config,
+        Err(error) => {
+            log::warn!(
+                "Skipping cluster info publish: failed to load cluster config: {}",
+                error
+            );
+            return;
+        }
+    };
+
+    let node_count = {
+        let shared = shared_data.lock().await;
+        let workers = shared.workers.lock().await;
+        workers.len()
+    };
+
+    if let Err(error) = update_cluster_info(
+        connection_manager,
+        &cluster_config,
+        node_count,
+        janitor_start_time,
+    )
+    .await
+    {
+        log::warn!(
+            "Janitor failed publishing cluster info through monitoring API: {}",
+            error
+        );
     }
 }
 

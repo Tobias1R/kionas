@@ -31,35 +31,35 @@ function KionasDashboardView() {
 			header={<KionasDashboardHeader />}
 			content={
 				<motion.div
-					className="grid w-full grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 md:px-8 lg:grid-cols-3"
+					className="grid w-full grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 md:px-8 lg:grid-cols-2"
 					variants={container}
 					initial="hidden"
 					animate="show"
 				>
 					<motion.div
 						variants={item}
-						className="sm:col-span-2 lg:col-span-1"
+						className="sm:col-span-2 lg:col-span-2"
 					>
 						<ServerStatsWidget />
 					</motion.div>
 
 					<motion.div
 						variants={item}
-						className="sm:col-span-2 lg:col-span-1"
+						className="sm:col-span-1 lg:col-span-1"
 					>
 						<SessionsWidget />
 					</motion.div>
 
 					<motion.div
 						variants={item}
-						className="sm:col-span-2 lg:col-span-1"
+						className="sm:col-span-1 lg:col-span-1"
 					>
 						<ConsulHealthWidget />
 					</motion.div>
 
 					<motion.div
 						variants={item}
-						className="sm:col-span-3"
+						className="sm:col-span-2 lg:col-span-2"
 					>
 						<WorkersWidget />
 					</motion.div>

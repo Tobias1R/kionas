@@ -126,3 +126,18 @@ If you add or change config keys:
 - All changes must respect `--dry-run` flag
 - All changes must degrade gracefully if system tools are unavailable
 
+## Planning
+- Always ask for input on dualities. Never assume!
+- On every slice add a completion checklisk eg.:
+```md
+**Tasks**:
+1. **<TASK DESCRIPTION>** 
+   - [ ] Files: 
+    - [<FILE_LOCATION>](<FILE_LOCATION>) (NEW/MODIFIED/DELETED)
+   - [ ] Test complex scenarios:
+      - [ ] <TEST SCENARIO 1>
+      - [ ] <TEST SCENARIO N>
+```
+
+## Executing Plans
+- At the end of each slice, run through the completion checklist to ensure all tasks are completed before moving on to the next slice.

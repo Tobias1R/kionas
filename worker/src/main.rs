@@ -3,6 +3,7 @@ mod execution;
 mod flight;
 mod init;
 mod interops;
+mod monitoring;
 mod services;
 mod state;
 mod storage;
@@ -14,11 +15,39 @@ pub mod interops_service {
     tonic::include_proto!("interops_service");
 }
 
+use chrono::Utc;
+use clap::Parser;
 use kionas::config;
 use kionas::get_local_hostname;
+use kionas::monitoring::init_redis_pool;
 use kionas::utils::resolve_hostname;
 use std::env;
 use std::error::Error;
+
+#[derive(Debug, Parser)]
+#[command(author, version, about = "kionas worker process")]
+struct WorkerArgs {
+    #[arg(long)]
+    worker_id: Option<String>,
+    #[arg(index = 1)]
+    worker_id_positional: Option<String>,
+}
+
+fn resolve_worker_id(args: &WorkerArgs) -> String {
+    if let Some(worker_id) = args.worker_id.as_ref()
+        && !worker_id.trim().is_empty()
+    {
+        return worker_id.clone();
+    }
+
+    if let Some(worker_id) = args.worker_id_positional.as_ref()
+        && !worker_id.trim().is_empty()
+    {
+        return worker_id.clone();
+    }
+
+    get_local_hostname().unwrap_or_else(|| "worker".to_string())
+}
 
 // Try to install a default rustls CryptoProvider at startup to avoid runtime
 // ambiguity when multiple provider features are compiled into dependencies.
@@ -50,15 +79,64 @@ fn resolve_worker_flight_port(default_worker_port: u16) -> u16 {
         .unwrap_or(default_worker_port.saturating_add(1))
 }
 
+/// What: Convert a Redis URL to target DB index 2 used for monitoring status data.
+///
+/// Inputs:
+/// - `url`: Source Redis URL that may or may not include an explicit DB path.
+///
+/// Output:
+/// - `Some(String)` when conversion succeeds.
+/// - `None` when URL parsing fails.
+///
+/// Details:
+/// - Preserves scheme, host, port, and credentials.
+fn to_status_db_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let mut rebuilt = format!("{}://", parsed.scheme());
+
+    if !parsed.username().is_empty() {
+        rebuilt.push_str(parsed.username());
+        if let Some(password) = parsed.password() {
+            rebuilt.push(':');
+            rebuilt.push_str(password);
+        }
+        rebuilt.push('@');
+    }
+
+    let host = parsed.host_str()?;
+    rebuilt.push_str(host);
+    if let Some(port) = parsed.port() {
+        rebuilt.push(':');
+        rebuilt.push_str(port.to_string().as_str());
+    }
+
+    rebuilt.push_str("/2");
+    Some(rebuilt)
+}
+
+/// What: Resolve Redis URL used by worker monitoring status publishers.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Redis URL guaranteed to target DB index 2.
+///
+/// Details:
+/// - Prefers KIONAS_REDIS_URL, then REDIS_URL, then default local service URL.
+fn resolve_monitoring_redis_url() -> String {
+    env::var("KIONAS_REDIS_URL")
+        .ok()
+        .or_else(|| env::var("REDIS_URL").ok())
+        .and_then(|value| to_status_db_url(value.as_str()))
+        .unwrap_or_else(|| "redis://kionas-redis:6379/2".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <worker_id>", args[0]);
-        std::process::exit(1);
-    }
+    let args = WorkerArgs::parse();
     let consul_url = env::var("CONSUL_URL").ok();
-    let worker_id = get_local_hostname().unwrap_or_else(|| "worker".to_string());
+    let worker_id = resolve_worker_id(&args);
     // Install rustls provider before any TLS code runs
     try_install_rustls_crypto_provider();
     // Try to load unified AppConfig for this worker
@@ -125,6 +203,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         worker_info.server_url
     );
     let mut shared_data = crate::state::SharedData::new(worker_info, cluster_info);
+
+    let worker_start_time = Utc::now();
+    let redis_url = resolve_monitoring_redis_url();
+
+    match init_redis_pool(redis_url.as_str()).await {
+        Ok(redis_pool) => {
+            log::info!("worker monitoring redis pool initialized at {}", redis_url);
+            crate::monitoring::spawn_monitoring_task(
+                redis_pool,
+                worker_id.clone(),
+                shared_data.cluster_info.cluster_id.clone(),
+                env::var("WORKER_POOL_NAME").ok(),
+                worker_start_time,
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "worker monitoring disabled: redis init failed for {}: {}",
+                redis_url,
+                error
+            );
+        }
+    }
 
     // Build storage provider from cluster info and attach to shared state (best-effort)
     match crate::storage::build_provider_from_cluster(&shared_data.cluster_info.storage).await {

@@ -32,6 +32,7 @@ prost = "0.13.5"
 prost-types = "0.13.5"
 async-trait = "0.1.64"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
+sysinfo = "0.29"
 
 [profile.dev]
 # Speed up local iteration by allowing more parallel codegen units.

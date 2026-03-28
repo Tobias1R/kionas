@@ -1,13 +1,14 @@
 use axum::Router;
-use axum::extract::{Query, State, Path};
-use axum::http::{StatusCode, HeaderMap, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use deadpool::managed::Pool;
 use kionas::constants::{
-    REDIS_POOL_SIZE_ENV, REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY,
-    REDIS_UI_DASHBOARD_SERVER_STATS_KEY, REDIS_UI_DASHBOARD_SESSIONS_KEY,
-    REDIS_UI_DASHBOARD_TOKENS_KEY, REDIS_UI_DASHBOARD_WORKERS_KEY, REDIS_URL_ENV,
+    REDIS_POOL_SIZE_ENV, REDIS_UI_DASHBOARD_CLUSTER_INFO_KEY,
+    REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY, REDIS_UI_DASHBOARD_SERVER_STATS_KEY,
+    REDIS_UI_DASHBOARD_SESSIONS_KEY, REDIS_UI_DASHBOARD_TOKENS_KEY, REDIS_UI_DASHBOARD_WORKERS_KEY,
+    REDIS_URL_ENV,
 };
 use redis::AsyncCommands;
 use serde::Deserialize;
@@ -177,7 +178,7 @@ fn mime_type_for_path(path: &str) -> &'static str {
 /// - Prevents directory traversal with basic path sanitization.
 async fn spa_static_handler(Path(path): Path<String>) -> Response {
     let static_dir = get_static_dir();
-    
+
     // Security: Prevent directory traversal
     if path.contains("../") || path.contains("..\\") {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
@@ -190,7 +191,11 @@ async fn spa_static_handler(Path(path): Path<String>) -> Response {
         Ok(content) => {
             let mime = mime_type_for_path(&path);
             let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, mime.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap()));
+            headers.insert(
+                header::CONTENT_TYPE,
+                mime.parse()
+                    .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+            );
             (StatusCode::OK, headers, content).into_response()
         }
         Err(_) => {
@@ -200,7 +205,10 @@ async fn spa_static_handler(Path(path): Path<String>) -> Response {
                 match fs::read(static_dir.join("index.html")).await {
                     Ok(content) => {
                         let mut headers = HeaderMap::new();
-                        headers.insert(header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            "text/html; charset=utf-8".parse().unwrap(),
+                        );
                         return (StatusCode::OK, headers, content).into_response();
                     }
                     Err(e) => {
@@ -346,12 +354,13 @@ async fn get_dashboard_key(
     State(state): State<AppState>,
     Query(query): Query<KeyQuery>,
 ) -> Response {
+    let is_workers_query = query.name == "workers";
     let redis_key = match key_alias_to_redis_key(query.name.as_str()) {
         Some(key) => key,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "unsupported key alias; expected one of: server_stats,sessions,tokens,workers,consul_cluster_summary",
+                "unsupported key alias; expected one of: server_stats,sessions,tokens,workers,cluster_info,consul_cluster_summary",
             )
                 .into_response();
         }
@@ -365,6 +374,25 @@ async fn get_dashboard_key(
         }
     };
 
+    if is_workers_query {
+        match read_workers_from_scan(&mut conn).await {
+            Ok(payload) => {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    payload,
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                log::warn!(
+                    "workers scan retrieval failed; falling back to cached workers key: {}",
+                    error
+                );
+            }
+        }
+    }
+
     let value: redis::RedisResult<Option<String>> = conn.get(redis_key).await;
     match value {
         Ok(Some(payload)) => (
@@ -373,7 +401,18 @@ async fn get_dashboard_key(
             payload,
         )
             .into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "key not found").into_response(),
+        Ok(None) => {
+            if is_workers_query {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    "[]",
+                )
+                    .into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "key not found").into_response()
+            }
+        }
         Err(error) => {
             log::warn!("redis read failed for key {}: {}", redis_key, error);
             (StatusCode::SERVICE_UNAVAILABLE, "redis read failed").into_response()
@@ -381,10 +420,71 @@ async fn get_dashboard_key(
     }
 }
 
+/// What: Read worker system info snapshots directly using Redis SCAN pattern lookup.
+///
+/// Inputs:
+/// - `connection`: Active Redis connection.
+///
+/// Output:
+/// - JSON array string containing worker sys-info payloads.
+///
+/// Details:
+/// - Scans keys matching kionas:worker:*:sys_info.
+/// - Returns an empty JSON array when no keys are present.
+/// - Skips malformed worker payloads while preserving healthy entries.
+async fn read_workers_from_scan(
+    connection: &mut redis::aio::MultiplexedConnection,
+) -> Result<String, String> {
+    let mut cursor: u64 = 0;
+    let mut keys: Vec<String> = Vec::new();
+
+    loop {
+        let (next_cursor, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("kionas:worker:*:sys_info")
+            .arg("COUNT")
+            .arg(100_u32)
+            .query_async(connection)
+            .await
+            .map_err(|error| format!("redis scan failed: {error}"))?;
+
+        keys.extend(batch);
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    let mut workers: Vec<serde_json::Value> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let raw: Option<String> = connection
+            .get(key.as_str())
+            .await
+            .map_err(|error| format!("redis get failed for key {key}: {error}"))?;
+
+        if let Some(body) = raw {
+            match serde_json::from_str::<serde_json::Value>(body.as_str()) {
+                Ok(value) => workers.push(value),
+                Err(error) => {
+                    log::warn!(
+                        "skipping malformed worker sys_info payload for key {}: {}",
+                        key,
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&workers)
+        .map_err(|error| format!("serialize workers array failed: {error}"))
+}
+
 /// What: Translate user-friendly alias to Redis hash key constant.
 ///
 /// Inputs:
-/// - name: Dashboard key alias (server_stats, sessions, tokens, workers, consul_cluster_summary).
+/// - name: Dashboard key alias (server_stats, sessions, tokens, workers, cluster_info, consul_cluster_summary).
 ///
 /// Output:
 /// - Some(&'static str) with Redis key constant if alias is valid.
@@ -399,8 +499,8 @@ fn key_alias_to_redis_key(name: &str) -> Option<&'static str> {
         "sessions" => Some(REDIS_UI_DASHBOARD_SESSIONS_KEY),
         "tokens" => Some(REDIS_UI_DASHBOARD_TOKENS_KEY),
         "workers" => Some(REDIS_UI_DASHBOARD_WORKERS_KEY),
+        "cluster_info" => Some(REDIS_UI_DASHBOARD_CLUSTER_INFO_KEY),
         "consul_cluster_summary" => Some(REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY),
         _ => None,
     }
 }
-

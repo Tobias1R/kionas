@@ -59,5 +59,6 @@ pub const REDIS_UI_DASHBOARD_SERVER_STATS_KEY: &str = "kionas:ui:dashboard:serve
 pub const REDIS_UI_DASHBOARD_SESSIONS_KEY: &str = "kionas:ui:dashboard:sessions";
 pub const REDIS_UI_DASHBOARD_TOKENS_KEY: &str = "kionas:ui:dashboard:tokens";
 pub const REDIS_UI_DASHBOARD_WORKERS_KEY: &str = "kionas:ui:dashboard:workers";
+pub const REDIS_UI_DASHBOARD_CLUSTER_INFO_KEY: &str = "kionas:cluster:info";
 pub const REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY: &str =
     "kionas:ui:dashboard:consul_cluster_summary";
