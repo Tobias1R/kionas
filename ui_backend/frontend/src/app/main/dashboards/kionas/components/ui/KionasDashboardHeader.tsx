@@ -3,10 +3,14 @@ import Button from '@mui/material/Button';
 import FuseSvgIcon from '@fuse/core/FuseSvgIcon';
 import PageBreadcrumb from 'src/components/PageBreadcrumb';
 
+interface KionasDashboardHeaderProps {
+	onRefresh?: () => void;
+}
+
 /**
  * The Kionas dashboard header.
  */
-function KionasDashboardHeader() {
+function KionasDashboardHeader({ onRefresh }: KionasDashboardHeaderProps) {
 	return (
 		<div className="container flex w-full">
 			<div className="flex flex-auto flex-col p-4 pb-0 md:px-8 md:pb-0">
@@ -27,6 +31,7 @@ function KionasDashboardHeader() {
 							startIcon={<FuseSvgIcon>lucide:refresh-cw</FuseSvgIcon>}
 							variant="contained"
 							color="primary"
+							onClick={onRefresh}
 						>
 							Refresh
 						</Button>

@@ -25,7 +25,7 @@ function FooterLayout1(props: FooterLayout1Props) {
 				elevation={0}
 			>
 				<Toolbar className="flex min-h-12 items-center overflow-x-auto px-2 py-0 sm:px-3 md:min-h-16">
-					Footer
+					Kionas @ 2026
 				</Toolbar>
 			</AppBar>
 		</FooterTheme>

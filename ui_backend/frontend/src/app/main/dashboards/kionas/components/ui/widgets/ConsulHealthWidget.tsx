@@ -6,23 +6,20 @@ import Alert from '@mui/material/Alert';
 import Chip from '@mui/material/Chip';
 import FuseSvgIcon from '@fuse/core/FuseSvgIcon';
 import { lighten, useTheme } from '@mui/material/styles';
-import { useDashboardData } from '../../../api/hooks/useDashboardData';
-
-interface HealthData {
-	status: 'passing' | 'warning' | 'critical';
-	[key: string]: any;
-}
+import { useClusterInfoData } from '../../../api/hooks/useClusterInfoData';
+import { ClusterHealthStatus } from '../../../api/types/dashboard';
+import { formatDateTime, formatUptime } from '../../../lib/formatters';
 
 /**
  * Get color for health status
  */
 function getStatusColor(status: string): 'success' | 'warning' | 'error' {
 	switch (status) {
-		case 'passing':
+		case 'Healthy':
 			return 'success';
-		case 'warning':
+		case 'Degraded':
 			return 'warning';
-		case 'critical':
+		case 'Unhealthy':
 			return 'error';
 		default:
 			return 'warning' as const;
@@ -34,11 +31,11 @@ function getStatusColor(status: string): 'success' | 'warning' | 'error' {
  */
 function getStatusIcon(status: string): string {
 	switch (status) {
-		case 'passing':
+		case 'Healthy':
 			return 'lucide:check-circle';
-		case 'warning':
+		case 'Degraded':
 			return 'lucide:alert-triangle';
-		case 'critical':
+		case 'Unhealthy':
 			return 'lucide:alert-circle';
 		default:
 			return 'lucide:help-circle';
@@ -48,7 +45,7 @@ function getStatusIcon(status: string): string {
 /**
  * Health Badge Component
  */
-function HealthBadge({ status }: { status: string }) {
+function HealthBadge({ status }: { status: ClusterHealthStatus }) {
 	const theme = useTheme();
 	const color = getStatusColor(status);
 	const icon = getStatusIcon(status);
@@ -92,10 +89,9 @@ function HealthBadge({ status }: { status: string }) {
  * Consul Health Widget - displays cluster health status
  */
 function ConsulHealthWidget() {
-	const { data, isLoading, error } = useDashboardData('consul_cluster_summary');
+	const { clusterInfo, meta, isLoading, error } = useClusterInfoData();
 	const theme = useTheme();
-	const healthData = (data as HealthData) || { status: 'unknown' };
-	const status = healthData?.status || 'unknown';
+	const status: ClusterHealthStatus = clusterInfo?.status || 'Unhealthy';
 
 	if (error) {
 		return (
@@ -151,7 +147,7 @@ function ConsulHealthWidget() {
 										Cluster State
 									</Typography>
 									<Typography variant="body2" sx={{ fontWeight: 500, marginTop: '4px' }}>
-										{status === 'passing' ? '🟢 Healthy' : status === 'warning' ? '🟡 Degraded' : '🔴 Unhealthy'}
+										{status === 'Healthy' ? 'Healthy' : status === 'Degraded' ? 'Degraded' : 'Unhealthy'}
 									</Typography>
 								</Box>
 								<Box>
@@ -159,7 +155,23 @@ function ConsulHealthWidget() {
 										Last Updated
 									</Typography>
 									<Typography variant="body2" sx={{ fontWeight: 500, marginTop: '4px', fontSize: '0.85rem' }}>
-										{new Date().toLocaleTimeString()}
+										{formatDateTime(clusterInfo?.updated_at || meta.generatedAt)}
+									</Typography>
+								</Box>
+								<Box>
+									<Typography variant="caption" color="textSecondary">
+										Cluster ID
+									</Typography>
+									<Typography variant="body2" sx={{ fontWeight: 500, marginTop: '4px', fontFamily: 'monospace' }}>
+										{clusterInfo?.cluster_id || '-'}
+									</Typography>
+								</Box>
+								<Box>
+									<Typography variant="caption" color="textSecondary">
+										Nodes / Uptime
+									</Typography>
+									<Typography variant="body2" sx={{ fontWeight: 500, marginTop: '4px' }}>
+										{clusterInfo?.node_count ?? 0} nodes / {formatUptime(clusterInfo?.uptime_seconds ?? 0)}
 									</Typography>
 								</Box>
 							</Box>
@@ -169,12 +181,12 @@ function ConsulHealthWidget() {
 						<Box sx={{ display: 'flex', gap: '12px', flexWrap: 'wrap', justifyContent: 'center' }}>
 							<Chip
 								icon={<FuseSvgIcon fontSize="small">lucide:server</FuseSvgIcon>}
-								label="Cluster OK"
+								label={clusterInfo?.cluster_name || 'Cluster'}
 								color={statusColor}
 								variant="outlined"
 								sx={{ fontWeight: 500 }}
 							/>
-							{status === 'passing' && (
+							{status === 'Healthy' && (
 								<Chip
 									icon={<FuseSvgIcon fontSize="small">lucide:shield-check</FuseSvgIcon>}
 									label="All Services"

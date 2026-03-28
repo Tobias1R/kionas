@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-03-28T20:42:49.004881823+00:00",
+  "freshness_target_seconds": 15,
+  "source_component": "server-janitor",
+  "partial_failure": false,
+  "data_version": 1,
+  "error": null,
+  "data": [
+    {
+      "id": "f06d77bd-72ba-4ba0-bf17-1a67dd0dff20",
+      "role": "kionas",
+      "warehouse": "compute_xl",
+      "remote_addr": "172.18.0.2:51444",
+      "is_authenticated": true,
+      "last_active": 0,
+      "use_database": "default",
+      "query_count": 4,
+      "last_query_at": 1774730565831,
+      "total_query_duration_ms": 8272,
+      "error_count": 0
+    }
+  ]
+}

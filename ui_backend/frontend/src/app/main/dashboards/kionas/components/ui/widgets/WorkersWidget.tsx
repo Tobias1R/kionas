@@ -4,33 +4,19 @@ import Box from '@mui/material/Box';
 import CircularProgress from '@mui/material/CircularProgress';
 import Alert from '@mui/material/Alert';
 import Chip from '@mui/material/Chip';
-import Table from '@mui/material/Table';
-import TableBody from '@mui/material/TableBody';
-import TableCell from '@mui/material/TableCell';
-import TableContainer from '@mui/material/TableContainer';
-import TableHead from '@mui/material/TableHead';
-import TableRow from '@mui/material/TableRow';
+import Accordion from '@mui/material/Accordion';
+import AccordionDetails from '@mui/material/AccordionDetails';
+import AccordionSummary from '@mui/material/AccordionSummary';
+import Grid from '@mui/material/Grid';
 import FuseSvgIcon from '@fuse/core/FuseSvgIcon';
 import { useTheme } from '@mui/material/styles';
-import { useDashboardData } from '../../../api/hooks/useDashboardData';
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 
-interface WorkerInfo {
-	worker_id: string;
-	hostname: string;
-	cluster_id: string;
-	warehouse_pool?: string;
-	memory_used_mb: number;
-	memory_total_mb: number;
-	cpu_percent: number;
-	disk_used_mb: number;
-	disk_total_mb: number;
-	health_status: 'Healthy' | 'Degraded' | 'Unhealthy';
-	active_queries: number;
-	total_queries_processed: number;
-	started_at: string;
-	uptime_seconds: number;
-	updated_at: string;
-}
+import { useWorkersData } from '../../../api/hooks/useWorkersData';
+import { WorkerSystemInfo } from '../../../api/types/dashboard';
+import { formatNumber, formatUptime } from '../../../lib/formatters';
+import WorkerDetailCard from './WorkerDetailCard';
+import WorkerMetricChips from './WorkerMetricChips';
 
 /**
  * Get color for worker health status
@@ -48,31 +34,53 @@ function getHealthStatusColor(status: string): 'success' | 'warning' | 'error' {
 	}
 }
 
-/**
- * Format uptime to human readable format
- */
-function formatUptime(seconds: number): string {
-	const hours = Math.floor(seconds / 3600);
-	const minutes = Math.floor((seconds % 3600) / 60);
-	if (hours > 0) {
-		return `${hours}h ${minutes}m`;
-	}
-	return `${minutes}m`;
-}
+function WorkerSummaryCard({ worker }: { worker: WorkerSystemInfo }) {
+	const memoryPercent = worker.memory_total_mb > 0 ? (worker.memory_used_mb / worker.memory_total_mb) * 100 : 0;
 
-/**
- * Format memory usage
- */
-function formatMemory(used: number, total: number): string {
-	const percent = Math.round((used / total) * 100);
-	return `${used} / ${total} MB (${percent}%)`;
+	return (
+		<Accordion disableGutters>
+			<AccordionSummary expandIcon={<ExpandMoreIcon />}>
+				<Box sx={{ width: '100%' }}>
+					<Grid container spacing={2} alignItems="center">
+						<Grid size={{ xs: 12, md: 3 }}>
+							<Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+								{worker.hostname}
+							</Typography>
+							<Typography variant="caption" color="text.secondary" sx={{ fontFamily: 'monospace' }}>
+								{worker.worker_id}
+							</Typography>
+						</Grid>
+						<Grid size={{ xs: 6, md: 2 }}>
+							<Chip size="small" label={worker.health_status} color={getHealthStatusColor(worker.health_status)} />
+						</Grid>
+						<Grid size={{ xs: 6, md: 2 }}>
+							<Typography variant="body2">CPU: {worker.cpu_percent.toFixed(1)}%</Typography>
+							<Typography variant="caption" color="text.secondary">
+								Memory: {memoryPercent.toFixed(1)}%
+							</Typography>
+						</Grid>
+						<Grid size={{ xs: 6, md: 2 }}>
+							<Typography variant="body2">Pool: {worker.warehouse_pool || '-'}</Typography>
+							<Typography variant="caption" color="text.secondary">Uptime: {formatUptime(worker.uptime_seconds)}</Typography>
+						</Grid>
+						<Grid size={{ xs: 12, md: 3 }}>
+							<WorkerMetricChips worker={worker} />
+						</Grid>
+					</Grid>
+				</Box>
+			</AccordionSummary>
+			<AccordionDetails>
+				<WorkerDetailCard worker={worker} />
+			</AccordionDetails>
+		</Accordion>
+	);
 }
 
 /**
  * Workers Widget - displays active workers in the cluster
  */
 function WorkersWidget() {
-	const { data, isLoading, error } = useDashboardData('workers');
+	const { workers, isLoading, error } = useWorkersData();
 	const theme = useTheme();
 
 	if (error) {
@@ -83,7 +91,7 @@ function WorkersWidget() {
 		);
 	}
 
-	const workers = ((data as unknown) as WorkerInfo[]) || [];
+	const healthyWorkers = workers.filter((worker) => worker.health_status === 'Healthy').length;
 
 	return (
 		<Paper className="flex flex-auto flex-col overflow-hidden rounded-xl shadow-sm">
@@ -91,13 +99,19 @@ function WorkersWidget() {
 			<div className="m-4 mb-0 flex items-center justify-between">
 				<div className="flex items-center gap-2">
 					<Typography className="text-lg leading-6 font-medium tracking-tight">
-						Active Workers
+						Workers Execution
 					</Typography>
 					<Chip
 						label={`${workers.length} online`}
 						size="small"
 						variant="filled"
 						color={workers.length > 0 ? 'success' : 'warning'}
+					/>
+					<Chip
+						label={`${healthyWorkers}/${workers.length} healthy`}
+						size="small"
+						variant="outlined"
+						color={healthyWorkers === workers.length ? 'success' : 'warning'}
 					/>
 				</div>
 				<FuseSvgIcon className="text-green-500">lucide:cpu</FuseSvgIcon>
@@ -116,105 +130,20 @@ function WorkersWidget() {
 					<Typography color="textSecondary">No workers found</Typography>
 				</Box>
 			) : (
-				<TableContainer sx={{ overflowX: 'auto' }}>
-					<Table size="small" stickyHeader>
-						<TableHead>
-							<TableRow sx={{ backgroundColor: 'rgba(0, 0, 0, 0.04)' }}>
-								<TableCell sx={{ fontWeight: 600 }}>Worker ID</TableCell>
-								<TableCell sx={{ fontWeight: 600 }}>Hostname</TableCell>
-								<TableCell sx={{ fontWeight: 600 }} align="center">
-									Health
-								</TableCell>
-								<TableCell sx={{ fontWeight: 600 }} align="right">
-									CPU %
-								</TableCell>
-								<TableCell sx={{ fontWeight: 600 }} align="right">
-									Memory
-								</TableCell>
-								<TableCell sx={{ fontWeight: 600 }} align="right">
-									Uptime
-								</TableCell>
-								<TableCell sx={{ fontWeight: 600 }} align="right">
-									Queries
-								</TableCell>
-							</TableRow>
-						</TableHead>
-						<TableBody>
-							{workers.map((worker) => (
-								<TableRow key={worker.worker_id} hover>
-									<TableCell>
-										<Typography
-											variant="body2"
-											sx={{
-												fontFamily: 'monospace',
-												fontSize: '0.85rem'
-											}}
-											title={worker.worker_id}
-										>
-											{worker.worker_id.substring(0, 8)}...
-										</Typography>
-									</TableCell>
-									<TableCell>
-										<Typography variant="body2">
-											{worker.hostname}
-										</Typography>
-									</TableCell>
-									<TableCell align="center">
-										<Chip
-											label={worker.health_status}
-											color={getHealthStatusColor(worker.health_status)}
-											size="small"
-											variant="filled"
-										/>
-									</TableCell>
-									<TableCell align="right">
-										<Typography
-											variant="body2"
-											sx={{
-												color: worker.cpu_percent > 80 ? theme.palette.error.main : 'inherit'
-											}}
-										>
-											{worker.cpu_percent.toFixed(1)}%
-										</Typography>
-									</TableCell>
-									<TableCell align="right">
-										<Typography
-											variant="body2"
-											sx={{
-												fontSize: '0.85rem',
-												color: (worker.memory_used_mb / worker.memory_total_mb) > 0.8
-													? theme.palette.error.main
-													: 'inherit'
-											}}
-											title={`${worker.memory_used_mb} / ${worker.memory_total_mb} MB`}
-										>
-											{formatMemory(worker.memory_used_mb, worker.memory_total_mb)}
-										</Typography>
-									</TableCell>
-									<TableCell align="right">
-										<Typography variant="body2">
-											{formatUptime(worker.uptime_seconds)}
-										</Typography>
-									</TableCell>
-									<TableCell align="right">
-										<Typography variant="body2">
-											{worker.active_queries}
-											{worker.active_queries === 0 && (
-												<Typography
-													component="span"
-													variant="caption"
-													sx={{ display: 'block', color: 'textSecondary' }}
-												>
-													({worker.total_queries_processed} total)
-												</Typography>
-											)}
-										</Typography>
-									</TableCell>
-								</TableRow>
-							))}
-						</TableBody>
-					</Table>
-				</TableContainer>
+				<Box sx={{ p: 2, display: 'grid', gap: 1.5 }}>
+					{workers.map((worker) => (
+						<WorkerSummaryCard key={worker.worker_id} worker={worker} />
+					))}
+
+					<Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', pt: 1 }}>
+						<Typography variant="caption" color="text.secondary">
+							Total rows produced: {formatNumber(workers.reduce((sum, worker) => sum + worker.total_rows_produced, 0))}
+						</Typography>
+						<Typography variant="caption" color="text.secondary">
+							Total stages executed: {formatNumber(workers.reduce((sum, worker) => sum + worker.total_stages_executed, 0))}
+						</Typography>
+					</Box>
+				</Box>
 			)}
 		</Paper>
 	);

@@ -4,37 +4,20 @@ import Box from '@mui/material/Box';
 import CircularProgress from '@mui/material/CircularProgress';
 import Alert from '@mui/material/Alert';
 import FuseSvgIcon from '@fuse/core/FuseSvgIcon';
+import Grid from '@mui/material/Grid';
+import Chip from '@mui/material/Chip';
 import { lighten, useTheme } from '@mui/material/styles';
-import { useDashboardData } from '../../../api/hooks/useDashboardData';
 
-interface ServerData {
-	counter: number;
-	warehouses: string[];
-	worker_pools: string[];
-	sessions: number;
-	memory_mb: number;
-	virtual_memory_mb: number;
-	cpu_usage_percent: number;
-}
-
-interface ServerStatsResponse {
-	data: ServerData;
-	generated_at: string;
-	freshness_target_seconds: number;
-	source_component: string;
-	partial_failure: boolean;
-	data_version: number;
-	error: string | null;
-}
+import { useServerStatsData } from '../../../api/hooks/useServerStatsData';
+import { formatDateTime, formatNumber, formatPercent } from '../../../lib/formatters';
 
 /**
  * Metric Card Component - displays a metric with icon and value
  */
-function MetricCard({ icon, label, value, unit = '', color = 'primary' }: {
+function MetricCard({ icon, label, value, color = 'primary' }: {
 	icon: string;
 	label: string;
 	value: string | number;
-	unit?: string;
 	color?: 'primary' | 'success' | 'warning' | 'error' | 'info';
 }) {
 	const theme = useTheme();
@@ -77,76 +60,7 @@ function MetricCard({ icon, label, value, unit = '', color = 'primary' }: {
 					{label}
 				</Typography>
 				<Typography variant="h6" sx={{ fontWeight: 600 }}>
-					{value}{unit && <span style={{ fontSize: '0.85em', marginLeft: '4px' }}>{unit}</span>}
-				</Typography>
-			</Box>
-		</Box>
-	);
-}
-
-/**
- * Progress Metric Component - displays metric with circular progress
- */
-function ProgressMetric({ icon, label, value, max = 100, color = 'primary' }: {
-	icon: string;
-	label: string;
-	value: number;
-	max: number;
-	color?: 'primary' | 'success' | 'warning' | 'error' | 'info';
-}) {
-	const theme = useTheme();
-	const percentage = Math.round((value / max) * 100);
-	const colorMap = {
-		primary: theme.palette.primary.main,
-		success: theme.palette.success.main,
-		warning: theme.palette.warning.main,
-		error: theme.palette.error.main,
-		info: theme.palette.info.main
-	};
-
-	let statusColor = 'success';
-	if (percentage > 80) statusColor = 'error';
-	else if (percentage > 60) statusColor = 'warning';
-
-	return (
-		<Box sx={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-			<Box sx={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-				<CircularProgress
-					variant="determinate"
-					value={100}
-					sx={{ color: lighten(colorMap[color], 0.7), position: 'absolute' }}
-					size={80}
-					thickness={3}
-				/>
-				<CircularProgress
-					variant="determinate"
-					value={percentage}
-					sx={{ color: colorMap[color] }}
-					size={80}
-					thickness={3}
-				/>
-				<Box
-					sx={{
-						position: 'absolute',
-						display: 'flex',
-						flexDirection: 'column',
-						alignItems: 'center'
-					}}
-				>
-					<Typography variant="h6" sx={{ fontWeight: 600 }}>
-						{percentage}%
-					</Typography>
-					<Typography variant="caption" color="textSecondary">
-						{Math.round(value)}MB
-					</Typography>
-				</Box>
-			</Box>
-			<Box>
-				<Typography variant="body2" color="textSecondary">
-					{label}
-				</Typography>
-				<Typography variant="body2" sx={{ marginTop: '4px' }}>
-					{Math.round(value)} / {max} MB
+					{value}
 				</Typography>
 			</Box>
 		</Box>
@@ -157,7 +71,7 @@ function ProgressMetric({ icon, label, value, max = 100, color = 'primary' }: {
  * Server Stats Widget - displays current server statistics
  */
 function ServerStatsWidget() {
-	const { data, isLoading, error } = useDashboardData('server_stats');
+	const { stats, meta, isLoading, error } = useServerStatsData();
 	const theme = useTheme();
 
 	if (error) {
@@ -168,8 +82,10 @@ function ServerStatsWidget() {
 		);
 	}
 
-	const serverData = (data as unknown) as ServerStatsResponse | undefined;
-	const stats = serverData?.data as ServerData | undefined;
+	const memoryPercent =
+		stats.virtual_memory_mb > 0
+			? (stats.memory_mb / stats.virtual_memory_mb) * 100
+			: 0;
 
 	return (
 		<Paper className="flex flex-auto flex-col overflow-hidden rounded-xl shadow-sm">
@@ -185,62 +101,74 @@ function ServerStatsWidget() {
 			<div className="flex flex-1 flex-col items-center justify-center p-6">
 				{isLoading ? (
 					<CircularProgress />
-				) : stats ? (
+				) : (
 					<Box className="w-full space-y-6">
-						{/* CPU and Memory Status */}
-						<Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr', md: '1fr 1fr 1fr' }, gap: '16px' }}>
-							<Box
-								sx={{
-									display: 'flex',
-									justifyContent: 'center',
-									padding: '16px',
-									backgroundColor: lighten(theme.palette.primary.main, 0.95),
-									borderRadius: '12px'
-								}}
-							>
-								<ProgressMetric
-									icon="lucide:cpu"
-									label="CPU Usage"
-									value={stats.cpu_usage_percent}
-									max={100}
+						<Grid container spacing={2}>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard icon="lucide:cpu" label="CPU Usage" value={formatPercent(stats.cpu_usage_percent)} color="info" />
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:memory-stick"
+									label="Memory"
+									value={`${formatNumber(stats.memory_mb)} / ${formatNumber(stats.virtual_memory_mb)} MB`}
+									color={memoryPercent > 85 ? 'error' : 'warning'}
+								/>
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:activity"
+									label="Queries / Minute"
+									value={stats.queries_per_minute.toFixed(1)}
+									color="success"
+								/>
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:workflow"
+									label="Worker Pools"
+									value={stats.worker_pools.length}
+									color="primary"
+								/>
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:users"
+									label="Active Sessions"
+									value={formatNumber(stats.sessions)}
 									color="info"
 								/>
-							</Box>
-
-							<Box
-								sx={{
-									display: 'flex',
-									justifyContent: 'center',
-									padding: '16px',
-									backgroundColor: lighten(theme.palette.warning.main, 0.95),
-									borderRadius: '12px'
-								}}
-							>
-								<ProgressMetric
-									icon="lucide:memory-stick"
-									label="Memory Usage"
-									value={stats.memory_mb}
-									max={stats.virtual_memory_mb}
-									color="warning"
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:send"
+									label="Submitted Queries"
+									value={formatNumber(stats.total_queries_submitted)}
+									color="primary"
 								/>
-							</Box>
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:check-circle"
+									label="Succeeded Queries"
+									value={formatNumber(stats.total_queries_succeeded)}
+									color="success"
+								/>
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6, lg: 3 }}>
+								<MetricCard
+									icon="lucide:alert-triangle"
+									label="Failed Queries"
+									value={formatNumber(stats.total_queries_failed)}
+									color={stats.total_queries_failed > 0 ? 'error' : 'success'}
+								/>
+							</Grid>
+						</Grid>
 
-							<MetricCard
-								icon="lucide:workflow"
-								label="Worker Pools"
-								value={stats.worker_pools.length}
-								color="success"
-							/>
-						</Box>
-
-						{/* Additional Stats */}
-						<Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: '12px' }}>
-							<MetricCard
-								icon="lucide:users"
-								label="Active Sessions"
-								value={stats.sessions}
-								color="info"
-							/>
+						<Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+							<Chip label={`Active queries: ${stats.active_queries}`} color="primary" variant="outlined" />
+							<Chip label={`Warehouses: ${stats.warehouses.length}`} color="info" variant="outlined" />
+							{meta.partialFailure && <Chip label="Partial data" color="warning" variant="filled" />}
 						</Box>
 
 						{/* Timestamp */}
@@ -253,13 +181,10 @@ function ServerStatsWidget() {
 							}}
 						>
 							<Typography variant="caption" color="textSecondary">
-								Last updated:{' '}
-								{new Date(serverData?.generated_at || '').toLocaleTimeString()}
+								Last updated: {formatDateTime(meta.generatedAt)}
 							</Typography>
 						</Box>
 					</Box>
-				) : (
-					<Typography color="textSecondary">No data available</Typography>
 				)}
 			</div>
 		</Paper>

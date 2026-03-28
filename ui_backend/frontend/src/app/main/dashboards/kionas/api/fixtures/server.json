@@ -1,0 +1,32 @@
+{
+  "generated_at": "2026-03-28T20:41:49.007541456+00:00",
+  "freshness_target_seconds": 15,
+  "source_component": "server-janitor",
+  "partial_failure": false,
+  "data_version": 1,
+  "error": null,
+  "data": {
+    "counter": 0,
+    "warehouses": [
+      "2b60c970-a341-538e-25b8-8c8fe103f731",
+      "9de57b1a-08ad-6a0f-22b5-7d066db33df3",
+      "fb836cb7-916b-7547-4ad3-916a9345b91c",
+      "9a2c0652-278f-e49f-e31b-c13f691360e3"
+    ],
+    "worker_pools": [
+      "9de57b1a-08ad-6a0f-22b5-7d066db33df3",
+      "2b60c970-a341-538e-25b8-8c8fe103f731",
+      "fb836cb7-916b-7547-4ad3-916a9345b91c",
+      "9a2c0652-278f-e49f-e31b-c13f691360e3"
+    ],
+    "sessions": 0,
+    "memory_mb": 170,
+    "virtual_memory_mb": 3061,
+    "cpu_usage_percent": 1.3710952,
+    "active_queries": 0,
+    "total_queries_submitted": 14,
+    "total_queries_succeeded": 14,
+    "total_queries_failed": 0,
+    "queries_per_minute": 0
+  }
+}

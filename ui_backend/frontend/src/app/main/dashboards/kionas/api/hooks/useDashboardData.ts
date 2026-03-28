@@ -1,25 +1,16 @@
 import { useQuery } from '@tanstack/react-query';
 
-const API_BASE = '/dashboard';
-
-export interface DashboardData {
-	[key: string]: unknown;
-}
+import { fetchDashboardKey } from '../services/dashboardSource';
+import { DashboardKey } from '../types/dashboard';
 
 /**
  * Hook to fetch dashboard data from backend
  * @param key - The dashboard key to fetch (e.g., 'server_stats', 'sessions')
  */
-export function useDashboardData(key: string) {
+export function useDashboardData<TData = unknown>(key: DashboardKey) {
 	return useQuery({
 		queryKey: ['dashboard', key],
-		queryFn: async () => {
-			const response = await fetch(`${API_BASE}/key?name=${encodeURIComponent(key)}`);
-			if (!response.ok) {
-				throw new Error(`Failed to fetch ${key}: ${response.statusText}`);
-			}
-			return response.json() as Promise<DashboardData>;
-		},
+		queryFn: () => fetchDashboardKey(key) as Promise<TData>,
 		refetchInterval: 15000, // Refresh every 15 seconds
 		retry: 1
 	});

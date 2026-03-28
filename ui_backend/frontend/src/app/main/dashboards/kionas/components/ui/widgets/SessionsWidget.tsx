@@ -3,24 +3,51 @@ import Typography from '@mui/material/Typography';
 import Box from '@mui/material/Box';
 import CircularProgress from '@mui/material/CircularProgress';
 import Alert from '@mui/material/Alert';
-import LinearProgress from '@mui/material/LinearProgress';
+import Grid from '@mui/material/Grid';
+import Table from '@mui/material/Table';
+import TableBody from '@mui/material/TableBody';
+import TableCell from '@mui/material/TableCell';
+import TableContainer from '@mui/material/TableContainer';
+import TableHead from '@mui/material/TableHead';
+import TableRow from '@mui/material/TableRow';
+import Chip from '@mui/material/Chip';
 import FuseSvgIcon from '@fuse/core/FuseSvgIcon';
 import { lighten, useTheme } from '@mui/material/styles';
-import { useDashboardData } from '../../../api/hooks/useDashboardData';
 
-interface SessionData {
-	count: number;
-	[key: string]: any;
+import { useSessionsData } from '../../../api/hooks/useSessionsData';
+import { formatDateTime, formatDurationMs, formatNumber } from '../../../lib/formatters';
+
+function MetricCard({ label, value }: { label: string; value: string | number }) {
+	return (
+		<Box
+			sx={{
+				p: 2,
+				borderRadius: 2,
+				bgcolor: 'background.default'
+			}}
+		>
+			<Typography variant="caption" color="text.secondary">
+				{label}
+			</Typography>
+			<Typography variant="h6" sx={{ fontWeight: 700 }}>
+				{value}
+			</Typography>
+		</Box>
+	);
 }
 
 /**
  * Sessions Widget - displays active session count and info
  */
 function SessionsWidget() {
-	const { data, isLoading, error } = useDashboardData('sessions');
+	const { sessions, meta, isLoading, error } = useSessionsData();
 	const theme = useTheme();
-	const sessionData = (data as SessionData) || { count: 0 };
-	const count = sessionData?.count || 0;
+
+	const activeCount = sessions.length;
+	const totalQueries = sessions.reduce((sum, session) => sum + session.query_count, 0);
+	const totalErrors = sessions.reduce((sum, session) => sum + session.error_count, 0);
+	const totalDurationMs = sessions.reduce((sum, session) => sum + session.total_query_duration_ms, 0);
+	const averageDurationMs = totalQueries > 0 ? Math.round(totalDurationMs / totalQueries) : 0;
 
 	if (error) {
 		return (
@@ -29,11 +56,6 @@ function SessionsWidget() {
 			</Paper>
 		);
 	}
-
-	// Estimate session utilization (mock for now - you can update this based on actual max capacity)
-	const maxSessions = 100;
-	const utilizationPercent = Math.round((count / maxSessions) * 100);
-	const statusColor = utilizationPercent > 80 ? 'error' : utilizationPercent > 50 ? 'warning' : 'success';
 
 	return (
 		<Paper className="flex flex-auto flex-col overflow-hidden rounded-xl shadow-sm">
@@ -46,114 +68,77 @@ function SessionsWidget() {
 			</div>
 
 			{/* Content */}
-			<div className="flex flex-1 flex-col items-center justify-center p-8">
+			<div className="flex flex-1 flex-col items-center justify-center p-6">
 				{isLoading ? (
 					<CircularProgress />
 				) : (
 					<Box className="w-full space-y-6">
-						{/* Big Number Display */}
-						<Box sx={{ textAlign: 'center' }}>
-							<Typography
-								sx={{
-									fontSize: { xs: '2.5rem', sm: '3.5rem', md: '4rem' },
-									fontWeight: 700,
-									letterSpacing: '-0.05em',
-									background: `linear-gradient(135deg, ${theme.palette.primary.main} 0%, ${theme.palette.secondary.main} 100%)`,
-									WebkitBackgroundClip: 'text',
-									WebkitTextFillColor: 'transparent'
-								}}
-							>
-								{count}
-							</Typography>
-							<Typography
-								variant="subtitle2"
-								sx={{
-									marginTop: '8px',
-									color: 'textSecondary',
-									fontSize: '0.95rem'
-								}}
-							>
-								sessions active
-							</Typography>
+						<Grid container spacing={2}>
+							<Grid size={{ xs: 12, sm: 6 }}>
+								<MetricCard label="Active Sessions" value={formatNumber(activeCount)} />
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6 }}>
+								<MetricCard label="Total Queries" value={formatNumber(totalQueries)} />
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6 }}>
+								<MetricCard label="Avg Query Duration" value={formatDurationMs(averageDurationMs)} />
+							</Grid>
+							<Grid size={{ xs: 12, sm: 6 }}>
+								<MetricCard label="Total Errors" value={formatNumber(totalErrors)} />
+							</Grid>
+						</Grid>
+
+						<Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+							<Chip label={`Snapshot: ${formatDateTime(meta.generatedAt)}`} size="small" variant="outlined" />
+							{meta.partialFailure && <Chip label="Partial data" color="warning" size="small" />}
 						</Box>
 
-						{/* Utilization Bar */}
-						<Box
-							sx={{
-								backgroundColor: lighten(theme.palette.background.default, 0.5),
-								borderRadius: '12px',
-								padding: '16px',
-								space: '8px'
-							}}
-						>
-							<Box sx={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-								<Typography variant="body2" sx={{ fontWeight: 500 }}>
-									Capacity Utilization
-								</Typography>
-								<Typography variant="body2" sx={{ fontWeight: 600, color: statusColor }}>
-									{utilizationPercent}%
-								</Typography>
-							</Box>
-							<LinearProgress
-								variant="determinate"
-								value={utilizationPercent}
-								sx={{
-									height: '8px',
-									borderRadius: '4px',
-									backgroundColor: lighten(theme.palette.primary.main, 0.7),
-									'& .MuiLinearProgress-bar': {
-										borderRadius: '4px'
-									}
-								}}
-								color={statusColor === 'success' ? 'success' : statusColor === 'warning' ? 'warning' : 'error'}
-							/>
-							<Typography
-								variant="caption"
-								sx={{
-									display: 'block',
-									marginTop: '8px',
-									color: 'textSecondary'
-								}}
-							>
-								{count} of {maxSessions} sessions
-							</Typography>
-						</Box>
+						<TableContainer sx={{ maxHeight: 320, borderRadius: 2, border: '1px solid', borderColor: 'divider' }}>
+							<Table size="small" stickyHeader>
+								<TableHead>
+									<TableRow>
+										<TableCell>Session</TableCell>
+										<TableCell>Role</TableCell>
+										<TableCell>Warehouse</TableCell>
+										<TableCell align="right">Queries</TableCell>
+										<TableCell align="right">Errors</TableCell>
+										<TableCell align="right">Avg Duration</TableCell>
+										<TableCell>Last Query</TableCell>
+									</TableRow>
+								</TableHead>
+								<TableBody>
+									{sessions.map((session) => {
+										const avgDuration =
+											session.query_count > 0
+												? Math.round(session.total_query_duration_ms / session.query_count)
+												: 0;
 
-						{/* Status Badge */}
-						<Box
-							sx={{
-								display: 'flex',
-								gap: '12px',
-								justifyContent: 'center',
-								flexWrap: 'wrap',
-								backgroundColor: lighten(theme.palette.background.default, 0.5),
-								borderRadius: '12px',
-								padding: '12px'
-							}}
-						>
-							<Box sx={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-								<Box
-									sx={{
-										width: '12px',
-										height: '12px',
-										borderRadius: '50%',
-										backgroundColor:
-											statusColor === 'success'
-												? theme.palette.success.main
-												: statusColor === 'warning'
-													? theme.palette.warning.main
-													: theme.palette.error.main
-									}}
-								/>
-								<Typography variant="caption" sx={{ fontWeight: 500 }}>
-									{statusColor === 'success'
-										? 'Optimal'
-										: statusColor === 'warning'
-											? 'Elevated'
-											: 'Critical'}
-								</Typography>
-							</Box>
-						</Box>
+										return (
+											<TableRow key={session.id} hover>
+												<TableCell>
+													<Typography sx={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+														{session.id.slice(0, 8)}...
+													</Typography>
+												</TableCell>
+												<TableCell>{session.role}</TableCell>
+												<TableCell>{session.warehouse}</TableCell>
+												<TableCell align="right">{formatNumber(session.query_count)}</TableCell>
+												<TableCell align="right">{formatNumber(session.error_count)}</TableCell>
+												<TableCell align="right">{formatDurationMs(avgDuration)}</TableCell>
+												<TableCell>{formatDateTime(session.last_query_at)}</TableCell>
+											</TableRow>
+										);
+									})}
+									{sessions.length === 0 && (
+										<TableRow>
+											<TableCell colSpan={7} align="center">
+												<Typography color="text.secondary">No active sessions</Typography>
+											</TableCell>
+										</TableRow>
+									)}
+								</TableBody>
+							</Table>
+						</TableContainer>
 					</Box>
 				)}
 			</div>
