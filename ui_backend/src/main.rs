@@ -6,9 +6,9 @@ use axum::routing::get;
 use deadpool::managed::Pool;
 use kionas::constants::{
     REDIS_POOL_SIZE_ENV, REDIS_UI_DASHBOARD_CLUSTER_INFO_KEY,
-    REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY, REDIS_UI_DASHBOARD_SERVER_STATS_KEY,
-    REDIS_UI_DASHBOARD_SESSIONS_KEY, REDIS_UI_DASHBOARD_TOKENS_KEY, REDIS_UI_DASHBOARD_WORKERS_KEY,
-    REDIS_URL_ENV,
+    REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY, REDIS_UI_DASHBOARD_QUERY_HISTORY_KEY,
+    REDIS_UI_DASHBOARD_SERVER_STATS_KEY, REDIS_UI_DASHBOARD_SESSIONS_KEY,
+    REDIS_UI_DASHBOARD_TOKENS_KEY, REDIS_UI_DASHBOARD_WORKERS_KEY, REDIS_URL_ENV,
 };
 use redis::AsyncCommands;
 use serde::Deserialize;
@@ -355,12 +355,13 @@ async fn get_dashboard_key(
     Query(query): Query<KeyQuery>,
 ) -> Response {
     let is_workers_query = query.name == "workers";
+    let is_query_history = query.name == "query_history";
     let redis_key = match key_alias_to_redis_key(query.name.as_str()) {
         Some(key) => key,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                "unsupported key alias; expected one of: server_stats,sessions,tokens,workers,cluster_info,consul_cluster_summary",
+                "unsupported key alias; expected one of: server_stats,sessions,tokens,workers,cluster_info,consul_cluster_summary,query_history",
             )
                 .into_response();
         }
@@ -389,6 +390,23 @@ async fn get_dashboard_key(
                     "workers scan retrieval failed; falling back to cached workers key: {}",
                     error
                 );
+            }
+        }
+    }
+
+    if is_query_history {
+        match read_query_history_from_list(&mut conn).await {
+            Ok(payload) => {
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    payload,
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                log::warn!("query history retrieval failed: {}", error);
+                return (StatusCode::SERVICE_UNAVAILABLE, "redis read failed").into_response();
             }
         }
     }
@@ -481,6 +499,39 @@ async fn read_workers_from_scan(
         .map_err(|error| format!("serialize workers array failed: {error}"))
 }
 
+/// What: Read query history list payloads and convert to JSON array.
+///
+/// Inputs:
+/// - `connection`: Active Redis connection.
+///
+/// Output:
+/// - JSON array string of query summary objects.
+///
+/// Details:
+/// - Reads newest-first entries from the Redis list.
+/// - Skips malformed JSON entries and returns valid records.
+async fn read_query_history_from_list(
+    connection: &mut redis::aio::MultiplexedConnection,
+) -> Result<String, String> {
+    let entries: Vec<String> = connection
+        .lrange(REDIS_UI_DASHBOARD_QUERY_HISTORY_KEY, 0, -1)
+        .await
+        .map_err(|error| format!("redis lrange failed for query history: {error}"))?;
+
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match serde_json::from_str::<serde_json::Value>(entry.as_str()) {
+            Ok(value) => rows.push(value),
+            Err(error) => {
+                log::warn!("skipping malformed query_history entry: {}", error);
+            }
+        }
+    }
+
+    serde_json::to_string(&rows)
+        .map_err(|error| format!("serialize query history array failed: {error}"))
+}
+
 /// What: Translate user-friendly alias to Redis hash key constant.
 ///
 /// Inputs:
@@ -501,6 +552,7 @@ fn key_alias_to_redis_key(name: &str) -> Option<&'static str> {
         "workers" => Some(REDIS_UI_DASHBOARD_WORKERS_KEY),
         "cluster_info" => Some(REDIS_UI_DASHBOARD_CLUSTER_INFO_KEY),
         "consul_cluster_summary" => Some(REDIS_UI_DASHBOARD_CONSUL_SUMMARY_KEY),
+        "query_history" => Some(REDIS_UI_DASHBOARD_QUERY_HISTORY_KEY),
         _ => None,
     }
 }

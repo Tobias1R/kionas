@@ -13,6 +13,7 @@ use kionas::constants::{
     TRANSACTION_STAGING_RETENTION_ENV, TRANSACTION_STAGING_RETENTION_SECONDS,
 };
 use kionas::monitoring::{init_redis_pool, update_cluster_info};
+use kionas::redis_monitoring::{ClusterHealthStatus, WorkerHealthStatus, WorkerSystemInfo};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -20,6 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{CpuExt, ProcessExt, System, SystemExt};
+
+#[cfg(test)]
+#[path = "../tests/janitor_server_stats_counters_tests.rs"]
+mod tests;
 
 const DEFAULT_REDIS_URL: &str = "redis://kionas-redis:6379/2";
 const DASHBOARD_TTL_SECONDS: u64 = 120;
@@ -75,6 +80,16 @@ struct ServerStatsPayload {
     memory_mb: u64,
     virtual_memory_mb: u64,
     cpu_usage_percent: f32,
+    active_queries: u32,
+    total_queries_submitted: u64,
+    total_queries_succeeded: u64,
+    total_queries_failed: u64,
+    queries_per_minute: f32,
+}
+
+#[derive(Default)]
+struct ServerStatsAccumulator {
+    last_queries_submitted: u64,
 }
 
 #[derive(Serialize)]
@@ -86,6 +101,10 @@ struct SessionSnapshot {
     is_authenticated: bool,
     last_active: u64,
     use_database: String,
+    query_count: u64,
+    last_query_at: u64,
+    total_query_duration_ms: u64,
+    error_count: u64,
 }
 
 /// What: Session data structure for deserializing from Redis JSON during cleanup.
@@ -130,6 +149,103 @@ struct ConsulSummaryPayload {
     storage_type: String,
 }
 
+/// What: Derive cluster-level health from registered and live worker health snapshots.
+///
+/// Inputs:
+/// - `registered_count`: Number of workers tracked in server shared state.
+/// - `live_workers`: Worker health snapshots currently present in monitoring Redis.
+///
+/// Output:
+/// - `ClusterHealthStatus` derived from worker health and stale-worker ratio.
+///
+/// Details:
+/// - Unhealthy when there are no live workers, any live worker is unhealthy,
+///   or stale ratio is greater than 50%.
+/// - Degraded when stale ratio is at least 20% or any live worker is degraded.
+/// - Healthy only when all live workers are healthy and stale ratio is below 20%.
+fn derive_cluster_health(
+    registered_count: usize,
+    live_workers: &[WorkerSystemInfo],
+) -> ClusterHealthStatus {
+    if live_workers.is_empty() {
+        return ClusterHealthStatus::Unhealthy;
+    }
+
+    let live_count = live_workers.len();
+    let stale_count = registered_count.saturating_sub(live_count);
+    let stale_ratio = stale_count as f32 / registered_count.max(1) as f32;
+
+    if stale_ratio > 0.50 {
+        return ClusterHealthStatus::Unhealthy;
+    }
+
+    let has_unhealthy = live_workers
+        .iter()
+        .any(|worker| worker.health_status == WorkerHealthStatus::Unhealthy);
+    if has_unhealthy {
+        return ClusterHealthStatus::Unhealthy;
+    }
+
+    if stale_ratio >= 0.20 {
+        return ClusterHealthStatus::Degraded;
+    }
+
+    let has_degraded = live_workers
+        .iter()
+        .any(|worker| worker.health_status == WorkerHealthStatus::Degraded);
+    if has_degraded {
+        return ClusterHealthStatus::Degraded;
+    }
+
+    ClusterHealthStatus::Healthy
+}
+
+/// What: Load currently live worker monitoring snapshots from Redis.
+///
+/// Inputs:
+/// - `connection_manager`: Monitoring Redis connection manager (status DB).
+///
+/// Output:
+/// - `Ok(Vec<WorkerSystemInfo>)` with successfully parsed live worker snapshots.
+/// - `Err(String)` when Redis key scan/read fails.
+///
+/// Details:
+/// - Keys are scanned via `kionas:worker:*:sys_info` pattern.
+/// - Individual JSON parse failures are logged and skipped.
+async fn collect_live_worker_infos(
+    connection_manager: &redis::aio::ConnectionManager,
+) -> Result<Vec<WorkerSystemInfo>, String> {
+    let mut connection = connection_manager.clone();
+    let keys: Vec<String> = connection
+        .keys("kionas:worker:*:sys_info")
+        .await
+        .map_err(|error| format!("failed to list worker sys_info keys: {}", error))?;
+
+    let mut workers = Vec::with_capacity(keys.len());
+    for key in keys {
+        let payload: String = match connection.get(&key).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::warn!("failed reading worker sys_info key '{}': {}", key, error);
+                continue;
+            }
+        };
+
+        match serde_json::from_str::<WorkerSystemInfo>(&payload) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                log::warn!(
+                    "failed parsing worker sys_info payload for key '{}': {}",
+                    key,
+                    error
+                );
+            }
+        }
+    }
+
+    Ok(workers)
+}
+
 /// What: Start the janitor loop responsible for periodic Redis dashboard cache updates.
 ///
 /// Inputs:
@@ -148,6 +264,7 @@ pub(crate) fn start(shared_data: SharedData) {
 
     tokio::spawn(async move {
         let janitor_start_time = Utc::now();
+        let mut server_stats_accumulator = ServerStatsAccumulator::default();
         let status_redis_url = resolved_status_redis_url();
         let redis_pool = match redis_pool() {
             Ok(pool) => pool,
@@ -174,6 +291,7 @@ pub(crate) fn start(shared_data: SharedData) {
             &redis_pool,
             monitoring_redis_pool.as_ref(),
             janitor_start_time,
+            &mut server_stats_accumulator,
         )
         .await;
         let mut interval = tokio::time::interval(Duration::from_secs(FRESHNESS_TARGET_SECONDS));
@@ -184,6 +302,7 @@ pub(crate) fn start(shared_data: SharedData) {
                 &redis_pool,
                 monitoring_redis_pool.as_ref(),
                 janitor_start_time,
+                &mut server_stats_accumulator,
             )
             .await;
         }
@@ -209,9 +328,10 @@ async fn publish_all_domains(
     redis_pool: &RedisPool,
     monitoring_redis_pool: Option<&redis::aio::ConnectionManager>,
     janitor_start_time: chrono::DateTime<Utc>,
+    server_stats_accumulator: &mut ServerStatsAccumulator,
 ) {
     log::debug!("Janitor publish cycle started");
-    publish_server_stats(shared_data, redis_pool).await;
+    publish_server_stats(shared_data, redis_pool, server_stats_accumulator).await;
     publish_sessions(shared_data, redis_pool).await;
     publish_tokens(shared_data, redis_pool).await;
     publish_workers(shared_data, redis_pool).await;
@@ -315,8 +435,12 @@ fn to_status_db_url(url: &str) -> Option<String> {
 ///
 /// Details:
 /// - Captures memory and CPU values via sysinfo.
-async fn publish_server_stats(shared_data: &SharedData, redis_pool: &RedisPool) {
-    let payload = collect_server_stats(shared_data).await;
+async fn publish_server_stats(
+    shared_data: &SharedData,
+    redis_pool: &RedisPool,
+    server_stats_accumulator: &mut ServerStatsAccumulator,
+) {
+    let payload = collect_server_stats(shared_data, server_stats_accumulator).await;
     let result = publish_success(redis_pool, REDIS_UI_DASHBOARD_SERVER_STATS_KEY, payload).await;
     if let Err(error) = result {
         log::warn!("Janitor failed publishing server stats: {}", error);
@@ -487,17 +611,31 @@ async fn publish_cluster_info(
         }
     };
 
-    let node_count = {
+    let registered_count = {
         let shared = shared_data.lock().await;
         let workers = shared.workers.lock().await;
         workers.len()
     };
 
+    let live_worker_infos = match collect_live_worker_infos(connection_manager).await {
+        Ok(workers) => workers,
+        Err(error) => {
+            log::warn!(
+                "failed collecting live worker snapshots for cluster health derivation: {}",
+                error
+            );
+            Vec::new()
+        }
+    };
+
+    let health_status = derive_cluster_health(registered_count, &live_worker_infos);
+
     if let Err(error) = update_cluster_info(
         connection_manager,
         &cluster_config,
-        node_count,
+        registered_count,
         janitor_start_time,
+        health_status,
     )
     .await
     {
@@ -518,8 +656,11 @@ async fn publish_cluster_info(
 ///
 /// Details:
 /// - Uses process memory/virtual memory and global CPU usage percentage.
-async fn collect_server_stats(shared_data: &SharedData) -> ServerStatsPayload {
-    let (counter, warehouses, worker_pools, sessions) = {
+async fn collect_server_stats(
+    shared_data: &SharedData,
+    server_stats_accumulator: &mut ServerStatsAccumulator,
+) -> ServerStatsPayload {
+    let (counter, warehouses, worker_pools, sessions, query_counters) = {
         let shared = shared_data.lock().await;
         let counter = *shared.counter.lock().await;
         let warehouses_map = shared.warehouses.lock().await;
@@ -527,8 +668,16 @@ async fn collect_server_stats(shared_data: &SharedData) -> ServerStatsPayload {
         let worker_pools_map = shared.worker_pools.lock().await;
         let worker_pools = worker_pools_map.keys().cloned().collect::<Vec<_>>();
         let sessions = shared.session_manager.list_sessions().await.len();
-        (counter, warehouses, worker_pools, sessions)
+        let query_counters = Arc::clone(&shared.query_counters);
+        (counter, warehouses, worker_pools, sessions, query_counters)
     };
+
+    let query_snapshot = query_counters.snapshot();
+    let query_delta = query_snapshot
+        .total_queries_submitted
+        .saturating_sub(server_stats_accumulator.last_queries_submitted);
+    let queries_per_minute = (query_delta as f32) * (60.0_f32 / FRESHNESS_TARGET_SECONDS as f32);
+    server_stats_accumulator.last_queries_submitted = query_snapshot.total_queries_submitted;
 
     let mut sys = System::new_all();
     sys.refresh_cpu();
@@ -558,6 +707,11 @@ async fn collect_server_stats(shared_data: &SharedData) -> ServerStatsPayload {
         memory_mb,
         virtual_memory_mb,
         cpu_usage_percent,
+        active_queries: query_snapshot.active_queries,
+        total_queries_submitted: query_snapshot.total_queries_submitted,
+        total_queries_succeeded: query_snapshot.total_queries_succeeded,
+        total_queries_failed: query_snapshot.total_queries_failed,
+        queries_per_minute,
     }
 }
 
@@ -588,6 +742,10 @@ async fn collect_sessions(shared_data: &SharedData) -> Vec<SessionSnapshot> {
             is_authenticated: session.is_authenticated(),
             last_active: session.get_last_active(),
             use_database: session.get_use_database(),
+            query_count: session.get_query_count(),
+            last_query_at: session.get_last_query_at(),
+            total_query_duration_ms: session.get_total_query_duration_ms(),
+            error_count: session.get_error_count(),
         })
         .collect()
 }

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::counters::WorkerCounters;
 use kionas::get_local_hostname;
 use kionas::monitoring::{
     WorkerSysInfoUpdateInput, collect_system_metrics, update_worker_sys_info,
@@ -27,6 +29,7 @@ pub fn spawn_monitoring_task(
     cluster_id: String,
     warehouse_pool: Option<String>,
     worker_start_time: DateTime<Utc>,
+    counters: Arc<WorkerCounters>,
 ) {
     let interval_secs = std::env::var("KIONAS_WORKER_UPDATE_INTERVAL_SECS")
         .ok()
@@ -41,17 +44,21 @@ pub fn spawn_monitoring_task(
             interval.tick().await;
 
             let metrics = collect_system_metrics();
+            let snapshot = counters.snapshot();
             let hostname = get_local_hostname().unwrap_or_else(|| "unknown-worker".to_string());
-            let active_queries = 0_u32;
-            let total_queries_processed = 0_u64;
             let input = WorkerSysInfoUpdateInput {
                 worker_id: worker_id.clone(),
                 cluster_id: cluster_id.clone(),
                 hostname,
                 warehouse_pool: warehouse_pool.clone(),
                 metrics,
-                active_queries,
-                total_queries_processed,
+                active_stages: snapshot.active_stages,
+                total_stages_executed: snapshot.total_stages_executed,
+                active_partitions: snapshot.active_partitions,
+                total_partitions_executed: snapshot.total_partitions_executed,
+                bytes_scanned_total: snapshot.bytes_scanned_total,
+                total_stage_exec_ms: snapshot.total_stage_exec_ms,
+                total_rows_produced: snapshot.total_rows_produced,
                 worker_start_time,
             };
 

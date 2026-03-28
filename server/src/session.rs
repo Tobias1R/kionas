@@ -8,6 +8,10 @@ use tokio::sync::Mutex;
 
 const SESSION_KEY_PREFIX: &str = "kionas:session";
 
+#[cfg(test)]
+#[path = "tests/session_observability_tests.rs"]
+mod tests;
+
 /// What: Get the configured session TTL from environment or use default.
 ///
 /// Inputs:
@@ -40,6 +44,14 @@ pub struct Session {
     remote_addr: String,
     last_active: u64,
     use_database: String,
+    #[serde(default)]
+    query_count: u64,
+    #[serde(default)]
+    last_query_at: u64,
+    #[serde(default)]
+    total_query_duration_ms: u64,
+    #[serde(default)]
+    error_count: u64,
 }
 
 impl Session {
@@ -61,6 +73,10 @@ impl Session {
             remote_addr,
             last_active: 0,
             use_database: "default".to_string(),
+            query_count: 0,
+            last_query_at: 0,
+            total_query_duration_ms: 0,
+            error_count: 0,
         }
     }
 
@@ -166,6 +182,84 @@ impl Session {
         self.use_database.clone()
     }
 
+    /// What: Get cumulative query dispatch count for this session.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Total number of tracked queries for the session.
+    ///
+    /// Details:
+    /// - Increments on both successful and failed query completions.
+    pub fn get_query_count(&self) -> u64 {
+        self.query_count
+    }
+
+    /// What: Get the epoch-millisecond timestamp of the most recent tracked query.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Millisecond UNIX timestamp, or 0 when no query has been tracked.
+    ///
+    /// Details:
+    /// - Updated by `record_query_completion`.
+    pub fn get_last_query_at(&self) -> u64 {
+        self.last_query_at
+    }
+
+    /// What: Get cumulative wall-clock query duration for this session.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Total query duration in milliseconds.
+    ///
+    /// Details:
+    /// - Uses saturating arithmetic to avoid overflow panics.
+    pub fn get_total_query_duration_ms(&self) -> u64 {
+        self.total_query_duration_ms
+    }
+
+    /// What: Get cumulative tracked query errors for this session.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Total failed query count.
+    ///
+    /// Details:
+    /// - Incremented only when `record_query_completion` receives `succeeded = false`.
+    pub fn get_error_count(&self) -> u64 {
+        self.error_count
+    }
+
+    /// What: Record completion metrics for one query handled under this session.
+    ///
+    /// Inputs:
+    /// - `duration_ms`: Wall-clock query duration in milliseconds.
+    /// - `succeeded`: Whether query execution succeeded.
+    ///
+    /// Output:
+    /// - Updates in-memory session observability counters.
+    ///
+    /// Details:
+    /// - Query count increments for both success and failure outcomes.
+    /// - Error count increments only for failed outcomes.
+    /// - Duration accumulation is saturating to avoid overflow panics.
+    pub fn record_query_completion(&mut self, duration_ms: u64, succeeded: bool) {
+        self.query_count = self.query_count.saturating_add(1);
+        self.last_query_at = chrono::Utc::now().timestamp_millis() as u64;
+        self.total_query_duration_ms = self.total_query_duration_ms.saturating_add(duration_ms);
+        if !succeeded {
+            self.error_count = self.error_count.saturating_add(1);
+        }
+    }
+
     #[allow(dead_code)]
     pub fn set_use_database(&mut self, database: String) {
         self.use_database = database;
@@ -213,7 +307,13 @@ impl SessionManager {
 
     pub async fn get_session(&self, id: String) -> Option<Session> {
         let key = Self::session_key(&id);
-        let value = self.provider.get(&key).await.unwrap();
+        let value = match self.provider.get(&key).await {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("failed to get session '{}' from redis: {}", id, error);
+                return None;
+            }
+        };
         serde_json::from_str::<Session>(&value).ok()
     }
 
@@ -232,11 +332,15 @@ impl SessionManager {
     }
 
     // update session
-    pub async fn update_session(&self, id: String, session: &mut Session) {
+    pub async fn update_session(&self, id: String, session: &Session) -> Result<(), String> {
         let key = Self::session_key(&id);
-        let value = serde_json::to_string(&session).unwrap();
+        let value = serde_json::to_string(session)
+            .map_err(|error| format!("failed to serialize session '{}': {}", id, error))?;
         let ttl = get_session_ttl();
-        self.provider.set_ex(&key, &value, ttl).await.unwrap();
+        self.provider
+            .set_ex(&key, &value, ttl)
+            .await
+            .map_err(|error| format!("failed to update session '{}' in redis: {}", id, error))
     }
 
     // get token session

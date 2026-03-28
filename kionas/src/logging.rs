@@ -42,8 +42,8 @@ pub fn init_logging(
         )
     });
 
-    // Initialize logger
-    builder.init();
+    // Initialize logger only when no global logger has been installed yet.
+    let _ = builder.try_init();
 
     Ok(())
 }

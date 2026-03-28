@@ -17,18 +17,19 @@ const CLUSTER_INFO_TTL_SECONDS: u64 = 45;
 /// - `config`: AppConfig with cluster metadata.
 /// - `node_count`: Number of active workers/nodes.
 /// - `cluster_start_time`: Cluster process start timestamp.
+/// - `health`: Derived cluster health computed by the server janitor.
 ///
 /// Output:
 /// - Ok when snapshot is successfully written.
 ///
 /// Details:
 /// - Stores JSON at kionas:cluster:info with 45-second TTL.
-/// - Uses a temporary Healthy status until richer health logic is added.
 pub async fn update_cluster_info(
     pool: &ConnectionManager,
     cluster_config: &ClusterConfig,
     node_count: usize,
     cluster_start_time: DateTime<Utc>,
+    health: ClusterHealthStatus,
 ) -> Result<(), MonitoringError> {
     let now = Utc::now();
     let uptime_delta = now.signed_duration_since(cluster_start_time).num_seconds();
@@ -38,7 +39,7 @@ pub async fn update_cluster_info(
         cluster_name: cluster_config.cluster_name.clone(),
         cluster_id: cluster_config.cluster_id.clone(),
         cluster_version: cluster_config.cluster_version.clone(),
-        status: ClusterHealthStatus::Healthy,
+        status: health,
         uptime_seconds,
         started_at: cluster_start_time,
         node_count,

@@ -2,6 +2,7 @@
 pub mod auth;
 pub mod auth_setup;
 pub mod consul;
+pub mod counters;
 pub mod handlers;
 pub mod janitor;
 pub mod parser;

@@ -1,4 +1,5 @@
 pub mod authz;
+pub mod counters;
 pub mod execution;
 pub mod flight;
 pub mod interops;

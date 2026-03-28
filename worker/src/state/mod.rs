@@ -1,3 +1,4 @@
+use crate::counters::WorkerCounters;
 use crate::interops::manager::InteropsManager;
 use crate::storage::StorageProvider;
 use crate::storage::object_store_pool::ObjectStoreManager;
@@ -57,6 +58,8 @@ pub struct WorkerInformation {
 pub struct SharedData {
     pub worker_info: WorkerInformation,
     pub cluster_info: ClusterInfo,
+    #[serde(skip)]
+    pub counters: Arc<WorkerCounters>,
     #[serde(skip)]
     pub storage_provider: Option<Arc<dyn StorageProvider + Send + Sync>>,
     #[serde(skip)]
@@ -279,6 +282,7 @@ impl SharedData {
         SharedData {
             worker_info,
             cluster_info,
+            counters: WorkerCounters::new(),
             storage_provider: None,
             master_pool: Arc::new(tokio::sync::Mutex::new(None)),
             object_store_pool: Arc::new(tokio::sync::Mutex::new(None)),

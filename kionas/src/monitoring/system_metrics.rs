@@ -1,4 +1,4 @@
-use sysinfo::{CpuExt, DiskExt, System, SystemExt};
+use sysinfo::{DiskExt, ProcessExt, System, SystemExt};
 
 /// What: Current point-in-time worker system metrics.
 ///
@@ -15,6 +15,7 @@ pub struct SystemMetrics {
     pub memory_used_mb: u64,
     pub memory_total_mb: u64,
     pub cpu_percent: f32,
+    pub thread_count: u32,
     pub disk_used_mb: u64,
     pub disk_total_mb: u64,
 }
@@ -37,12 +38,28 @@ pub fn collect_system_metrics() -> SystemMetrics {
     let total_memory = system.total_memory();
     let used_memory = system.used_memory();
 
-    let cpu_count = system.cpus().len() as f32;
-    let cpu_total: f32 = system.cpus().iter().map(|cpu| cpu.cpu_usage()).sum();
-    let cpu_percent = if cpu_count > 0.0 {
-        (cpu_total / cpu_count).clamp(0.0, 100.0)
-    } else {
-        0.0
+    // Per-process CPU usage gives worker-specific signal instead of host-wide average.
+    let current_process = sysinfo::get_current_pid()
+        .ok()
+        .and_then(|pid| system.process(pid));
+
+    let cpu_count = system.cpus().len().max(1) as f32;
+    let cpu_percent = current_process
+        .map(|process| (process.cpu_usage() / cpu_count).clamp(0.0, 100.0))
+        .unwrap_or(0.0);
+
+    let thread_count = {
+        #[cfg(target_os = "linux")]
+        {
+            current_process
+                .map(|process| u32::try_from(process.tasks.len()).unwrap_or(u32::MAX))
+                .unwrap_or(0)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
     };
 
     let disk_total_bytes: u64 = system.disks().iter().map(DiskExt::total_space).sum();
@@ -53,6 +70,7 @@ pub fn collect_system_metrics() -> SystemMetrics {
         memory_used_mb: used_memory / 1024,
         memory_total_mb: total_memory / 1024,
         cpu_percent,
+        thread_count,
         disk_used_mb: disk_used_bytes / (1024 * 1024),
         disk_total_mb: disk_total_bytes / (1024 * 1024),
     }

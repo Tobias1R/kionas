@@ -1235,6 +1235,15 @@ async fn maybe_prune_scan_keys(
 /// Output:
 /// - `Ok(())` when execution succeeds and parquet artifacts are persisted.
 /// - `Err(message)` when runtime execution or storage operations fail.
+#[tracing::instrument(
+    name = "stage.execute",
+    skip(shared, task, namespace, result_location),
+    fields(
+        query_id = tracing::field::Empty,
+        stage_id = tracing::field::Empty,
+        partition_id = tracing::field::Empty
+    )
+)]
 pub(crate) async fn execute_query_task(
     shared: &SharedData,
     task: &worker_service::StagePartitionExecution,
@@ -1317,6 +1326,11 @@ pub(crate) async fn execute_query_task(
         .get("__query_id")
         .cloned()
         .unwrap_or_else(|| "unknown".to_string());
+    let current_span = tracing::Span::current();
+    current_span.record("query_id", query_id.as_str());
+    current_span.record("stage_id", stage_context.stage_id);
+    current_span.record("partition_id", stage_context.partition_index);
+
     log::info!(
         "{}",
         format_scan_mode_chosen_event(
@@ -1630,6 +1644,19 @@ pub(crate) async fn execute_query_task(
         .map(RecordBatch::num_rows)
         .sum::<usize>();
     let stage_runtime_ms = stage_started_at.elapsed().as_millis();
+    let artifact_bytes_total = exchange_artifact_bytes + materialization_artifact_bytes;
+    shared
+        .counters
+        .bytes_scanned_total
+        .fetch_add(artifact_bytes_total, std::sync::atomic::Ordering::Relaxed);
+    shared.counters.total_stage_exec_ms.fetch_add(
+        u64::try_from(stage_runtime_ms).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    shared.counters.total_rows_produced.fetch_add(
+        u64::try_from(operator_rows_out).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     log::info!(
         "{}",
         format_stage_runtime_event(
@@ -1643,7 +1670,7 @@ pub(crate) async fn execute_query_task(
                 operator_rows_in,
                 operator_rows_out,
                 batch_count: normalized_batches.len(),
-                artifact_bytes: exchange_artifact_bytes + materialization_artifact_bytes,
+                artifact_bytes: artifact_bytes_total,
             },
         )
     );

@@ -53,8 +53,9 @@ pub async fn handle_use_warehouse(
             s.set_pool_members(pool_members);
             state
                 .session_manager
-                .update_session(session_id.to_string(), &mut s)
-                .await;
+                .update_session(session_id.to_string(), &s)
+                .await
+                .map_err(|error| format!("failed to persist updated session: {}", error))?;
             Ok(format!("Using warehouse {}", wh))
         }
         None => Err("session not found".to_string()),

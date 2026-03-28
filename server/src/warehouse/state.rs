@@ -1,3 +1,4 @@
+use crate::counters::ServerCounters;
 use crate::session;
 use crate::tasks::TaskManager;
 use crate::warehouse::Warehouse;
@@ -12,6 +13,10 @@ use std::collections::hash_map::Entry as HashEntry;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::transport::Channel;
+
+#[cfg(test)]
+#[path = "../tests/warehouse_state_query_counters_tests.rs"]
+mod tests;
 /*
 Shared state structure
 
@@ -21,6 +26,7 @@ Must be serializable and sendable between threads
 #[derive(Debug)]
 pub struct SharedState {
     pub counter: Arc<AsyncMutex<u32>>,
+    pub query_counters: Arc<ServerCounters>,
     pub warehouses: Arc<AsyncMutex<HashMap<String, Warehouse>>>,
     pub session_manager: Arc<session::SessionManager>,
     pub worker_pools: Arc<AsyncMutex<HashMap<String, WorkerPool>>>,
@@ -37,6 +43,7 @@ impl SharedState {
         let worker_pools: HashMap<String, WorkerPool> = HashMap::new();
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
+            query_counters: ServerCounters::new(),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
             session_manager: Arc::new(session::SessionManager::new()),
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
@@ -55,6 +62,7 @@ impl Default for SharedState {
         let worker_pools: HashMap<String, WorkerPool> = HashMap::new();
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
+            query_counters: ServerCounters::new(),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
             session_manager: Arc::new(session::SessionManager::new()),
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),

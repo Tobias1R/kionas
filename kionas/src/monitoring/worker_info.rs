@@ -25,8 +25,13 @@ pub struct WorkerSysInfoUpdateInput {
     pub hostname: String,
     pub warehouse_pool: Option<String>,
     pub metrics: SystemMetrics,
-    pub active_queries: u32,
-    pub total_queries_processed: u64,
+    pub active_stages: u32,
+    pub total_stages_executed: u64,
+    pub active_partitions: u32,
+    pub total_partitions_executed: u64,
+    pub bytes_scanned_total: u64,
+    pub total_stage_exec_ms: u64,
+    pub total_rows_produced: u64,
     pub worker_start_time: DateTime<Utc>,
 }
 
@@ -39,8 +44,13 @@ pub struct WorkerSysInfoUpdateInput {
 /// - `hostname`: Worker host name.
 /// - `warehouse_pool`: Optional worker pool assignment.
 /// - `metrics`: Current system metrics snapshot.
-/// - `active_queries`: Number of currently active queries.
-/// - `total_queries_processed`: Cumulative query count.
+/// - `active_stages`: Number of currently executing stages.
+/// - `total_stages_executed`: Cumulative completed stage count.
+/// - `active_partitions`: Number of currently executing partition tasks.
+/// - `total_partitions_executed`: Cumulative completed partition task count.
+/// - `bytes_scanned_total`: Cumulative bytes produced by stage artifacts.
+/// - `total_stage_exec_ms`: Cumulative stage runtime in milliseconds.
+/// - `total_rows_produced`: Cumulative operator output row count.
 /// - `worker_start_time`: Worker start timestamp.
 ///
 /// Output:
@@ -67,11 +77,17 @@ pub async fn update_worker_sys_info(
         memory_used_mb: input.metrics.memory_used_mb,
         memory_total_mb: input.metrics.memory_total_mb,
         cpu_percent: input.metrics.cpu_percent,
+        thread_count: input.metrics.thread_count,
         disk_used_mb: input.metrics.disk_used_mb,
         disk_total_mb: input.metrics.disk_total_mb,
         health_status: determine_worker_health(&input.metrics),
-        active_queries: input.active_queries,
-        total_queries_processed: input.total_queries_processed,
+        active_stages: input.active_stages,
+        total_stages_executed: input.total_stages_executed,
+        active_partitions: input.active_partitions,
+        total_partitions_executed: input.total_partitions_executed,
+        bytes_scanned_total: input.bytes_scanned_total,
+        total_stage_exec_ms: input.total_stage_exec_ms,
+        total_rows_produced: input.total_rows_produced,
         started_at: input.worker_start_time,
         uptime_seconds,
         updated_at: now,

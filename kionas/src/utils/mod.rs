@@ -1,4 +1,5 @@
 use chrono;
+use regex::Regex;
 use sysinfo::{ProcessExt, System, SystemExt};
 
 pub async fn resolve_hostname(
@@ -103,4 +104,35 @@ pub fn print_server_info() {
     log::info!("{}", line);
     log::info!("Starting Kionas server at: {}", chrono::Utc::now());
     log::info!("{}", line);
+}
+
+/// What: Produce a redacted SQL digest safe for dashboard history display.
+///
+/// Inputs:
+/// - `sql`: Raw SQL text.
+///
+/// Output:
+/// - SQL with string and numeric literals redacted, truncated to 200 chars.
+///
+/// Details:
+/// - Uses conservative regex substitutions and does not attempt full SQL parsing.
+/// - Prevents obvious literal leakage in monitoring payloads.
+pub fn redact_sql(sql: &str) -> String {
+    let single_quoted = match Regex::new(r"'(?:''|[^'])*'") {
+        Ok(regex) => regex,
+        Err(_) => return sql.chars().take(200).collect(),
+    };
+    let double_quoted = match Regex::new(r#""(?:""|[^"])*""#) {
+        Ok(regex) => regex,
+        Err(_) => return sql.chars().take(200).collect(),
+    };
+    let numeric = match Regex::new(r"\b\d+(?:\.\d+)?\b") {
+        Ok(regex) => regex,
+        Err(_) => return sql.chars().take(200).collect(),
+    };
+
+    let redacted_single = single_quoted.replace_all(sql, "'?'");
+    let redacted_double = double_quoted.replace_all(&redacted_single, "\"?\"");
+    let redacted_numeric = numeric.replace_all(&redacted_double, "?");
+    redacted_numeric.chars().take(200).collect()
 }

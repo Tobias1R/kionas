@@ -33,6 +33,9 @@ prost-types = "0.13.5"
 async-trait = "0.1.64"
 rustls = { version = "0.23.37", features = ["aws_lc_rs"] }
 sysinfo = "0.29"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-log = "0.2"
 
 [profile.dev]
 # Speed up local iteration by allowing more parallel codegen units.

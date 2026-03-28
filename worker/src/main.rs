@@ -1,4 +1,5 @@
 mod authz;
+mod counters;
 mod execution;
 mod flight;
 mod init;
@@ -23,6 +24,10 @@ use kionas::monitoring::init_redis_pool;
 use kionas::utils::resolve_hostname;
 use std::env;
 use std::error::Error;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "kionas worker process")]
@@ -77,6 +82,31 @@ fn resolve_worker_flight_port(default_worker_port: u16) -> u16 {
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(default_worker_port.saturating_add(1))
+}
+
+/// What: Initialize structured tracing for worker logs and spans.
+///
+/// Inputs:
+/// - None.
+///
+/// Output:
+/// - Installs global tracing subscriber and log facade bridge.
+///
+/// Details:
+/// - Uses `RUST_LOG` when present, otherwise defaults to `info`.
+/// - Emits JSON logs and span close events to include timing metadata.
+fn init_tracing() {
+    let _ = tracing_log::LogTracer::init();
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_span_events(FmtSpan::CLOSE),
+        )
+        .try_init();
 }
 
 /// What: Convert a Redis URL to target DB index 2 used for monitoring status data.
@@ -134,6 +164,7 @@ fn resolve_monitoring_redis_url() -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_tracing();
     let args = WorkerArgs::parse();
     let consul_url = env::var("CONSUL_URL").ok();
     let worker_id = resolve_worker_id(&args);
@@ -216,6 +247,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 shared_data.cluster_info.cluster_id.clone(),
                 env::var("WORKER_POOL_NAME").ok(),
                 worker_start_time,
+                shared_data.counters.clone(),
             );
         }
         Err(error) => {
