@@ -1,0 +1,49 @@
+{
+  "mode": "server",
+  "consul_host": "kionas-consul",
+  "cluster_name": "local-dev-cluster",
+  "cluster_id": "cluster-001",
+  "cluster_version": "1.0.0",
+  "logging": {
+    "level": "info",
+    "format": "text",
+    "output": "stdout"
+  },
+  "services": {
+     "security": {
+        "token": "jwt",
+        "secret": "That70sShow",
+        "data_path": "/workspace/data"
+      },
+      "warehouse": {
+        "host": "kionas-warehouse",
+        "port": 443,
+        "tls_cert": "/workspace/certs/Kionas-RootCA/warehouse.local.crt",
+        "tls_key": "/workspace/certs/Kionas-RootCA/warehouse.local.key"
+      },
+      "interops": {
+        "host": "kionas-warehouse",
+        "port": 50051,
+        "tls_cert": "/workspace/certs/Kionas-RootCA/warehouse.local.crt",
+        "tls_key": "/workspace/certs/Kionas-RootCA/warehouse.local.key",
+        "ca_cert": "/workspace/certs/Kionas-RootCA/Kionas-RootCA.crt",
+        "mode": "https",
+        "operation": "interops"
+      }
+  },
+  "session": {
+    "ttl_seconds": 604800,
+    "description": "Session expiration time in seconds. Default: 604800 (7 days). Can be overridden via KIONAS_SESSION_TTL_SECONDS environment variable."
+  },
+  "cleanup": {
+    "stage_exchange_retention_seconds": 259200,
+    "query_result_retention_seconds": 604800,
+    "transaction_staging_retention_seconds": 86400,
+    "cleanup_interval_seconds": 3600,
+    "description": "MinIO artifact cleanup policy. Retention in seconds: 3 days (exchanges), 7 days (results), 1 day (transactions). Interval: 1 hour. Set cleanup_interval_seconds to 0 to disable."
+  },
+  "metrics": {
+    "enabled": true,
+    "port": 9091
+  }
+}

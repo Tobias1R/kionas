@@ -45,3 +45,6 @@ runtime/*
 
 roadmaps
 roadmaps/*
+
+.VSCodeCounter
+.VSCodeCounter/*

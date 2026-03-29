@@ -1,0 +1,37 @@
+{
+  "mode": "metastore",
+  "consul_host": "kionas-consul",
+  "logging": {
+    "level": "info",
+    "format": "text",
+    "output": "stdout"
+  },
+  "services": {     
+      "interops": {
+        "host": "kionas-metastore",
+        "port": 443,
+        "tls_cert": "/workspace/certs/Kionas-RootCA/metastore.local.crt",
+        "tls_key": "/workspace/certs/Kionas-RootCA/metastore.local.key",
+        "ca_cert": "/workspace/certs/Kionas-RootCA/Kionas-RootCA.crt",
+        "mode": "https",
+        "operation": "metastore"
+      },
+      "postgres": {
+        "postgres_host": "kionas-postgres",
+        "postgres_port": 5432,
+        "postgres_user": "kionas",
+        "postgres_password": "kionas",
+        "postgres_db": "kionas_metastore"
+      }
+  },
+  "stage_extraction": {
+    "enable_exchange_pushdown": true,
+    "prefer_partition_strategy": "hash",
+    "bucket_count_multiplier": 4,
+    "max_partitions": 128
+  },
+  "session": {
+    "ttl_seconds": 604800,
+    "description": "Session expiration time in seconds. Default: 604800 (7 days). Can be overridden via KIONAS_SESSION_TTL_SECONDS environment variable."
+  }
+}

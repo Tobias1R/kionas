@@ -1,3 +1,9 @@
 pub(crate) mod constraints;
 pub(crate) mod ddl;
+pub(crate) mod insert_coercion;
+pub(crate) mod insert_contract;
+pub(crate) mod insert_record_batch;
+pub(crate) mod interops_pool;
 pub mod maestro;
+pub(crate) mod task_executor;
+pub(crate) mod tx_lifecycle;

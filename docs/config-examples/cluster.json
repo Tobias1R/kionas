@@ -1,0 +1,58 @@
+{
+  "cluster_name": "kionas-cluster",
+  "cluster_id": "kionas-cluster-001",
+  "cluster_version": "1.0.0",
+  "nodes": [
+    "kionas-worker1",
+    "kionas-worker2",
+    "kionas-worker3",
+    "kionas-worker4"
+  ],
+  "master": "https://kionas-warehouse:50051",
+  "storage": {
+    "storage_type": "minio",
+    "bucket": "warehouse",
+    "region": "us-east-1",
+    "endpoint": "http://kionas-minio:9000",
+    "access_key": "root",
+    "secret_key": "rootpassword"
+  },
+  "deltalake": {
+    "enabled": true,
+    "root_path": "deltalake",
+    "storage": {
+      "storage_type": "minio",
+      "bucket": "warehouse",
+      "region": "us-east-1",
+      "endpoint": "http://kionas-minio:9000",
+      "access_key": "root",
+      "secret_key": "rootpassword"
+    }
+  },
+  "warehouse_pools_types": [
+    {
+      "name": "compute_xs",
+      "tier": "xs",
+      "min_members": 1,
+      "max_members": 1,
+      "default": false,
+      "description": "Single-worker pool for light workloads"
+    },
+    {
+      "name": "compute_small",
+      "tier": "small",
+      "min_members": 1,
+      "max_members": 3,
+      "default": false,
+      "description": "Small pool for department queries"
+    },
+    {
+      "name": "compute_xl",
+      "tier": "xl",
+      "min_members": 1,
+      "max_members": 10,
+      "default": true,
+      "description": "Large pool for ETL and heavy analytics"
+    }
+  ]
+}

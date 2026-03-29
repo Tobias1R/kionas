@@ -1,0 +1,47 @@
+{
+  "mode": "worker",
+  "consul_host": "kionas-consul",
+  "cluster_name": "local-dev-cluster",
+  "cluster_id": "cluster-001",
+  "cluster_version": "1.0.0",
+  "pool": "compute_small",
+  "logging": {
+    "level": "info",
+    "format": "text",
+    "output": "stdout"
+  },
+  "services": {     
+      "interops": {
+        "host": "kionas-worker4",
+        "port": 50051,
+        "tls_cert": "/workspace/certs/Kionas-RootCA/kionas-worker4.crt",
+        "tls_key": "/workspace/certs/Kionas-RootCA/kionas-worker4.key",
+        "ca_cert": "/workspace/certs/Kionas-RootCA/Kionas-RootCA.crt",
+        "mode": "https",
+        "operation": "interops"
+      }
+  },
+  "execution": {
+    "router": {
+      "enabled": true,
+      "max_destination_workers": 16,
+      "partition_key_hash": "fnv",
+      "retry_backoff_ms": 100,
+      "retry_max_attempts": 3,
+      "network_timeout_ms": 30000
+    }
+  },
+  "memory_tracking": {
+    "enabled": true,
+    "spill_threshold_mb": 512,
+    "sample_interval_batches": 10
+  },
+  "session": {
+    "ttl_seconds": 604800,
+    "description": "Session expiration time in seconds. Default: 604800 (7 days). Can be overridden via KIONAS_SESSION_TTL_SECONDS environment variable."
+  },
+  "metrics": {
+    "enabled": true,
+    "port": 9092
+  }
+}
