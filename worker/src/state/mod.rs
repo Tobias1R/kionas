@@ -5,6 +5,7 @@ use crate::storage::StorageProvider;
 use crate::storage::object_store_pool::ObjectStoreManager;
 use arrow::record_batch::RecordBatch;
 use deadpool::managed::Pool;
+use deltalake::DeltaTable;
 use kionas::constants::{
     REDIS_DB_STATUS, REDIS_POOL_SIZE_ENV, REDIS_TASK_RESULT_KEY_PREFIX,
     REDIS_TASK_RESULT_TTL_SECONDS, REDIS_URL_ENV,
@@ -55,6 +56,23 @@ pub struct WorkerInformation {
     pub ca_cert_path: String,
 }
 
+/// What: Cached delta table state shared across write requests for one table URI.
+///
+/// Inputs:
+/// - table: Per-table lock guarding update_state/commit sequence.
+/// - cached_at: Last refresh timestamp used for TTL eviction.
+///
+/// Output:
+/// - Cache entry stored in worker shared state.
+///
+/// Details:
+/// - The inner mutex serializes writers for the same table on a worker.
+#[derive(Clone)]
+pub struct CachedDeltaTable {
+    pub table: Arc<tokio::sync::Mutex<DeltaTable>>,
+    pub cached_at: Instant,
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct SharedData {
     pub worker_info: WorkerInformation,
@@ -69,6 +87,8 @@ pub struct SharedData {
     pub master_pool: Arc<tokio::sync::Mutex<Option<Arc<Pool<InteropsManager>>>>>,
     #[serde(skip)]
     pub object_store_pool: Arc<tokio::sync::Mutex<Option<Arc<Pool<ObjectStoreManager>>>>>,
+    #[serde(skip)]
+    pub delta_table_cache: Arc<tokio::sync::RwLock<HashMap<String, CachedDeltaTable>>>,
     #[serde(skip)]
     pub task_result_locations: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
     #[serde(skip)]
@@ -291,6 +311,7 @@ impl SharedData {
             storage_provider: None,
             master_pool: Arc::new(tokio::sync::Mutex::new(None)),
             object_store_pool: Arc::new(tokio::sync::Mutex::new(None)),
+            delta_table_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             task_result_locations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             stage_streaming_state: StageStreamingState::default(),
             redis_pool: Arc::new(tokio::sync::Mutex::new(None)),

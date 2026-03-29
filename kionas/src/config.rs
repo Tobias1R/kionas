@@ -11,6 +11,11 @@ const DEFAULT_OBJECT_STORE_POOL_SIZE: usize = 20;
 const DEFAULT_INTEROPS_POOL_SIZE: usize = 20;
 const DEFAULT_WORKER_EXECUTE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_CONSTRAINT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_DELTA_CACHE_TTL_SECS: u64 = 60;
+const DEFAULT_DELTA_COMMIT_MAX_RETRIES: u32 = 5;
+const DEFAULT_MULTIPART_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024;
+const DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+const DEFAULT_CIRCUIT_BREAKER_OPEN_DURATION_SECS: u64 = 30;
 
 /// Typed application config used by all binaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +50,8 @@ pub struct AppConfig {
     pub worker_execute_timeout_secs: Option<u64>,
     #[serde(default)]
     pub constraint_cache_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 /// What: Worker write-path performance tuning values loaded from config.
@@ -62,6 +69,9 @@ pub struct AppConfig {
 pub struct WritePerformanceConfig {
     pub object_store_pool_size: usize,
     pub interops_pool_size: usize,
+    pub delta_cache_ttl_secs: u64,
+    pub delta_commit_max_retries: u32,
+    pub multipart_threshold_bytes: u64,
 }
 
 impl Default for WritePerformanceConfig {
@@ -69,6 +79,35 @@ impl Default for WritePerformanceConfig {
         Self {
             object_store_pool_size: DEFAULT_OBJECT_STORE_POOL_SIZE,
             interops_pool_size: DEFAULT_INTEROPS_POOL_SIZE,
+            delta_cache_ttl_secs: DEFAULT_DELTA_CACHE_TTL_SECS,
+            delta_commit_max_retries: DEFAULT_DELTA_COMMIT_MAX_RETRIES,
+            multipart_threshold_bytes: DEFAULT_MULTIPART_THRESHOLD_BYTES,
+        }
+    }
+}
+
+/// What: Server-side worker dispatch circuit-breaker configuration.
+///
+/// Inputs:
+/// - `failure_threshold`: Consecutive worker failures before opening the circuit.
+/// - `open_duration_secs`: Time window to keep the circuit open once tripped.
+///
+/// Output:
+/// - Deserialized server circuit-breaker settings.
+///
+/// Details:
+/// - Defaults are applied by `AppConfig::resolved_circuit_breaker_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: u32,
+    pub open_duration_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            open_duration_secs: DEFAULT_CIRCUIT_BREAKER_OPEN_DURATION_SECS,
         }
     }
 }
@@ -176,6 +215,20 @@ impl AppConfig {
     pub fn resolved_constraint_cache_ttl_secs(&self) -> u64 {
         self.constraint_cache_ttl_secs
             .unwrap_or(DEFAULT_CONSTRAINT_CACHE_TTL_SECS)
+    }
+
+    /// What: Resolve server circuit-breaker configuration used by worker dispatch.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Effective `CircuitBreakerConfig` with safe defaults.
+    ///
+    /// Details:
+    /// - Missing config falls back to 3 failures and 30 seconds open duration.
+    pub fn resolved_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        self.circuit_breaker.clone().unwrap_or_default()
     }
 }
 
