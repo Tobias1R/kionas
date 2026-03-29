@@ -49,6 +49,8 @@ url = "2"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
+prometheus-client.workspace = true
+axum.workspace = true
 
 
 [build-dependencies]

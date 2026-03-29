@@ -1649,14 +1649,28 @@ pub(crate) async fn execute_query_task(
         .counters
         .bytes_scanned_total
         .fetch_add(artifact_bytes_total, std::sync::atomic::Ordering::Relaxed);
-    shared.counters.total_stage_exec_ms.fetch_add(
-        u64::try_from(stage_runtime_ms).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    shared.counters.total_rows_produced.fetch_add(
-        u64::try_from(operator_rows_out).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    shared
+        .prometheus_metrics
+        .inc_bytes_scanned_total(artifact_bytes_total);
+    let stage_runtime_ms_u64 = u64::try_from(stage_runtime_ms).unwrap_or(u64::MAX);
+    shared
+        .counters
+        .total_stage_exec_ms
+        .fetch_add(stage_runtime_ms_u64, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .prometheus_metrics
+        .inc_stage_exec_ms_total(stage_runtime_ms_u64);
+    shared
+        .prometheus_metrics
+        .observe_stage_exec_ms(stage_runtime_ms_u64);
+    let operator_rows_out_u64 = u64::try_from(operator_rows_out).unwrap_or(u64::MAX);
+    shared
+        .counters
+        .total_rows_produced
+        .fetch_add(operator_rows_out_u64, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .prometheus_metrics
+        .inc_rows_produced_total(operator_rows_out_u64);
     log::info!(
         "{}",
         format_stage_runtime_event(

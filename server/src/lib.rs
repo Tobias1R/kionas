@@ -5,6 +5,7 @@ pub mod consul;
 pub mod counters;
 pub mod handlers;
 pub mod janitor;
+pub mod metrics;
 pub mod parser;
 pub mod planner;
 pub mod providers;

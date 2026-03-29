@@ -4,6 +4,7 @@ mod execution;
 mod flight;
 mod init;
 mod interops;
+mod metrics;
 mod monitoring;
 mod services;
 mod state;
@@ -82,6 +83,14 @@ fn resolve_worker_flight_port(default_worker_port: u16) -> u16 {
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|p| *p > 0)
         .unwrap_or(default_worker_port.saturating_add(1))
+}
+
+fn resolve_worker_metrics_port(default_port: u16) -> u16 {
+    std::env::var("KIONAS_WORKER_METRICS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(default_port)
 }
 
 /// What: Initialize structured tracing for worker logs and spans.
@@ -195,6 +204,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("-----------------------------");
     // debug worker config
     println!("Worker config: {:?}", &app_cfg);
+    let metrics_cfg = app_cfg.resolved_metrics_config();
     let interops = app_cfg
         .services
         .interops
@@ -235,6 +245,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     );
     let mut shared_data = crate::state::SharedData::new(worker_info, cluster_info);
 
+    let metrics_port = resolve_worker_metrics_port(metrics_cfg.port);
+    if metrics_cfg.enabled {
+        let metrics_registry = shared_data.prometheus_metrics.registry.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                crate::metrics::serve_metrics_endpoint(metrics_registry, metrics_port).await
+            {
+                log::warn!("worker metrics endpoint failed: {}", error);
+            }
+        });
+        log::info!("worker metrics endpoint enabled on port {}", metrics_port);
+    } else {
+        log::info!("worker metrics endpoint disabled by config");
+    }
+
     let worker_start_time = Utc::now();
     let redis_url = resolve_monitoring_redis_url();
 
@@ -248,6 +273,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 env::var("WORKER_POOL_NAME").ok(),
                 worker_start_time,
                 shared_data.counters.clone(),
+                shared_data.prometheus_metrics.clone(),
             );
         }
         Err(error) => {

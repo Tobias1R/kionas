@@ -31,6 +31,71 @@ pub struct AppConfig {
     // cleanup configuration
     #[serde(default)]
     pub cleanup: Option<CleanupConfig>,
+    // prometheus metrics endpoint configuration
+    #[serde(default)]
+    pub metrics: Option<MetricsConfig>,
+}
+
+/// What: Metrics endpoint configuration shared by server and worker processes.
+///
+/// Inputs:
+/// - `enabled`: Whether the Prometheus endpoint should be started.
+/// - `port`: TCP port used by the metrics HTTP endpoint.
+///
+/// Output:
+/// - Deserialized metrics settings consumed by binary startup wiring.
+///
+/// Details:
+/// - Defaults are mode-aware through `default_for_mode`.
+/// - Environment overrides are applied by the binaries at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl MetricsConfig {
+    /// What: Build default metrics configuration based on binary mode.
+    ///
+    /// Inputs:
+    /// - `mode`: App mode string such as server or worker.
+    ///
+    /// Output:
+    /// - Metrics configuration with enabled endpoint and mode-specific port.
+    ///
+    /// Details:
+    /// - Server default port: 9091.
+    /// - Worker default port: 9092.
+    /// - Unknown modes fall back to server default.
+    pub fn default_for_mode(mode: &str) -> Self {
+        let port = if mode.eq_ignore_ascii_case("worker") {
+            9092
+        } else {
+            9091
+        };
+        Self {
+            enabled: true,
+            port,
+        }
+    }
+}
+
+impl AppConfig {
+    /// What: Resolve effective metrics configuration for this app config.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Effective `MetricsConfig` with mode-specific defaults when omitted.
+    ///
+    /// Details:
+    /// - If `metrics` is absent in config payload, defaults are derived from `mode`.
+    pub fn resolved_metrics_config(&self) -> MetricsConfig {
+        self.metrics
+            .clone()
+            .unwrap_or_else(|| MetricsConfig::default_for_mode(self.mode.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

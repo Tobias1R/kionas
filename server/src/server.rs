@@ -11,6 +11,7 @@ use kionas::config::AppConfig;
 
 use crate::auth_setup;
 use crate::handlers;
+use crate::metrics;
 use tokio::sync::Mutex;
 
 use crate::services::interops_service_server::InteropsService;
@@ -66,6 +67,30 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     };
 
     let shared_data: SharedData = Arc::new(Mutex::new(SharedState::new(config.clone())));
+
+    let resolved_metrics_cfg = config.resolved_metrics_config();
+    let metrics_port = std::env::var("KIONAS_METRICS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(resolved_metrics_cfg.port);
+
+    if resolved_metrics_cfg.enabled {
+        let prometheus_registry = {
+            let state = shared_data.lock().await;
+            state.prometheus_metrics.registry.clone()
+        };
+        tokio::spawn(async move {
+            if let Err(error) =
+                metrics::serve_metrics_endpoint(prometheus_registry, metrics_port).await
+            {
+                log::warn!("server metrics endpoint failed: {}", error);
+            }
+        });
+        log::info!("server metrics endpoint enabled on port {}", metrics_port);
+    } else {
+        log::info!("server metrics endpoint disabled by config");
+    }
 
     let consul_addr = std::env::var("CONSUL_URL").ok();
     let cluster_config = kionas::config::load_cluster_config(consul_addr.as_deref()).await?;

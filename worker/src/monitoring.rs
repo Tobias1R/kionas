@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::counters::WorkerCounters;
+use crate::metrics::WorkerPrometheusMetrics;
 use kionas::get_local_hostname;
 use kionas::monitoring::{
     WorkerSysInfoUpdateInput, collect_system_metrics, update_worker_sys_info,
@@ -30,6 +31,7 @@ pub fn spawn_monitoring_task(
     warehouse_pool: Option<String>,
     worker_start_time: DateTime<Utc>,
     counters: Arc<WorkerCounters>,
+    prometheus_metrics: Arc<WorkerPrometheusMetrics>,
 ) {
     let interval_secs = std::env::var("KIONAS_WORKER_UPDATE_INTERVAL_SECS")
         .ok()
@@ -45,6 +47,11 @@ pub fn spawn_monitoring_task(
 
             let metrics = collect_system_metrics();
             let snapshot = counters.snapshot();
+            prometheus_metrics.set_active_stages(snapshot.active_stages);
+            prometheus_metrics.set_active_partitions(snapshot.active_partitions);
+            prometheus_metrics.set_cpu_percent(metrics.cpu_percent);
+            prometheus_metrics.set_memory_used_mb(metrics.memory_used_mb);
+            prometheus_metrics.set_thread_count(metrics.thread_count);
             let hostname = get_local_hostname().unwrap_or_else(|| "unknown-worker".to_string());
             let input = WorkerSysInfoUpdateInput {
                 worker_id: worker_id.clone(),

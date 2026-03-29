@@ -1,5 +1,6 @@
 use crate::counters::WorkerCounters;
 use crate::interops::manager::InteropsManager;
+use crate::metrics::WorkerPrometheusMetrics;
 use crate::storage::StorageProvider;
 use crate::storage::object_store_pool::ObjectStoreManager;
 use arrow::record_batch::RecordBatch;
@@ -54,12 +55,14 @@ pub struct WorkerInformation {
     pub ca_cert_path: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Default)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct SharedData {
     pub worker_info: WorkerInformation,
     pub cluster_info: ClusterInfo,
     #[serde(skip)]
     pub counters: Arc<WorkerCounters>,
+    #[serde(skip, default = "default_prometheus_metrics")]
+    pub prometheus_metrics: Arc<WorkerPrometheusMetrics>,
     #[serde(skip)]
     pub storage_provider: Option<Arc<dyn StorageProvider + Send + Sync>>,
     #[serde(skip)]
@@ -279,10 +282,12 @@ impl fmt::Debug for SharedData {
 
 impl SharedData {
     pub fn new(worker_info: WorkerInformation, cluster_info: ClusterInfo) -> Self {
+        let worker_id = worker_info.worker_id.clone();
         SharedData {
             worker_info,
             cluster_info,
             counters: WorkerCounters::new(),
+            prometheus_metrics: WorkerPrometheusMetrics::new(worker_id.as_str()),
             storage_provider: None,
             master_pool: Arc::new(tokio::sync::Mutex::new(None)),
             object_store_pool: Arc::new(tokio::sync::Mutex::new(None)),
@@ -525,4 +530,14 @@ impl SharedData {
             }
         }
     }
+}
+
+impl Default for SharedData {
+    fn default() -> Self {
+        Self::new(WorkerInformation::default(), ClusterInfo::default())
+    }
+}
+
+fn default_prometheus_metrics() -> Arc<WorkerPrometheusMetrics> {
+    WorkerPrometheusMetrics::new("worker")
 }

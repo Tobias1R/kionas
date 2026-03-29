@@ -36,6 +36,8 @@ sysinfo = "0.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-log = "0.2"
+prometheus-client = "0.22"
+axum = "0.8.4"
 
 [profile.dev]
 # Speed up local iteration by allowing more parallel codegen units.

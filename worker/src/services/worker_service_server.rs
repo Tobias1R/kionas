@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::counters::{PartitionGuard, StageGuard};
+use crate::metrics::{PrometheusPartitionGuard, PrometheusStageGuard};
 use crate::state::SharedData;
 use std::sync::Arc;
 
@@ -342,11 +343,23 @@ impl worker_service::worker_service_server::WorkerService for WorkerService {
         }
 
         let _stage_guard = StageGuard::acquire(&self.shared_data.counters);
+        let _prometheus_stage_guard =
+            PrometheusStageGuard::acquire(self.shared_data.prometheus_metrics.clone());
         let _partition_guard =
             if req.tasks.iter().any(|task| {
                 task.operation.eq_ignore_ascii_case("query") && is_staged_query_task(task)
             }) {
                 Some(PartitionGuard::acquire(&self.shared_data.counters))
+            } else {
+                None
+            };
+        let _prometheus_partition_guard =
+            if req.tasks.iter().any(|task| {
+                task.operation.eq_ignore_ascii_case("query") && is_staged_query_task(task)
+            }) {
+                Some(PrometheusPartitionGuard::acquire(
+                    self.shared_data.prometheus_metrics.clone(),
+                ))
             } else {
                 None
             };

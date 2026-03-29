@@ -5,6 +5,7 @@ pub(crate) mod shared;
 pub(crate) mod utility;
 
 use crate::counters::{QueryGuard, QueryOutcome};
+use crate::metrics::{PrometheusQueryGuard, PrometheusQueryStatus};
 use crate::parser::datafusion_sql::sqlparser::ast::Statement;
 use crate::services::request_context::RequestContext;
 use crate::warehouse::state::SharedData;
@@ -220,17 +221,21 @@ pub async fn handle_statement(
 
     let query_start = should_track.then(Instant::now);
 
-    let (query_counters, session_manager) = if should_track {
+    let (query_counters, session_manager, prometheus_metrics) = if should_track {
         let shared_data_ref = shared_data.lock().await;
         (
             Some(shared_data_ref.query_counters.clone()),
             Some(shared_data_ref.session_manager.clone()),
+            Some(shared_data_ref.prometheus_metrics.clone()),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let mut query_guard = query_counters.as_ref().map(QueryGuard::acquire);
+    let mut prometheus_query_guard = prometheus_metrics
+        .as_ref()
+        .map(|metrics| PrometheusQueryGuard::acquire(metrics.clone(), ctx.warehouse_name.as_str()));
 
     let result = match stmt {
         Statement::Insert(insert_stmt) => {
@@ -338,6 +343,12 @@ pub async fn handle_statement(
         && succeeded
     {
         guard.outcome = QueryOutcome::Succeeded;
+    }
+
+    if let Some(guard) = prometheus_query_guard.as_mut()
+        && succeeded
+    {
+        guard.status = PrometheusQueryStatus::Success;
     }
 
     let duration_ms = query_start

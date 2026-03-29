@@ -660,7 +660,7 @@ async fn collect_server_stats(
     shared_data: &SharedData,
     server_stats_accumulator: &mut ServerStatsAccumulator,
 ) -> ServerStatsPayload {
-    let (counter, warehouses, worker_pools, sessions, query_counters) = {
+    let (counter, warehouses, worker_pools, sessions, query_counters, prometheus_metrics) = {
         let shared = shared_data.lock().await;
         let counter = *shared.counter.lock().await;
         let warehouses_map = shared.warehouses.lock().await;
@@ -669,7 +669,15 @@ async fn collect_server_stats(
         let worker_pools = worker_pools_map.keys().cloned().collect::<Vec<_>>();
         let sessions = shared.session_manager.list_sessions().await.len();
         let query_counters = Arc::clone(&shared.query_counters);
-        (counter, warehouses, worker_pools, sessions, query_counters)
+        let prometheus_metrics = Arc::clone(&shared.prometheus_metrics);
+        (
+            counter,
+            warehouses,
+            worker_pools,
+            sessions,
+            query_counters,
+            prometheus_metrics,
+        )
     };
 
     let query_snapshot = query_counters.snapshot();
@@ -698,6 +706,10 @@ async fn collect_server_stats(
     };
 
     let cpu_usage_percent = sys.global_cpu_info().cpu_usage();
+
+    prometheus_metrics.set_sessions_active(sessions);
+    prometheus_metrics.set_process_cpu_percent(cpu_usage_percent);
+    prometheus_metrics.set_process_memory_mb(memory_mb);
 
     ServerStatsPayload {
         counter,

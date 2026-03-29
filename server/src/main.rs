@@ -11,6 +11,7 @@ mod providers;
 //mod core;
 mod handlers;
 mod janitor;
+mod metrics;
 mod parser;
 mod server;
 mod services;

@@ -1,4 +1,5 @@
 use crate::counters::ServerCounters;
+use crate::metrics::ServerPrometheusMetrics;
 use crate::session;
 use crate::tasks::TaskManager;
 use crate::warehouse::Warehouse;
@@ -27,6 +28,7 @@ Must be serializable and sendable between threads
 pub struct SharedState {
     pub counter: Arc<AsyncMutex<u32>>,
     pub query_counters: Arc<ServerCounters>,
+    pub prometheus_metrics: Arc<ServerPrometheusMetrics>,
     pub warehouses: Arc<AsyncMutex<HashMap<String, Warehouse>>>,
     pub session_manager: Arc<session::SessionManager>,
     pub worker_pools: Arc<AsyncMutex<HashMap<String, WorkerPool>>>,
@@ -44,6 +46,7 @@ impl SharedState {
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
             query_counters: ServerCounters::new(),
+            prometheus_metrics: ServerPrometheusMetrics::new(),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
             session_manager: Arc::new(session::SessionManager::new()),
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),
@@ -63,6 +66,7 @@ impl Default for SharedState {
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
             query_counters: ServerCounters::new(),
+            prometheus_metrics: ServerPrometheusMetrics::new(),
             warehouses: Arc::new(AsyncMutex::new(HashMap::new())),
             session_manager: Arc::new(session::SessionManager::new()),
             worker_pools: Arc::new(AsyncMutex::new(worker_pools)),

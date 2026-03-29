@@ -3,6 +3,7 @@ pub mod counters;
 pub mod execution;
 pub mod flight;
 pub mod interops;
+pub mod metrics;
 pub mod services;
 pub mod state;
 pub mod storage;
