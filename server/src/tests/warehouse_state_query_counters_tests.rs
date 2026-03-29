@@ -33,6 +33,9 @@ fn shared_state_new_initializes_query_counters() {
         session: None,
         cleanup: None,
         metrics: None,
+        write_performance: None,
+        worker_execute_timeout_secs: None,
+        constraint_cache_ttl_secs: None,
     };
     let shared_state = SharedState::new(config);
 

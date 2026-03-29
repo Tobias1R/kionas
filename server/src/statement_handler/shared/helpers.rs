@@ -554,12 +554,14 @@ pub async fn resolve_session_pool_context(
 }
 
 /// Create a Task in TaskManager and mark it Scheduled.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_task_and_schedule(
     shared_data: &SharedData,
     query_id: String,
     session_id: &str,
     operation: &str,
     payload: String,
+    raw_payload: Option<Vec<u8>>,
     params: std::collections::HashMap<String, String>,
     stage_metadata: Option<crate::tasks::StageTaskMetadata>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -568,11 +570,12 @@ pub async fn build_task_and_schedule(
         state.task_manager.clone()
     };
     let task_id = task_manager
-        .create_task(
+        .create_task_with_raw_payload(
             query_id,
             session_id.to_string(),
             operation.to_string(),
             payload,
+            raw_payload.unwrap_or_default(),
             params,
         )
         .await;
@@ -655,6 +658,7 @@ pub async fn run_task_for_input(
         session_id,
         operation,
         payload,
+        None,
         std::collections::HashMap::new(),
         None,
         None,
@@ -670,6 +674,7 @@ pub async fn run_task_for_input_with_params(
     session_id: &str,
     operation: &str,
     payload: String,
+    raw_payload: Option<Vec<u8>>,
     params: std::collections::HashMap<String, String>,
     stage_metadata: Option<crate::tasks::StageTaskMetadata>,
     auth_ctx: Option<&DispatchAuthContext>,
@@ -791,6 +796,7 @@ pub async fn run_task_for_input_with_params(
         session_id,
         operation,
         payload,
+        raw_payload,
         params,
         stage_metadata,
     )
@@ -916,6 +922,7 @@ pub async fn run_stage_groups_for_input(
                 &session_id_owned,
                 &group.operation,
                 group.payload.clone(),
+                None,
                 group.params.clone(),
                 Some(crate::tasks::StageTaskMetadata {
                     stage_id: group.stage_id,

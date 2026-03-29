@@ -4,7 +4,6 @@ use crate::parser::datafusion_sql::sqlparser::ast::{
 use crate::providers::{KionasMetastoreResolver, normalize_identifier};
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
-use base64::Engine;
 use prost::Message;
 use std::collections::HashMap;
 
@@ -224,12 +223,12 @@ mod insert_scalar_proto {
 /// - `table_name`: Canonical table name computed by the server.
 ///
 /// Output:
-/// - Base64 text that encodes protobuf bytes for worker task input.
+/// - Raw protobuf bytes for worker task payload.
 ///
 /// Details:
 /// - Supports only `INSERT ... VALUES (...)` forms.
 /// - Preserves scalar intent across int, bool, string, and null values.
-fn build_insert_payload_binary(insert_stmt: &Insert, table_name: &str) -> Result<String, String> {
+fn build_insert_payload_bytes(insert_stmt: &Insert, table_name: &str) -> Result<Vec<u8>, String> {
     let source = insert_stmt
         .source
         .as_ref()
@@ -297,8 +296,16 @@ fn build_insert_payload_binary(insert_stmt: &Insert, table_name: &str) -> Result
         rows,
     };
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.encode_to_vec());
-    Ok(encoded)
+    Ok(payload.encode_to_vec())
+}
+
+async fn resolve_worker_execute_timeout_secs(shared_data: &SharedData) -> u64 {
+    let state = shared_data.lock().await;
+    state
+        .config
+        .as_ref()
+        .map(|cfg| cfg.resolved_worker_execute_timeout_secs())
+        .unwrap_or(120)
 }
 
 /// What: Load ordered table columns and NOT NULL columns from metastore metadata.
@@ -320,6 +327,17 @@ async fn load_table_constraint_columns(
     schema: &str,
     table: &str,
 ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), String> {
+    {
+        let state = shared_data.lock().await;
+        if let Some(cached) = state.constraint_cache.get(database, schema, table).await {
+            return Ok((
+                cached.table_columns,
+                cached.not_null_columns,
+                cached.column_type_hints,
+            ));
+        }
+    }
+
     let resolver = KionasMetastoreResolver::new(shared_data.clone(), 8)?;
     let metadata = resolver.resolve_relation(database, schema, table).await?;
 
@@ -342,6 +360,21 @@ async fn load_table_constraint_columns(
         if !key.is_empty() {
             column_type_hints.insert(key, column.data_type.clone());
         }
+    }
+
+    {
+        let state = shared_data.lock().await;
+        state
+            .constraint_cache
+            .insert(
+                database,
+                schema,
+                table,
+                table_columns.clone(),
+                required_columns.clone(),
+                column_type_hints.clone(),
+            )
+            .await;
     }
 
     Ok((table_columns, required_columns, column_type_hints))
@@ -383,7 +416,7 @@ pub(crate) async fn handle_insert_statement(
     let table_name =
         canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
     params.insert("table_name".to_string(), table_name.clone());
-    let payload = match build_insert_payload_binary(insert_stmt, &table_name) {
+    let payload = match build_insert_payload_bytes(insert_stmt, &table_name) {
         Ok(value) => value,
         Err(e) => {
             let err = e.to_string();
@@ -391,6 +424,7 @@ pub(crate) async fn handle_insert_statement(
             return format_outcome(category, code, normalize_insert_error_message(code, &err));
         }
     };
+    let timeout_secs = resolve_worker_execute_timeout_secs(shared_data).await;
 
     if let Some((database, schema, table)) = parse_table_namespace(&table_name) {
         match load_table_constraint_columns(shared_data, &database, &schema, &table).await {
@@ -422,11 +456,12 @@ pub(crate) async fn handle_insert_statement(
         shared_data,
         session_id,
         "insert",
-        payload,
+        String::new(),
+        Some(payload),
         params,
         None,
         None,
-        30,
+        timeout_secs,
     )
     .await
     {

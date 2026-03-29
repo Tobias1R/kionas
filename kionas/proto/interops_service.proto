@@ -10,6 +10,8 @@ service InteropsService {
     rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
     // Worker reports updates about tasks previously scheduled by the server
     rpc TaskUpdate (TaskUpdateRequest) returns (TaskUpdateResponse);
+    // Invalidate cached relation schema in server-side constraint cache
+    rpc InvalidateTableSchema (InvalidateTableSchemaRequest) returns (InvalidateTableSchemaResponse);
     
 }
 
@@ -47,5 +49,15 @@ message TaskUpdateRequest {
 }
 
 message TaskUpdateResponse {
+    string status = 1;
+}
+
+message InvalidateTableSchemaRequest {
+    string database = 1;
+    string schema = 2;
+    string table = 3;
+}
+
+message InvalidateTableSchemaResponse {
     string status = 1;
 }

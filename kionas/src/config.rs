@@ -7,6 +7,11 @@ use std::fs;
 
 use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 
+const DEFAULT_OBJECT_STORE_POOL_SIZE: usize = 20;
+const DEFAULT_INTEROPS_POOL_SIZE: usize = 20;
+const DEFAULT_WORKER_EXECUTE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_CONSTRAINT_CACHE_TTL_SECS: u64 = 300;
+
 /// Typed application config used by all binaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -34,6 +39,38 @@ pub struct AppConfig {
     // prometheus metrics endpoint configuration
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub write_performance: Option<WritePerformanceConfig>,
+    #[serde(default)]
+    pub worker_execute_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub constraint_cache_ttl_secs: Option<u64>,
+}
+
+/// What: Worker write-path performance tuning values loaded from config.
+///
+/// Inputs:
+/// - `object_store_pool_size`: Max concurrent object-store clients in worker write path.
+/// - `interops_pool_size`: Max concurrent interops clients for task updates.
+///
+/// Output:
+/// - Deserialized write performance configuration used by worker runtime.
+///
+/// Details:
+/// - Missing values are resolved via `AppConfig::resolved_write_performance_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WritePerformanceConfig {
+    pub object_store_pool_size: usize,
+    pub interops_pool_size: usize,
+}
+
+impl Default for WritePerformanceConfig {
+    fn default() -> Self {
+        Self {
+            object_store_pool_size: DEFAULT_OBJECT_STORE_POOL_SIZE,
+            interops_pool_size: DEFAULT_INTEROPS_POOL_SIZE,
+        }
+    }
 }
 
 /// What: Metrics endpoint configuration shared by server and worker processes.
@@ -95,6 +132,50 @@ impl AppConfig {
         self.metrics
             .clone()
             .unwrap_or_else(|| MetricsConfig::default_for_mode(self.mode.as_str()))
+    }
+
+    /// What: Resolve worker write performance config with safe defaults.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Effective `WritePerformanceConfig` for worker pool sizing.
+    ///
+    /// Details:
+    /// - Falls back to object/interops pool size defaults of 20.
+    pub fn resolved_write_performance_config(&self) -> WritePerformanceConfig {
+        self.write_performance.clone().unwrap_or_default()
+    }
+
+    /// What: Resolve per-worker execute timeout used by server dispatch.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Effective timeout in seconds.
+    ///
+    /// Details:
+    /// - Defaults to 120 seconds when unset.
+    pub fn resolved_worker_execute_timeout_secs(&self) -> u64 {
+        self.worker_execute_timeout_secs
+            .unwrap_or(DEFAULT_WORKER_EXECUTE_TIMEOUT_SECS)
+    }
+
+    /// What: Resolve table-constraint cache TTL for server-side metadata cache.
+    ///
+    /// Inputs:
+    /// - None.
+    ///
+    /// Output:
+    /// - Effective TTL in seconds.
+    ///
+    /// Details:
+    /// - Defaults to 300 seconds when unset.
+    pub fn resolved_constraint_cache_ttl_secs(&self) -> u64 {
+        self.constraint_cache_ttl_secs
+            .unwrap_or(DEFAULT_CONSTRAINT_CACHE_TTL_SECS)
     }
 }
 

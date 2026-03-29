@@ -40,6 +40,7 @@ pub struct Task {
     pub session_id: String,
     pub operation: String,
     pub payload: String,
+    pub raw_payload: Vec<u8>,
     pub params: HashMap<String, String>,
     pub stage_metadata: Option<StageTaskMetadata>,
     pub state: TaskState,
@@ -58,6 +59,7 @@ impl Task {
         session_id: String,
         operation: String,
         payload: String,
+        raw_payload: Vec<u8>,
         params: HashMap<String, String>,
     ) -> Self {
         Task {
@@ -66,6 +68,7 @@ impl Task {
             session_id,
             operation,
             payload,
+            raw_payload,
             params,
             stage_metadata: None,
             state: TaskState::Pending,
@@ -108,6 +111,7 @@ impl TaskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn create_task(
         &self,
         query_id: String,
@@ -116,7 +120,34 @@ impl TaskManager {
         payload: String,
         params: HashMap<String, String>,
     ) -> String {
-        let t = Task::new(query_id, session_id, operation, payload, params);
+        self.create_task_with_raw_payload(
+            query_id,
+            session_id,
+            operation,
+            payload,
+            Vec::new(),
+            params,
+        )
+        .await
+    }
+
+    pub async fn create_task_with_raw_payload(
+        &self,
+        query_id: String,
+        session_id: String,
+        operation: String,
+        payload: String,
+        raw_payload: Vec<u8>,
+        params: HashMap<String, String>,
+    ) -> String {
+        let t = Task::new(
+            query_id,
+            session_id,
+            operation,
+            payload,
+            raw_payload,
+            params,
+        );
         let id = t.id.clone();
         let at = Arc::new(Mutex::new(t));
         let mut map = self.tasks.write().await;
@@ -640,7 +671,11 @@ pub fn task_to_request(
         session_id: task.session_id.clone(),
         tasks: vec![StagePartitionExecution {
             task_id: task.id.clone(),
-            input: task.payload.clone(),
+            input: if task.operation.eq_ignore_ascii_case("insert") {
+                String::new()
+            } else {
+                task.payload.clone()
+            },
             operation: task.operation.clone(),
             output: String::new(),
             params: task.params.clone(),
@@ -656,6 +691,7 @@ pub fn task_to_request(
             upstream_partition_counts,
             partition_spec,
             query_run_id,
+            raw_payload: task.raw_payload.clone(),
         }],
     }
 }

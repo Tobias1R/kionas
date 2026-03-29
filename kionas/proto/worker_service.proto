@@ -68,6 +68,7 @@ message StagePartitionExecution {
   map<uint32, uint32> upstream_partition_counts = 15;
   string partition_spec = 16;
   string query_run_id = 17;
+  bytes raw_payload = 18;
 }
 
 // Arrow Flight integration

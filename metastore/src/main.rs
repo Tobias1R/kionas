@@ -2,6 +2,7 @@ mod services;
 
 use crate::services::metastore_service::{MetastoreService, metastore_service};
 use crate::services::provider::postgres::PostgresProvider;
+use kionas::consul::download_cluster_info;
 use kionas::utils::resolve_hostname;
 use std::error::Error;
 use std::sync::Arc;
@@ -20,6 +21,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let hostname = kionas::get_local_hostname().unwrap_or_else(|| "metastore".to_string());
 
     let app_cfg = kionas::config::load_for_host(consul_url.as_deref(), &hostname).await?;
+    let cluster_info =
+        download_cluster_info(consul_url.as_deref().unwrap_or("http://kionas-consul:8500"))
+            .await
+            .ok();
 
     // Map AppConfig -> use sections directly
     let interops = app_cfg
@@ -41,8 +46,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize Postgres provider using shared PostgresServiceConfig
     let pg_provider = Arc::new(PostgresProvider::new(&pg)?);
 
+    let notifier = if let Some(cluster_info) = cluster_info {
+        let cert = std::fs::read(kionas::parse_env_vars(&interops.tls_cert)).ok();
+        let key = std::fs::read(kionas::parse_env_vars(&interops.tls_key)).ok();
+        let ca_cert = std::fs::read(kionas::parse_env_vars(&interops.ca_cert)).ok();
+        Some(
+            crate::services::metastore_service::TableSchemaInvalidationNotifier::new(
+                cluster_info.master,
+                cert.zip(key),
+                ca_cert,
+            ),
+        )
+    } else {
+        None
+    };
+
     // Service implementation (pass provider to service)
-    let svc = MetastoreService::new(pg_provider.clone());
+    let svc = MetastoreService::new(pg_provider.clone(), notifier);
 
     let addr = resolve_hostname(interops.host.as_str(), interops.port).await?;
 

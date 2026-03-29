@@ -1,6 +1,6 @@
 fn main() {
     let proto_dir = &["../kionas/proto"];
-    let protos = &["metastore_service.proto"];
+    let protos = &["metastore_service.proto", "interops_service.proto"];
     tonic_build::configure()
         .build_server(true) // Include server-side code
         .build_client(true)

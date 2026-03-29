@@ -13,10 +13,17 @@ pub(crate) async fn ensure_pool(
             tls_cert_path: Some(info.tls_cert_path.clone()),
             tls_key_path: Some(info.tls_key_path.clone()),
         };
-        let pool_size: usize = std::env::var("MASTER_POOL_SIZE")
+        let config_pool_size = shared
+            .cluster_info
+            .write_performance
+            .as_ref()
+            .map(|cfg| cfg.interops_pool_size)
+            .filter(|size| *size > 0);
+        let env_pool_size: Option<usize> = std::env::var("MASTER_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+            .filter(|size| *size > 0);
+        let pool_size = config_pool_size.or(env_pool_size).unwrap_or(20);
         match deadpool::managed::Pool::builder(manager)
             .max_size(pool_size)
             .build()

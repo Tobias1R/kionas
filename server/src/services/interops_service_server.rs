@@ -265,6 +265,34 @@ impl interops_service::interops_service_server::InteropsService for InteropsServ
         };
         Ok(Response::new(resp))
     }
+
+    async fn invalidate_table_schema(
+        &self,
+        request: Request<interops_service::InvalidateTableSchemaRequest>,
+    ) -> Result<Response<interops_service::InvalidateTableSchemaResponse>, Status> {
+        let req = request.into_inner();
+        let database = req.database.trim().to_ascii_lowercase();
+        let schema = req.schema.trim().to_ascii_lowercase();
+        let table = req.table.trim().to_ascii_lowercase();
+
+        if database.is_empty() || schema.is_empty() || table.is_empty() {
+            return Err(Status::invalid_argument(
+                "database, schema and table are required",
+            ));
+        }
+
+        let shared = self.shared_data.lock().await;
+        let _removed = shared
+            .constraint_cache
+            .invalidate(&database, &schema, &table)
+            .await;
+
+        Ok(Response::new(
+            interops_service::InvalidateTableSchemaResponse {
+                status: "ok".to_string(),
+            },
+        ))
+    }
 }
 
 impl InteropsService {

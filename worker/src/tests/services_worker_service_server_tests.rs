@@ -9,6 +9,7 @@ fn build_query_task() -> worker_service::StagePartitionExecution {
         upstream_stage_ids: Vec::new(),
         upstream_partition_counts: std::collections::HashMap::new(),
         partition_spec: String::new(),
+        raw_payload: Vec::new(),
         query_run_id: String::new(),
         query_id: String::new(),
         stage_id: 0,

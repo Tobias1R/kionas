@@ -1,4 +1,5 @@
 //pub mod warehouse_service_server;
+pub(crate) mod constraint_cache;
 pub(crate) mod pool;
 pub(crate) mod state;
 

@@ -130,6 +130,7 @@ fn task_to_request_emits_structured_filter_predicate_from_payload() {
         "session-1".to_string(),
         "query".to_string(),
         payload,
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -166,6 +167,7 @@ fn task_to_request_omits_filter_predicate_when_payload_has_no_filter() {
         "session-2".to_string(),
         "query".to_string(),
         payload,
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -198,6 +200,7 @@ fn task_to_request_preserves_all_conjunction_clauses() {
         "session-3".to_string(),
         "query".to_string(),
         payload,
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -241,6 +244,7 @@ fn task_to_request_serializes_disjunction_predicate_variant() {
         "session-3b".to_string(),
         "query".to_string(),
         payload,
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -277,6 +281,7 @@ fn task_to_request_serializes_not_predicate_variant() {
         "session-3c".to_string(),
         "query".to_string(),
         payload,
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -311,6 +316,7 @@ fn task_to_request_populates_stage_metadata_fields() {
         "session-4".to_string(),
         "query".to_string(),
         "[]".to_string(),
+        Vec::new(),
         params,
     );
 
@@ -362,6 +368,7 @@ fn task_to_request_defaults_query_run_id_to_query_id() {
         "session-5".to_string(),
         "query".to_string(),
         "[]".to_string(),
+        Vec::new(),
         HashMap::new(),
     );
 
@@ -377,6 +384,7 @@ fn task_to_request_prefers_typed_stage_metadata() {
         "session-typed-stage".to_string(),
         "query".to_string(),
         "[]".to_string(),
+        Vec::new(),
         HashMap::new(),
     );
 

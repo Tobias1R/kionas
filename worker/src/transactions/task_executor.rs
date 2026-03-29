@@ -5,6 +5,7 @@ use arrow::record_batch::RecordBatch;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// What: Build a Delta table URI from storage config and a SQL table name.
 ///
@@ -59,6 +60,57 @@ pub(crate) fn derive_table_uri_from_storage(
         return None;
     }
     Some(format!("s3://{}/{}", bucket, clean_table))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_task_update(
+    shared: SharedData,
+    task_id: String,
+    status: String,
+    result_location: String,
+    error_message: String,
+    stage_id: Option<String>,
+    partition_count: Option<u32>,
+    upstream_stage_ids: String,
+    partition_spec: String,
+) {
+    if let Some(pool_arc) = crate::transactions::interops_pool::ensure_pool(shared).await {
+        match pool_arc.get().await {
+            Ok(mut pooled_client) => {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("upstream_stage_ids".to_string(), upstream_stage_ids);
+                metadata.insert("partition_spec".to_string(), partition_spec);
+
+                let partition_completed =
+                    partition_count.map(|count| if status == "succeeded" { count } else { 0 });
+
+                let update = crate::interops_service::TaskUpdateRequest {
+                    task_id: task_id.clone(),
+                    status,
+                    result_location,
+                    error: error_message,
+                    stage_id,
+                    partition_count,
+                    partition_completed,
+                    metadata,
+                };
+
+                if let Err(e) = pooled_client.task_update(tonic::Request::new(update)).await {
+                    log::error!(
+                        "Failed to send TaskUpdate for {} using pool: {}",
+                        task_id,
+                        e
+                    );
+                }
+            }
+            Err(e) => log::error!("Failed to acquire pooled master client: {}", e),
+        }
+    } else {
+        log::error!(
+            "No interops pool available; dropping TaskUpdate for {}",
+            task_id
+        );
+    }
 }
 
 /// What: Handle task execution orchestration and async status reporting.
@@ -361,6 +413,93 @@ pub async fn handle_execute_task(
         })
         .unwrap_or_else(|| "\"Single\"".to_string());
 
+    if operation == "insert" {
+        let table_name_for_span = parsed_insert
+            .as_ref()
+            .map(|parsed| parsed.table_name.clone())
+            .unwrap_or_default();
+        let row_count_for_span = parsed_insert
+            .as_ref()
+            .map_or(0usize, |parsed| parsed.rows.len());
+        let insert_execute_span = tracing::info_span!(
+            "insert.execute",
+            table_name = table_name_for_span,
+            row_count = row_count_for_span
+        );
+
+        let write_outcome = async {
+            let Some(table_uri) = delta_table_uri.clone() else {
+                return Err("missing delta table uri for insert task".to_string());
+            };
+
+            let Some(parsed) = parsed_insert.as_ref() else {
+                return Err("failed to parse INSERT payload".to_string());
+            };
+
+            let batch = crate::transactions::insert_record_batch::build_record_batch_from_insert(
+                parsed,
+                &insert_column_type_hints,
+            )
+            .map_err(|e| format!("failed to build record batch: {}", e))?;
+
+            crate::storage::deltalake::write_parquet_and_commit(
+                shared.clone(),
+                &table_uri,
+                vec![batch],
+            )
+            .await
+            .map_err(|e| format!("delta write/commit failed: {}", e))?;
+
+            Ok::<(), String>(())
+        }
+        .instrument(insert_execute_span)
+        .await;
+
+        match write_outcome {
+            Ok(()) => {
+                shared
+                    .set_task_result_location(&session_id, &task_id, &result_location)
+                    .await;
+                emit_task_update(
+                    shared.clone(),
+                    task_id.clone(),
+                    "succeeded".to_string(),
+                    result_location.clone(),
+                    String::new(),
+                    stage_id,
+                    partition_count,
+                    upstream_stage_ids,
+                    partition_spec,
+                )
+                .await;
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "ok".to_string(),
+                    error: String::new(),
+                    result_location,
+                };
+            }
+            Err(error_message) => {
+                emit_task_update(
+                    shared.clone(),
+                    task_id,
+                    "failed".to_string(),
+                    result_location.clone(),
+                    error_message.clone(),
+                    stage_id,
+                    partition_count,
+                    upstream_stage_ids,
+                    partition_spec,
+                )
+                .await;
+                return crate::services::worker_service_server::worker_service::TaskResponse {
+                    status: "error".to_string(),
+                    error: error_message,
+                    result_location: String::new(),
+                };
+            }
+        }
+    }
+
     shared
         .set_task_result_location(&session_id, &task_id, &result_location)
         .await;
@@ -370,123 +509,95 @@ pub async fn handle_execute_task(
     let partition_count_for_spawn = partition_count;
     let upstream_stage_ids_for_spawn = upstream_stage_ids.clone();
     let partition_spec_for_spawn = partition_spec.clone();
-    tokio::spawn(async move {
-        let mut status = "succeeded".to_string();
-        let mut error_message = String::new();
+    let current_span = tracing::Span::current();
+    tokio::spawn(
+        async move {
+            let mut status = "succeeded".to_string();
+            let mut error_message = String::new();
 
-        if let Some(table_uri) = delta_table_uri {
-            let batch_res: Result<RecordBatch, String> = if operation == "insert" {
-                if let Some(parsed) = parsed_insert.as_ref() {
-                    crate::transactions::insert_record_batch::build_record_batch_from_insert(
-                        parsed,
-                        &insert_column_type_hints,
-                    )
+            if let Some(table_uri) = delta_table_uri {
+                let batch_res: Result<RecordBatch, String> = if operation == "insert" {
+                    if let Some(parsed) = parsed_insert.as_ref() {
+                        crate::transactions::insert_record_batch::build_record_batch_from_insert(
+                            parsed,
+                            &insert_column_type_hints,
+                        )
+                    } else {
+                        Err("failed to parse INSERT payload".to_string())
+                    }
                 } else {
-                    Err("failed to parse INSERT payload".to_string())
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("session_id", DataType::Utf8, false),
+                        Field::new("task_id", DataType::Utf8, false),
+                        Field::new("result_location", DataType::Utf8, false),
+                        Field::new(
+                            "committed_at_ms",
+                            DataType::Timestamp(TimeUnit::Millisecond, None),
+                            false,
+                        ),
+                    ]));
+
+                    let committed_at = chrono::Utc::now().timestamp_millis();
+                    RecordBatch::try_new(
+                        schema,
+                        vec![
+                            Arc::new(StringArray::from(vec![session_id.clone()])),
+                            Arc::new(StringArray::from(vec![task_id.clone()])),
+                            Arc::new(StringArray::from(vec![result_location_for_spawn.clone()])),
+                            Arc::new(TimestampMillisecondArray::from(vec![committed_at])),
+                        ],
+                    )
+                    .map_err(|e| format!("failed to build record batch: {}", e))
+                };
+
+                match batch_res {
+                    Ok(batch) => {
+                        if let Err(e) = crate::storage::deltalake::write_parquet_and_commit(
+                            shared_clone.clone(),
+                            &table_uri,
+                            vec![batch],
+                        )
+                        .await
+                        {
+                            status = "failed".to_string();
+                            error_message = format!("delta write/commit failed: {}", e);
+                            log::error!(
+                                "Failed delta write for task {} table {}: {}",
+                                task_id,
+                                table_uri,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        status = "failed".to_string();
+                        error_message = format!("failed to build record batch: {}", e);
+                        log::error!(
+                            "Failed to build Arrow record batch for task {}: {}",
+                            task_id,
+                            e
+                        );
+                    }
                 }
             } else {
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("session_id", DataType::Utf8, false),
-                    Field::new("task_id", DataType::Utf8, false),
-                    Field::new("result_location", DataType::Utf8, false),
-                    Field::new(
-                        "committed_at_ms",
-                        DataType::Timestamp(TimeUnit::Millisecond, None),
-                        false,
-                    ),
-                ]));
-
-                let committed_at = chrono::Utc::now().timestamp_millis();
-                RecordBatch::try_new(
-                    schema,
-                    vec![
-                        Arc::new(StringArray::from(vec![session_id.clone()])),
-                        Arc::new(StringArray::from(vec![task_id.clone()])),
-                        Arc::new(StringArray::from(vec![result_location_for_spawn.clone()])),
-                        Arc::new(TimestampMillisecondArray::from(vec![committed_at])),
-                    ],
-                )
-                .map_err(|e| format!("failed to build record batch: {}", e))
-            };
-
-            match batch_res {
-                Ok(batch) => {
-                    if let Err(e) = crate::storage::deltalake::write_parquet_and_commit(
-                        shared_clone.clone(),
-                        &table_uri,
-                        vec![batch],
-                    )
-                    .await
-                    {
-                        status = "failed".to_string();
-                        error_message = format!("delta write/commit failed: {}", e);
-                        log::error!(
-                            "Failed delta write for task {} table {}: {}",
-                            task_id,
-                            table_uri,
-                            e
-                        );
-                    }
-                }
-                Err(e) => {
-                    status = "failed".to_string();
-                    error_message = format!("failed to build record batch: {}", e);
-                    log::error!(
-                        "Failed to build Arrow record batch for task {}: {}",
-                        task_id,
-                        e
-                    );
-                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-        } else {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            emit_task_update(
+                shared_clone,
+                task_id,
+                status,
+                result_location_for_spawn,
+                error_message,
+                stage_id_for_spawn,
+                partition_count_for_spawn,
+                upstream_stage_ids_for_spawn,
+                partition_spec_for_spawn,
+            )
+            .await;
         }
-
-        if let Some(pool_arc) =
-            crate::transactions::interops_pool::ensure_pool(shared_clone.clone()).await
-        {
-            match pool_arc.get().await {
-                Ok(mut pooled_client) => {
-                    let mut metadata = std::collections::HashMap::new();
-                    metadata.insert(
-                        "upstream_stage_ids".to_string(),
-                        upstream_stage_ids_for_spawn.clone(),
-                    );
-                    metadata.insert(
-                        "partition_spec".to_string(),
-                        partition_spec_for_spawn.clone(),
-                    );
-
-                    let partition_completed = partition_count_for_spawn
-                        .map(|count| if status == "succeeded" { count } else { 0 });
-
-                    let update = crate::interops_service::TaskUpdateRequest {
-                        task_id: task_id.clone(),
-                        status,
-                        result_location: result_location_for_spawn.clone(),
-                        error: error_message,
-                        stage_id: stage_id_for_spawn.clone(),
-                        partition_count: partition_count_for_spawn,
-                        partition_completed,
-                        metadata,
-                    };
-                    if let Err(e) = pooled_client.task_update(tonic::Request::new(update)).await {
-                        log::error!(
-                            "Failed to send TaskUpdate for {} using pool: {}",
-                            task_id,
-                            e
-                        );
-                    }
-                }
-                Err(e) => log::error!("Failed to acquire pooled master client: {}", e),
-            }
-        } else {
-            log::error!(
-                "No interops pool available; dropping TaskUpdate for {}",
-                task_id
-            );
-        }
-    });
+        .instrument(current_span),
+    );
 
     crate::services::worker_service_server::worker_service::TaskResponse {
         status: "ok".to_string(),

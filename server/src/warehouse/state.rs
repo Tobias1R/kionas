@@ -3,6 +3,7 @@ use crate::metrics::ServerPrometheusMetrics;
 use crate::session;
 use crate::tasks::TaskManager;
 use crate::warehouse::Warehouse;
+use crate::warehouse::constraint_cache::TableConstraintCache;
 use crate::warehouse::pool::{PoolHealth, WarehousePool};
 use crate::workers_pool::WorkerPool;
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use kionas::parse_env_vars;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as HashEntry;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::transport::Channel;
 
@@ -37,12 +39,16 @@ pub struct SharedState {
     pub pool_tier_templates: Arc<AsyncMutex<HashMap<String, WarehousePoolTierConfig>>>,
     pub warehouse_pools: Arc<AsyncMutex<HashMap<String, WarehousePool>>>,
     pub metastore_channel: Arc<AsyncMutex<Option<Channel>>>,
+    pub constraint_cache: TableConstraintCache,
     pub config: Option<AppConfig>,
 }
 
 impl SharedState {
     pub fn new(config: AppConfig) -> Self {
         let worker_pools: HashMap<String, WorkerPool> = HashMap::new();
+        let constraint_cache = TableConstraintCache::new(Duration::from_secs(
+            config.resolved_constraint_cache_ttl_secs(),
+        ));
         SharedState {
             counter: Arc::new(AsyncMutex::new(0)),
             query_counters: ServerCounters::new(),
@@ -55,6 +61,7 @@ impl SharedState {
             pool_tier_templates: Arc::new(AsyncMutex::new(HashMap::new())),
             warehouse_pools: Arc::new(AsyncMutex::new(HashMap::new())),
             metastore_channel: Arc::new(AsyncMutex::new(None)),
+            constraint_cache,
             config: Some(config),
         }
     }
@@ -75,6 +82,7 @@ impl Default for SharedState {
             pool_tier_templates: Arc::new(AsyncMutex::new(HashMap::new())),
             warehouse_pools: Arc::new(AsyncMutex::new(HashMap::new())),
             metastore_channel: Arc::new(AsyncMutex::new(None)),
+            constraint_cache: TableConstraintCache::new(Duration::from_secs(300)),
             config: None,
         }
     }

@@ -17,12 +17,13 @@ pub async fn init_worker(
 ) -> Result<kionas::consul::ClusterInfo, Box<dyn Error + Send + Sync>> {
     let consul_url =
         std::env::var("CONSUL_URL").unwrap_or_else(|_| "http://kionas-consul:8500".to_string());
-    let cluster_info = download_cluster_info(&consul_url).await?;
+    let mut cluster_info = download_cluster_info(&consul_url).await?;
 
     println!("Cluster info: {:?}", cluster_info);
 
     // Determine worker config: prefer provided AppConfig, fallback to consul-stored worker info
     let cfg = app_cfg;
+    cluster_info.write_performance = cfg.write_performance.clone();
     // Construct a WorkerInfo from AppConfig.interops and consul info
     let interops = cfg
         .services

@@ -55,22 +55,26 @@ fn normalize_identifier(raw: &str) -> String {
 }
 
 pub(crate) fn parse_insert_payload(task: &Task) -> Result<ParsedInsertPayload, String> {
-    let raw = task.input.trim();
-    if raw.is_empty() {
-        return Err(
-            "insert payload contract missing: task input must contain base64 protobuf payload"
-                .to_string(),
-        );
-    }
+    let bytes = if !task.raw_payload.is_empty() {
+        task.raw_payload.clone()
+    } else {
+        let raw = task.input.trim();
+        if raw.is_empty() {
+            return Err(
+                "insert payload contract missing: task input or raw_payload must contain protobuf payload"
+                    .to_string(),
+            );
+        }
 
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw)
-        .map_err(|e| {
-            format!(
-                "insert payload contract malformed: base64 decode failed: {}",
-                e
-            )
-        })?;
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|e| {
+                format!(
+                    "insert payload contract malformed: base64 decode failed: {}",
+                    e
+                )
+            })?
+    };
     let payload = InsertEnvelopeProto::decode(bytes.as_slice()).map_err(|e| {
         format!(
             "insert payload contract malformed: protobuf decode failed: {}",

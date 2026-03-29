@@ -18,6 +18,7 @@ fn normalize_identifier(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[tracing::instrument(skip(parsed, column_type_hints), fields(table_name = %parsed.table_name, row_count = parsed.rows.len()))]
 pub(crate) fn build_record_batch_from_insert(
     parsed: &ParsedInsertPayload,
     column_type_hints: &HashMap<String, String>,

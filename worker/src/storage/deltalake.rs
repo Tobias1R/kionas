@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::Instrument;
 use url::Url;
 use uuid::Uuid;
 
@@ -77,10 +78,17 @@ async fn ensure_object_store_pool(
     }
 
     let manager = ObjectStoreManager::new(&shared.cluster_info.storage);
-    let pool_size: usize = std::env::var("OBJECT_STORE_POOL_SIZE")
+    let config_pool_size = shared
+        .cluster_info
+        .write_performance
+        .as_ref()
+        .map(|cfg| cfg.object_store_pool_size)
+        .filter(|size| *size > 0);
+    let env_pool_size = std::env::var("OBJECT_STORE_POOL_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .filter(|size| *size > 0);
+    let pool_size: usize = config_pool_size.or(env_pool_size).unwrap_or(20);
     let pool = deadpool::managed::Pool::builder(manager)
         .max_size(pool_size)
         .build()
@@ -169,6 +177,7 @@ pub async fn create_table(
 }
 
 /// Write given record batches as Parquet files and commit to the Delta log.
+#[tracing::instrument(skip(shared, record_batches), fields(table_name = %table_uri))]
 pub async fn write_parquet_and_commit(
     shared: SharedData,
     table_uri: &str,
@@ -183,15 +192,18 @@ pub async fn write_parquet_and_commit(
     }
 
     // build in-memory parquet
-    let schema_ref = record_batches[0].schema();
-    let props = WriterProperties::builder().build();
-    let mut cursor = Cursor::new(Vec::new());
-    let mut writer = ArrowWriter::try_new(&mut cursor, schema_ref, Some(props))?;
-    for batch in &record_batches {
-        writer.write(batch)?;
-    }
-    writer.close()?;
-    let bytes = cursor.into_inner();
+    let bytes =
+        tracing::info_span!("parquet.encode").in_scope(|| -> Result<Vec<u8>, DynError> {
+            let schema_ref = record_batches[0].schema();
+            let props = WriterProperties::builder().build();
+            let mut cursor = Cursor::new(Vec::new());
+            let mut writer = ArrowWriter::try_new(&mut cursor, schema_ref, Some(props))?;
+            for batch in &record_batches {
+                writer.write(batch)?;
+            }
+            writer.close()?;
+            Ok(cursor.into_inner())
+        })?;
     let bytes_len = bytes.len();
 
     // determine object store and upload path from cluster config and table URI
@@ -217,7 +229,10 @@ pub async fn write_parquet_and_commit(
     };
 
     let obj_path = ObjPath::from(object_key);
-    store.put(&obj_path, Bytes::from(bytes).into()).await?;
+    store
+        .put(&obj_path, Bytes::from(bytes).into())
+        .instrument(tracing::info_span!("s3.put"))
+        .await?;
 
     // TODO: create a Delta AddFile action for `key` (relative to table root)
     // and call the DeltaTable commit API so the new file is visible to the table.
@@ -244,18 +259,38 @@ pub async fn write_parquet_and_commit(
     // Commit through deltalake_core transaction API. DeltaTable itself does not
     // expose a direct `commit` method in this version.
     let storage_options = storage_options_from_cluster(&shared.cluster_info.storage);
-    let mut tbl = open_table_with_storage_options(url, storage_options).await?;
+    let mut tbl = async { open_table_with_storage_options(url, storage_options).await }
+        .instrument(tracing::info_span!("delta.open_table"))
+        .await?;
     let table_state = tbl.snapshot()?;
     let operation = DeltaOperation::Write {
         mode: SaveMode::Append,
         partition_by: None,
         predicate: None,
     };
-    CommitBuilder::default()
-        .with_actions(vec![action])
-        .build(Some(table_state), tbl.log_store(), operation)
+    let commit_span = tracing::info_span!("delta.commit");
+    let precommit = commit_span.in_scope(|| {
+        CommitBuilder::default().with_actions(vec![action]).build(
+            Some(table_state),
+            tbl.log_store(),
+            operation,
+        )
+    });
+    let commit_result: Result<_, _> = precommit.await;
+    if let Err(error) = commit_result {
+        if let Err(cleanup_error) = store.delete(&obj_path).await {
+            log::warn!(
+                "failed to cleanup staged parquet object '{}' after commit failure: {}",
+                obj_path,
+                cleanup_error
+            );
+        }
+        return Err(error.into());
+    }
+
+    tbl.update_state()
+        .instrument(tracing::info_span!("delta.update_state"))
         .await?;
-    tbl.update_state().await?;
 
     Ok(())
 }

@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::config::WritePerformanceConfig;
+
 use crate::constants::{CONSUL_CLUSTER_KEY, CONSUL_NODE_CONFIG_PREFIX};
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -14,6 +16,8 @@ pub struct ClusterInfo {
     pub nodes: Vec<String>,
     pub master: String,
     pub storage: serde_json::Value,
+    #[serde(default)]
+    pub write_performance: Option<WritePerformanceConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
