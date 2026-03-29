@@ -1,4 +1,7 @@
-use super::{normalize_decimal_literal, parse_datetime_literal, parse_insert_column_type_hints};
+use super::{
+    normalize_decimal_literal, parse_datetime_literal, parse_insert_column_type_hints,
+    parse_insert_payload,
+};
 use crate::services::worker_service_server::worker_service;
 use std::collections::HashMap;
 
@@ -55,4 +58,22 @@ fn rejects_missing_type_hints_in_contract_mode() {
     let err = parse_insert_column_type_hints(&task)
         .expect_err("contract mode should require type hints payload");
     assert!(err.contains("INSERT_TYPE_HINTS_MALFORMED"));
+}
+
+#[test]
+fn rejects_missing_insert_payload_in_task_input() {
+    let task = task_with_params(HashMap::new());
+    let err =
+        parse_insert_payload(&task).expect_err("insert contract must require task input payload");
+    assert!(err.contains("insert payload contract missing"));
+}
+
+#[test]
+fn rejects_malformed_insert_payload_in_task_input() {
+    let mut task = task_with_params(HashMap::new());
+    task.input = "not-base64".to_string();
+
+    let err = parse_insert_payload(&task)
+        .expect_err("invalid base64 payload must fail strict insert contract");
+    assert!(err.contains("insert payload contract malformed"));
 }

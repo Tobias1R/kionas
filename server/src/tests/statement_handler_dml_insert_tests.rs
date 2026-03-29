@@ -14,6 +14,10 @@ fn maps_known_insert_validation_and_constraint_errors() {
         map_insert_dispatch_error("missing not null column: id"),
         ("CONSTRAINT", "CONSTRAINT_NOT_NULL_COLUMNS_MISSING")
     );
+    assert_eq!(
+        map_insert_dispatch_error("insert payload contract malformed: protobuf decode failed"),
+        ("VALIDATION", "VALIDATION_INSERT_PAYLOAD_CONTRACT_MALFORMED")
+    );
 }
 
 #[test]

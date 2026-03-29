@@ -4,7 +4,8 @@ use crate::parser::datafusion_sql::sqlparser::ast::{
 use crate::providers::{KionasMetastoreResolver, normalize_identifier};
 use crate::statement_handler::shared::helpers;
 use crate::warehouse::state::SharedData;
-use serde::Serialize;
+use base64::Engine;
+use prost::Message;
 use std::collections::HashMap;
 
 const OUTCOME_PREFIX: &str = "RESULT";
@@ -46,7 +47,7 @@ fn map_insert_dispatch_error(err: &str) -> (&'static str, &'static str) {
         };
     }
 
-    let rules: [(&str, &str, &str); 8] = [
+    let rules: [(&str, &str, &str); 9] = [
         (
             "temporal_literal_invalid",
             "VALIDATION",
@@ -66,6 +67,11 @@ fn map_insert_dispatch_error(err: &str) -> (&'static str, &'static str) {
             "insert_type_hints_malformed",
             "VALIDATION",
             "VALIDATION_INSERT_TYPE_HINTS_MALFORMED",
+        ),
+        (
+            "insert payload contract",
+            "VALIDATION",
+            "VALIDATION_INSERT_PAYLOAD_CONTRACT_MALFORMED",
         ),
         (
             "not null constraint violated",
@@ -105,6 +111,7 @@ fn normalize_insert_error_message(code: &str, err: &str) -> String {
         | "VALIDATION_DATETIME_TIMEZONE_NOT_ALLOWED"
         | "VALIDATION_DECIMAL_COERCION_FAILED"
         | "VALIDATION_INSERT_TYPE_HINTS_MALFORMED"
+        | "VALIDATION_INSERT_PAYLOAD_CONTRACT_MALFORMED"
         | "CONSTRAINT_NOT_NULL_VIOLATION"
         | "CONSTRAINT_NOT_NULL_COLUMNS_MISSING"
         | "INFRA_INSERT_OBJECT_STORE_UNAVAILABLE" => err.to_string(),
@@ -170,20 +177,44 @@ fn parse_table_namespace(table_name: &str) -> Option<(String, String, String)> {
     Some((parts[0].clone(), parts[1].clone(), parts[2].clone()))
 }
 
-#[derive(Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum InsertScalarPayload {
-    Int(i64),
-    Bool(bool),
-    Str(String),
-    Null,
+#[derive(Clone, PartialEq, Message)]
+struct InsertEnvelopeProto {
+    #[prost(uint32, tag = "1")]
+    contract_version: u32,
+    #[prost(string, tag = "2")]
+    table_name: String,
+    #[prost(string, repeated, tag = "3")]
+    columns: Vec<String>,
+    #[prost(message, repeated, tag = "4")]
+    rows: Vec<InsertRowProto>,
 }
 
-#[derive(Serialize)]
-struct InsertPayload {
-    table_name: String,
-    columns: Vec<String>,
-    rows: Vec<Vec<InsertScalarPayload>>,
+#[derive(Clone, PartialEq, Message)]
+struct InsertRowProto {
+    #[prost(message, repeated, tag = "1")]
+    values: Vec<InsertScalarProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct InsertScalarProto {
+    #[prost(oneof = "insert_scalar_proto::Value", tags = "1, 2, 3, 4")]
+    value: Option<insert_scalar_proto::Value>,
+}
+
+mod insert_scalar_proto {
+    use prost::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(crate) enum Value {
+        #[prost(int64, tag = "1")]
+        Int(i64),
+        #[prost(bool, tag = "2")]
+        Bool(bool),
+        #[prost(string, tag = "3")]
+        Str(String),
+        #[prost(bool, tag = "4")]
+        Null(bool),
+    }
 }
 
 /// What: Build the worker INSERT payload contract from server-side SQL AST.
@@ -193,12 +224,12 @@ struct InsertPayload {
 /// - `table_name`: Canonical table name computed by the server.
 ///
 /// Output:
-/// - JSON text for `insert_payload_json` task param.
+/// - Base64 text that encodes protobuf bytes for worker task input.
 ///
 /// Details:
 /// - Supports only `INSERT ... VALUES (...)` forms.
 /// - Preserves scalar intent across int, bool, string, and null values.
-fn build_insert_payload_json(insert_stmt: &Insert, table_name: &str) -> Result<String, String> {
+fn build_insert_payload_binary(insert_stmt: &Insert, table_name: &str) -> Result<String, String> {
     let source = insert_stmt
         .source
         .as_ref()
@@ -226,24 +257,26 @@ fn build_insert_payload_json(insert_stmt: &Insert, table_name: &str) -> Result<S
                 Expr::Value(vws) => match &vws.value {
                     SqlValue::Number(n, _) => n
                         .parse::<i64>()
-                        .map(InsertScalarPayload::Int)
-                        .unwrap_or_else(|_| InsertScalarPayload::Str(n.clone())),
-                    SqlValue::Boolean(b) => InsertScalarPayload::Bool(*b),
-                    SqlValue::Null => InsertScalarPayload::Null,
-                    other => InsertScalarPayload::Str(other.to_string()),
+                        .map(insert_scalar_proto::Value::Int)
+                        .unwrap_or_else(|_| insert_scalar_proto::Value::Str(n.clone())),
+                    SqlValue::Boolean(b) => insert_scalar_proto::Value::Bool(*b),
+                    SqlValue::Null => insert_scalar_proto::Value::Null(true),
+                    other => insert_scalar_proto::Value::Str(other.to_string()),
                 },
-                other => InsertScalarPayload::Str(other.to_string()),
+                other => insert_scalar_proto::Value::Str(other.to_string()),
             };
-            parsed_row.push(scalar);
+            parsed_row.push(InsertScalarProto {
+                value: Some(scalar),
+            });
         }
-        rows.push(parsed_row);
+        rows.push(InsertRowProto { values: parsed_row });
     }
 
-    let column_count = rows.first().map(std::vec::Vec::len).unwrap_or(0);
+    let column_count = rows.first().map(|row| row.values.len()).unwrap_or(0);
     if column_count == 0 {
         return Err("INSERT VALUES produced zero columns".to_string());
     }
-    if rows.iter().any(|r| r.len() != column_count) {
+    if rows.iter().any(|r| r.values.len() != column_count) {
         return Err("INSERT VALUES row width mismatch".to_string());
     }
 
@@ -257,12 +290,15 @@ fn build_insert_payload_json(insert_stmt: &Insert, table_name: &str) -> Result<S
             .collect()
     };
 
-    serde_json::to_string(&InsertPayload {
+    let payload = InsertEnvelopeProto {
+        contract_version: 1,
         table_name: table_name.to_string(),
         columns,
         rows,
-    })
-    .map_err(|e| format!("failed to serialize INSERT payload: {}", e))
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload.encode_to_vec());
+    Ok(encoded)
 }
 
 /// What: Load ordered table columns and NOT NULL columns from metastore metadata.
@@ -328,10 +364,9 @@ async fn load_table_constraint_columns(
 pub(crate) async fn handle_insert_statement(
     shared_data: &SharedData,
     session_id: &str,
-    stmt: &Statement,
+    _stmt: &Statement,
     insert_stmt: &Insert,
 ) -> String {
-    let payload = stmt.to_string();
     let default_schema = {
         let state = shared_data.lock().await;
         match state
@@ -348,7 +383,7 @@ pub(crate) async fn handle_insert_statement(
     let table_name =
         canonicalize_insert_table_name(&insert_stmt.table.to_string(), &default_schema);
     params.insert("table_name".to_string(), table_name.clone());
-    let insert_payload_json = match build_insert_payload_json(insert_stmt, &table_name) {
+    let payload = match build_insert_payload_binary(insert_stmt, &table_name) {
         Ok(value) => value,
         Err(e) => {
             let err = e.to_string();
@@ -356,7 +391,6 @@ pub(crate) async fn handle_insert_statement(
             return format_outcome(category, code, normalize_insert_error_message(code, &err));
         }
     };
-    params.insert("insert_payload_json".to_string(), insert_payload_json);
 
     if let Some((database, schema, table)) = parse_table_namespace(&table_name) {
         match load_table_constraint_columns(shared_data, &database, &schema, &table).await {
